@@ -35,7 +35,7 @@ fn validate_bytes(parameters: &[u8], state: &[u8]) -> Result<u32, ContractError>
     let publisher = VerifyingKey::from_bytes(&key_bytes)
         .map_err(|e| ContractError::Other(format!("invalid publisher key: {e}")))?;
 
-    let (metadata_bytes, webapp) = decode_state(state).map_err(|e| ContractError::Deser(e))?;
+    let (metadata_bytes, webapp) = decode_state(state).map_err(ContractError::Deser)?;
 
     if metadata_bytes.len() > MAX_METADATA_SIZE {
         return Err(ContractError::Other(format!(

@@ -76,6 +76,11 @@ pub struct GameCertificate {
 }
 
 /// Everything both players sign, excluding the signatures themselves.
+///
+/// Long argument list on purpose: taking the fields individually is what lets
+/// [`CertificateDraft`] and [`GameCertificate`] produce byte-identical signing
+/// input without one having to construct the other.
+#[allow(clippy::too_many_arguments)]
 fn certificate_signing_bytes(
     game_id: &GameId,
     white: &VerifyingKey,
@@ -101,7 +106,7 @@ fn certificate_signing_bytes(
     buf.extend_from_slice(&(white_nickname.len() as u32).to_le_bytes());
     buf.extend_from_slice(white_nickname.as_bytes());
     buf.extend_from_slice(&(black_nickname.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&black_nickname.as_bytes()[..]);
+    buf.extend_from_slice(black_nickname.as_bytes());
     buf.push(result_tag(result));
     buf.extend_from_slice(&(moves.len() as u32).to_le_bytes());
     for mv in moves {

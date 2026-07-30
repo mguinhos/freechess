@@ -201,7 +201,7 @@ impl ChessGameStateV1 {
         };
         let mut used = 0i64;
         for (ply, stamp) in stamps.iter().enumerate() {
-            let mover = if ply % 2 == 0 {
+            let mover = if ply.is_multiple_of(2) {
                 Color::White
             } else {
                 Color::Black
@@ -267,7 +267,7 @@ impl ChessGameStateV1 {
         }
         // Only the side to move at that ply can have been running their clock
         // down.
-        let to_move = if plies % 2 == 0 {
+        let to_move = if plies.is_multiple_of(2) {
             Color::White
         } else {
             Color::Black
@@ -327,7 +327,7 @@ impl ChessGameStateV1 {
             return 0;
         }
         let stamps = self.moves.timestamps();
-        let to_move = if stamps.len() % 2 == 0 {
+        let to_move = if stamps.len().is_multiple_of(2) {
             Color::White
         } else {
             Color::Black
@@ -383,7 +383,7 @@ impl ChessGameStateV1 {
     /// opponent yet. White plays even plies.
     pub fn key_for_ply(&self, ply: u32) -> Option<VerifyingKey> {
         let (white, black) = self.player_keys()?;
-        Some(if ply % 2 == 0 { white } else { black })
+        Some(if ply.is_multiple_of(2) { white } else { black })
     }
 
     /// Which color a given key plays, if it is one of the two players.
