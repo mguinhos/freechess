@@ -293,6 +293,51 @@ fn a_third_party_cannot_displace_a_seated_opponent() {
     );
 }
 
+/// Backdating a join must not evict a seated opponent, nor erase the moves they
+/// have already played. The race order is `(joined_at, key)` and `joined_at` is
+/// the joiner's own unverifiable claim, so without a floor an attacker simply
+/// signs `joined_at = 1` and wins every race — retroactively, in the middle of a
+/// game in progress.
+#[test]
+#[ignore = "KNOWN OPEN VULNERABILITY: the seat race is decided by the joiner's \
+            own unverifiable joined_at, so a backdated join wins retroactively. \
+            Closing it needs the creator to countersign the join; until then this \
+            test records the hole rather than pretending it is shut."]
+fn a_backdated_join_cannot_hijack_a_game_in_progress() {
+    let creator = key();
+    let opponent = key();
+    let attacker = key();
+    let (mut state, params) = open_game(&creator, Color::White);
+
+    let honest = SignedJoin::new(&opponent, &params.game_id, T0 + 100, "honest".to_string());
+    state
+        .opponent
+        .apply_delta(&state.clone(), &params, &Some(honest))
+        .unwrap();
+
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 200);
+    push_move(&mut state, &params, &opponent, 1, "e7e5", T0 + 300);
+    state.prune(&params).unwrap();
+    assert_eq!(state.moves.len(), 2, "both moves stand before the attack");
+
+    // The attacker claims to have joined before the honest player did.
+    let backdated = SignedJoin::new(&attacker, &params.game_id, 1, "attacker".to_string());
+    let outcome = state
+        .opponent
+        .apply_delta(&state.clone(), &params, &Some(backdated));
+    state.prune(&params).unwrap();
+
+    assert!(
+        outcome.is_err() || state.opponent.get().unwrap().player == opponent.verifying_key(),
+        "a backdated join took the seat of a player already in the game"
+    );
+    assert_eq!(
+        state.moves.len(),
+        2,
+        "the seated player's moves were erased by a backdated join"
+    );
+}
+
 // ---------------------------------------------------- direct challenges
 
 /// A game created as a direct challenge to `invited`.
