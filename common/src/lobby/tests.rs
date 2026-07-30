@@ -483,6 +483,99 @@ fn the_active_list_excludes_expired_players() {
     assert_eq!(state.presence.online_count(T0), 1);
 }
 
+/// A lobby pushed past [`MAX_LOBBY_ENTRIES`] by one flooder holding many
+/// keypairs, plus one honest player who got there first.
+///
+/// Eviction reads only creator, timestamps and open/matched status, so each
+/// creator's listings are cloned from one mined setup under distinct ids rather
+/// than mining a fresh proof for all 500-odd. That keeps the fixture cheap; the
+/// proof-of-work binding itself is covered by the `verify` tests above.
+///
+/// Cloning is also the honest model of the attack: the flooder's real cost is
+/// one proof per listing, which is only `MAX_LOBBY_ENTRIES` proofs to cover the
+/// whole lobby -- seconds of one core.
+fn flooded_corpus() -> (Vec<LobbyEntry>, PlayerId) {
+    let challenger = key();
+    let honest = key();
+    let honest_id = PlayerId::from(&honest.verifying_key());
+
+    // Distinct ids for cloned listings, so each occupies its own lobby slot.
+    let mut next_id = 0u64;
+    let mut spread = |base: &LobbyEntry, n: usize| -> Vec<LobbyEntry> {
+        (0..n)
+            .map(|_| {
+                next_id += 1;
+                let mut e = base.clone();
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&next_id.to_le_bytes());
+                e.game_id = GameId(raw);
+                e
+            })
+            .collect()
+    };
+
+    // The honest player got there first, so every flood listing is newer.
+    let mut entries = spread(&matched_listing(&honest, &challenger, T0), 1);
+    for k in 0..(MAX_LOBBY_ENTRIES / MAX_LISTINGS_PER_CREATOR) as i64 {
+        let flooder = key();
+        let base = matched_listing(&flooder, &challenger, T0 + 1_000 + k * 1_000);
+        entries.extend(spread(&base, MAX_LISTINGS_PER_CREATOR));
+    }
+    assert!(
+        entries.len() > MAX_LOBBY_ENTRIES,
+        "the cap must be exercised"
+    );
+    (entries, honest_id)
+}
+
+#[test]
+fn a_flooder_holding_many_keypairs_cannot_evict_an_honest_players_game() {
+    // Keypairs are free, so the per-creator quota alone does not bound how much
+    // of the lobby one party can occupy: MAX_LOBBY_ENTRIES/MAX_LISTINGS_PER_CREATOR
+    // fresh keys cover every slot, at MAX_LOBBY_ENTRIES proofs of work in total.
+    //
+    // While the global cap kept simply the most recently active games, a flooder
+    // whose listings were newer won that truncation outright and evicted real
+    // players. Sharing the slots out across creators is what bounds them.
+    let (entries, honest_id) = flooded_corpus();
+    let mut state = lobby_with(entries);
+    state.prune(&params()).unwrap();
+
+    assert_eq!(state.games.len(), MAX_LOBBY_ENTRIES);
+    assert!(
+        state
+            .games
+            .games
+            .values()
+            .any(|e| e.creator_id() == honest_id),
+        "an honest player's game was evicted by a flooder holding fresh keypairs"
+    );
+}
+
+#[test]
+fn the_global_cap_is_idempotent_and_independent_of_arrival_order() {
+    // The cap is load-bearing for convergence: it must be a pure function of the
+    // merged set, so two peers that saw the same games in different orders keep
+    // the same ones.
+    let (entries, _) = flooded_corpus();
+
+    let mut forwards = lobby_with(entries.clone());
+    forwards.prune(&params()).unwrap();
+
+    let mut backwards = lobby_with(entries.iter().rev().cloned().collect());
+    backwards.prune(&params()).unwrap();
+    assert_eq!(
+        forwards.games.games.keys().collect::<Vec<_>>(),
+        backwards.games.games.keys().collect::<Vec<_>>(),
+        "arrival order changed which games survived the cap"
+    );
+
+    // Pruning an already-pruned lobby must change nothing.
+    let once = forwards.games.games.clone();
+    forwards.prune(&params()).unwrap();
+    assert_eq!(forwards.games.games, once, "prune is not idempotent");
+}
+
 // ------------------------------------------------- summaries vs merge order
 
 #[test]

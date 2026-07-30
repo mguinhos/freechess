@@ -14,14 +14,30 @@
 //! Three independent limits, all verifiable from state alone:
 //!
 //! 1. **Proof-of-work per game.** Every listing embeds the creator-signed setup
-//!    whose `game_id` must be a PoW digest (see
-//!    [`crate::game::setup`]). Minting a listing costs work, so a fresh keypair
-//!    buys nothing.
+//!    whose `game_id` must be a PoW digest (see [`crate::game::setup`]), and the
+//!    digest is bound to the contract key, so work cannot be reused across
+//!    games.
 //! 2. **A quota per creator.** At most [`MAX_OPEN_PER_CREATOR`] games *waiting
 //!    for an opponent* and [`MAX_LISTINGS_PER_CREATOR`] listings in total.
-//!    Filling the lobby with unanswered challenges is therefore impossible
-//!    regardless of how much work an attacker burns.
-//! 3. **A global cap.** [`MAX_LOBBY_ENTRIES`] listings overall.
+//! 3. **A global cap.** [`MAX_LOBBY_ENTRIES`] listings overall, shared out
+//!    across creators rather than granted to whoever is most recently active.
+//!
+//! # What these do and do not bound
+//!
+//! The quota in (2) is per *creator*, and keypairs are free, so it does not by
+//! itself bound how much of the lobby one party holds: roughly
+//! `MAX_LOBBY_ENTRIES / MAX_LISTINGS_PER_CREATOR` fresh keys cover every slot,
+//! for `MAX_LOBBY_ENTRIES` proofs of work in total. That is why (3) shares slots
+//! out across creators: it makes crowding the lobby cost a number of *distinct
+//! identities* rather than a flat number of listings, and stops a flooder whose
+//! listings are merely newer from evicting real players.
+//!
+//! What remains unbounded is the price of an identity. Fresh keys cost nothing
+//! and the per-game work is deliberately small, so a determined flooder can
+//! still mint enough identities to claim a large share of the lobby -- and the
+//! difficulty cannot simply be raised to fix it, because a phone creating one
+//! game pays the same per listing as a flooder's script with far more compute.
+//! Closing that gap needs a scarce identity rather than a bigger puzzle.
 //!
 //! Every one of these is enforced by *deterministic eviction over the merged
 //! set* — sorted by a total order and truncated — never by arrival order. That
@@ -36,7 +52,7 @@ use crate::identity::{verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 mod tests;
@@ -523,16 +539,63 @@ impl LobbyGamesV1 {
             self.games.remove(&id);
         }
 
-        // Global cap: keep the most recently active games.
+        // Global cap: share the slots out across creators, most recently
+        // active first *within* each creator.
+        //
+        // Keeping simply the globally-most-recent games let a single party hold
+        // every slot. Listings are quota-limited per creator, but keypairs are
+        // free, so ~`MAX_LOBBY_ENTRIES / MAX_LISTINGS_PER_CREATOR` fresh keys
+        // covered the whole lobby, and a flooder who kept refreshing always won
+        // the recency sort and evicted real players' games. Round-robin bounds
+        // any one creator to `ceil(cap / distinct_creators)` while the lobby is
+        // contended, so the cost of crowding the lobby now scales with the
+        // number of distinct *identities* rather than being flat in the number
+        // of listings.
+        //
+        // Still a pure function of the merged set: sorted inputs, deterministic
+        // tiebreaks, no dependence on arrival order (see the module docs).
         if self.games.len() > MAX_LOBBY_ENTRIES {
-            let mut ids: Vec<GameId> = self.games.keys().copied().collect();
-            ids.sort_by_key(|id| {
-                let e = &self.games[id];
-                (std::cmp::Reverse(e.last_activity()), *id)
-            });
-            for id in ids.into_iter().skip(MAX_LOBBY_ENTRIES) {
-                self.games.remove(&id);
+            let mut by_creator: BTreeMap<PlayerId, Vec<GameId>> = BTreeMap::new();
+            for entry in self.games.values() {
+                by_creator
+                    .entry(entry.creator_id())
+                    .or_default()
+                    .push(entry.game_id);
             }
+            for ids in by_creator.values_mut() {
+                ids.sort_by_key(|id| {
+                    let e = &self.games[id];
+                    (std::cmp::Reverse(e.last_activity()), *id)
+                });
+            }
+
+            let mut keep: BTreeSet<GameId> = BTreeSet::new();
+            for round in 0.. {
+                // This round's candidates: each creator's `round`-th best.
+                let mut candidates: Vec<GameId> = by_creator
+                    .values()
+                    .filter_map(|ids| ids.get(round).copied())
+                    .collect();
+                if candidates.is_empty() {
+                    break;
+                }
+                if keep.len() + candidates.len() <= MAX_LOBBY_ENTRIES {
+                    keep.extend(candidates);
+                    continue;
+                }
+                // The round overflows the cap. Rank the tail by activity rather
+                // than taking creators in key order, which would hand the last
+                // slots to whoever grinds the lowest-sorting key.
+                candidates.sort_by_key(|id| {
+                    let e = &self.games[id];
+                    (std::cmp::Reverse(e.last_activity()), *id)
+                });
+                candidates.truncate(MAX_LOBBY_ENTRIES - keep.len());
+                keep.extend(candidates);
+                break;
+            }
+
+            self.games.retain(|id, _| keep.contains(id));
         }
     }
 
