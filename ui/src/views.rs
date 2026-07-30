@@ -546,6 +546,19 @@ pub fn GameView(
     let mut viewing_ply = use_signal(|| None::<usize>);
     let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
 
+    // Tick once a second so the clocks actually count down. Everything else in
+    // this view is driven by state changes, and between moves there are none —
+    // without this the clock only moved when an update happened to arrive.
+    let mut tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            crate::gloo_sleep(1000).await;
+            tick += 1;
+        }
+    });
+    // Read it so this component actually subscribes to the tick.
+    let _ = tick();
+
     let s = state.read();
     let me = s.me();
     let now = now_ms();
@@ -626,8 +639,21 @@ pub fn GameView(
 
     let board_now = Board::from_fen(&fen).unwrap_or_default();
     let (captured_by_white, captured_by_black) = captured_material(&board_now);
-    let white_ms = game.time_remaining(Color::White, now);
-    let black_ms = game.time_remaining(Color::Black, now);
+    // Freeze the clocks at the moment the game ended. `time_remaining` measures
+    // against "now" and judges liveness from the BOARD alone (so that a timeout
+    // claim can be verified against the state that contains it) — which means a
+    // resignation or agreed draw leaves the mover's clock still ticking.
+    let clock_now = if is_over {
+        game.conclusion
+            .get()
+            .map(|c| c.at)
+            .or_else(|| game.moves.timestamps().last().copied())
+            .unwrap_or(now)
+    } else {
+        now
+    };
+    let white_ms = game.time_remaining(Color::White, clock_now);
+    let black_ms = game.time_remaining(Color::Black, clock_now);
     let to_move = replay.side_to_move();
 
     let sans = replay.san_list();
