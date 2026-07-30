@@ -13,7 +13,13 @@ export default defineConfig({
   workers: 1,
   // A P2P round trip is not instant; give assertions room without making a
   // real failure take forever to surface.
-  timeout: 180_000,
+  //
+  // The test budget must exceed the per-assertion one by more than a single
+  // assertion's worth, or the first slow wait eats the whole test and the
+  // failure is reported as a bare "test timeout" — with no indication of WHICH
+  // assertion was still waiting. That is how three admin tests failed on a cold
+  // network with nothing in the report to act on.
+  timeout: 300_000,
   // A node reaching a contract for the first time has to fetch it across the
   // network — the webapp alone is ~400KB. 45s was enough for a warm node and
   // not for a cold one, which showed up as the first test against a given node

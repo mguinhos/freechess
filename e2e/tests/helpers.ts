@@ -123,6 +123,40 @@ export async function setNickname(frame: FrameLocator, nickname: string) {
   await expect(modal).toBeHidden();
 }
 
+/**
+ * Take the open seat in a specific game, addressed by id.
+ *
+ * Never locate a game by its creator's name. The lobby shows the nickname
+ * signed into the setup, and the test network is not wiped between runs, so
+ * several open games carry the same name; `.first()` then picks an arbitrary
+ * one. That is how the checkmate test came to join a stale game and wait
+ * forever for a move its real opponent never made.
+ */
+export async function joinGame(
+  page: Page,
+  port: number,
+  id: string,
+): Promise<FrameLocator> {
+  const frame = await reopen(page, port, `?game=${id}`);
+  await expect(frame.locator(".board")).toBeVisible();
+  await frame.getByRole("button", { name: "Take the open seat" }).click();
+  return frame;
+}
+
+/**
+ * Wait until the creator's client has countersigned the challenger, which is
+ * what fills the seat and makes any move legal.
+ *
+ * Joining only publishes an *offer*; clicking a square before the seat is
+ * filled does nothing at all, and the test then hangs on a move that was never
+ * accepted rather than on the thing it meant to check.
+ */
+export async function expectSeated(frame: FrameLocator, nickname: string) {
+  await expect(
+    frame.locator(".seat").getByText(nickname, { exact: true }),
+  ).toBeVisible();
+}
+
 /** Create a game and land on its board. */
 export async function createGame(frame: FrameLocator, timeControl = "10+0") {
   await frame.getByRole("button", { name: "New game" }).click();

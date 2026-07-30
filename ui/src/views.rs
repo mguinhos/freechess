@@ -448,7 +448,11 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                         } else {
                             div { class: "list",
                                 for entry in open {
-                                    div { key: "{entry.game_id}", class: "list-item",
+                                    // The id is here so a test can address one
+                                    // specific listing: several open games
+                                    // usually share a creator name, so picking
+                                    // by name gets an arbitrary one of them.
+                                    div { key: "{entry.game_id}", id: "listing-{entry.game_id}", class: "list-item",
                                         span { class: "grow",
                                             b { "{entry.setup.setup.creator_nickname}" }
                                         }

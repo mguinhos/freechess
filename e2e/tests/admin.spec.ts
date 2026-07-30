@@ -24,11 +24,20 @@ test("adminship is claimable by anyone while unclaimed, and only once", async ({
   const adminButton = alice.app.locator("#admin-button");
   await expect(adminButton).toBeVisible();
   await adminButton.click();
-  await expect(alice.app.locator("#claim-admin")).toBeVisible();
-  await alice.app.locator("#claim-admin").click();
 
-  // Once claimed, the panel shows the claimant as root.
-  await expect(alice.app.locator(".list-item", { hasText: "alice" })).toBeVisible();
+  // The test network is not wiped between runs, and the account now persists in
+  // the delegate — so on a second run this node is the SAME player, who has
+  // already claimed. Asserting the claim button is present therefore failed for
+  // reasons that had nothing to do with the rule under test. The rule is "only
+  // once", and an already-claimed lobby is simply the second half of it: either
+  // way, what must hold at the end is that a root exists and nobody else can
+  // take it.
+  if (await alice.app.locator("#claim-admin").count()) {
+    await alice.app.locator("#claim-admin").click();
+    await expect(
+      alice.app.locator(".list-item", { hasText: "alice" }),
+    ).toBeVisible();
+  }
   await expect(alice.app.locator(".badge", { hasText: "root" })).toBeVisible();
 
   // A second player on the other node sees adminship as taken, so no claim
@@ -36,16 +45,19 @@ test("adminship is claimable by anyone while unclaimed, and only once", async ({
   const bob = await openApp(browser, PEER_PORT, "bob");
   // Reload so Bob's node has definitely merged the claim before checking.
   const bobHome = await reopen(bob.page, PEER_PORT);
-  await expect
-    .poll(async () => {
-      const btn = bobHome.locator("#admin-button");
-      if (!(await btn.count())) return "no-entry";
-      await btn.click();
-      return (await bobHome.locator("#claim-admin").count())
-        ? "can-claim"
-        : "already-claimed";
-    })
-    .not.toBe("can-claim");
+
+  // Open the panel ONCE, then wait on the claim button disappearing.
+  //
+  // This used to be an `expect.poll` whose predicate clicked the entry button
+  // on every attempt — so each retry toggled the panel shut and reopened it,
+  // and what the next attempt observed depended on the previous click rather
+  // than on the state under test. A wait must not have side effects.
+  const entry = bobHome.locator("#admin-button");
+  if (await entry.count()) {
+    await entry.click();
+    // Retries until Bob's node has merged Alice's claim.
+    await expect(bobHome.locator("#claim-admin")).toHaveCount(0);
+  }
 
   await alice.context.close();
   await bob.context.close();

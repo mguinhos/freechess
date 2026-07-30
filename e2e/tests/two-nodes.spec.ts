@@ -5,6 +5,8 @@ import {
   PEER2_PORT,
   createGame,
   expectCleanConsole,
+  expectSeated,
+  joinGame,
   gameId,
   moveList,
   openApp,
@@ -40,11 +42,12 @@ test("a game created on one node appears on the other", async ({ browser }) => {
   await createGame(alice.app, "10+0");
 
   // Bob's home page should list Alice's open challenge — this is the lobby
-  // contract replicating from one node to the other.
+  // contract replicating from one node to the other. Addressed by id: matching
+  // on "alice" would be satisfied by any leftover game of hers and could never
+  // fail.
+  const id = await gameId(alice.app);
   const bobHome = await reopen(bob.page, PEER_PORT);
-  await expect(
-    bobHome.locator(".list-item", { hasText: "alice" }).first(),
-  ).toBeVisible();
+  await expect(bobHome.locator(`#listing-${id}`)).toBeVisible();
 
   expectCleanConsole(alice.errors);
   expectCleanConsole(bob.errors);
@@ -63,12 +66,10 @@ test("two players on different nodes play a game to checkmate", async ({
   // Reading the share link also verifies the app produced a usable one.
   const id = await gameId(alice.app);
 
-  // Bob joins from the other node.
-  const bobHome = await reopen(bob.page, PEER_PORT);
-  const challenge = bobHome.locator(".list-item", { hasText: "alice" }).first();
-  await expect(challenge).toBeVisible();
-  await challenge.getByRole("button", { name: "Play" }).click();
-  await expect(bobHome.locator(".board")).toBeVisible();
+  // Bob joins from the other node, and Alice's client countersigns him before
+  // any move is legal.
+  const bobHome = await joinGame(bob.page, PEER_PORT, id);
+  await expectSeated(alice.app, "bob");
 
   // Fool's mate: Black wins on move 2.
   await playMove(alice.app, "f2", "f3");
@@ -105,11 +106,8 @@ test("a spectator sees the game live and cannot move", async ({ browser }) => {
   await createGame(alice.app, "10+0");
   const id = await gameId(alice.app);
 
-  const bobHome = await reopen(bob.page, PEER_PORT);
-  const challenge = bobHome.locator(".list-item", { hasText: "alice" }).first();
-  await expect(challenge).toBeVisible();
-  await challenge.getByRole("button", { name: "Play" }).click();
-  await expect(bobHome.locator(".board")).toBeVisible();
+  const bobHome = await joinGame(bob.page, PEER_PORT, id);
+  await expectSeated(alice.app, "bob");
 
   // A third party opens the same game by URL — from a THIRD node, because a
   // second context on Bob's node would be Bob himself.
@@ -144,13 +142,8 @@ test("a game link replays for someone who never saw it live", async ({
   await createGame(alice.app, "10+0");
   const id = await gameId(alice.app);
 
-  const bobHome = await reopen(bob.page, PEER_PORT);
-  await bobHome
-    .locator(".list-item", { hasText: "alice" })
-    .first()
-    .getByRole("button", { name: "Play" })
-    .click();
-  await expect(bobHome.locator(".board")).toBeVisible();
+  const bobHome = await joinGame(bob.page, PEER_PORT, id);
+  await expectSeated(alice.app, "bob");
 
   await playMove(alice.app, "e2", "e4");
   await expect.poll(() => moveList(bobHome)).toContain("e4");

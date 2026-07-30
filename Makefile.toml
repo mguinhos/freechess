@@ -313,11 +313,32 @@ script_runner = "@shell"
 script = "./scripts/nodes.sh down"
 
 [tasks.test-e2e]
-description = "Two-node browser test"
+description = "Three-node browser test, from a wiped network"
 dependencies = ["build"]
 script_runner = "@shell"
 script = '''
+set -e
+# Wipe, don't just restart. The suite is NOT idempotent against a used network,
+# and the two ways it fails both look like app bugs:
+#
+#  * The account persists in the delegate, so a node is the SAME player on every
+#    run. Past MAX_OPEN_PER_CREATOR (3) unfinished games, the anti-spam quota
+#    stops listing that player's new ones — and a test waiting for its game to
+#    appear in the lobby hangs.
+#  * Adminship is first-come and permanent, so the second run onwards has no
+#    claim to make.
+#
+# Both are the rules working correctly. Starting clean is what makes a red run
+# mean something.
+./scripts/nodes.sh wipe
 ./scripts/nodes.sh up
+
+# Publish to all three: a node only serves the app it holds itself.
+for port in 7511 7512 7514; do
+  WS_API_PORT=$port cargo make --quiet publish-delegate
+  WS_API_PORT=$port cargo make --quiet publish-webapp
+done
+
 cd e2e && npx playwright test
 '''
 
