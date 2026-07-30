@@ -86,6 +86,9 @@ pub struct AppState {
     /// auto-fetch triggered, client should retry". So a join on a game this
     /// node has never seen is deferred until the GET lands.
     pub pending_join: Option<GameId>,
+    /// True while the nickname is still the generated placeholder, i.e. the
+    /// player has never chosen one and none was found on the network.
+    pub nickname_unset: bool,
     /// Whether the delegate has answered about the account yet.
     ///
     /// Registration and the first request race: `RegisterDelegate` and
@@ -106,6 +109,7 @@ impl AppState {
             creators: HashMap::new(),
             route: Route::Home,
             pending_join: None,
+            nickname_unset: true,
             account_settled: false,
         }
     }
@@ -163,6 +167,8 @@ pub enum Cmd {
     LoadAccount,
     /// Hand this session's account to the delegate for safekeeping.
     StoreAccount,
+    /// Ask the delegate for the stored nickname.
+    LoadNickname,
 
     // --- administration ---
     /// Claim adminship. Only takes effect if nobody claimed it earlier.
@@ -536,8 +542,20 @@ async fn handle_cmd(
             // and are what the views actually read — so a separate per-player
             // contract would add a second write and another WASM in the bundle
             // for no visible benefit.
-            state.with_mut(|s| s.account.nickname = nickname.clone());
+            state.with_mut(|s| {
+                s.account.nickname = nickname.clone();
+                s.nickname_unset = false;
+            });
             crate::identity::save_local_nickname(&nickname);
+
+            // Also hand it to the delegate: localStorage throws in the
+            // gateway's sandbox, so without this the name is lost on reload.
+            let store = chess_core::delegate_api::ChessDelegateRequest::SetNickname {
+                nickname: nickname.clone(),
+            };
+            if let Ok(payload) = store.to_bytes() {
+                let _ = api.send(freenet::delegate_request(payload)).await;
+            }
 
             let presence =
                 SignedPresence::watching_game(key, nickname, PresenceStatus::Online, None, now);
@@ -551,6 +569,15 @@ async fn handle_cmd(
             ))
             .await
             .map_err(|e| format!("could not publish the nickname: {e}"))
+        }
+
+        Cmd::LoadNickname => {
+            let payload = chess_core::delegate_api::ChessDelegateRequest::GetNickname
+                .to_bytes()
+                .map_err(|e| format!("could not encode the delegate request: {e}"))?;
+            api.send(freenet::delegate_request(payload))
+                .await
+                .map_err(|e| format!("could not ask the delegate for the nickname: {e}"))
         }
 
         Cmd::LoadAccount => {
@@ -895,6 +922,16 @@ fn handle_delegate_response(
                 // session generated, so the next load finds it.
                 state.with_mut(|s| s.account_settled = true);
                 return Some(Cmd::StoreAccount);
+            }
+            ChessDelegateResponse::Nickname {
+                nickname: Some(name),
+            } => {
+                if !name.trim().is_empty() {
+                    state.with_mut(|s| {
+                        s.account.nickname = name.clone();
+                        s.nickname_unset = false;
+                    });
+                }
             }
             ChessDelegateResponse::Error { message } => {
                 state.with_mut(|s| s.message = Some(format!("delegate: {message}")));

@@ -1216,3 +1216,77 @@ pub fn short_result(result: chess_core::game::GameResult) -> &'static str {
         AwaitingOpponent => "waiting",
     }
 }
+
+/// Asks for a nickname when neither the delegate nor the network knows one.
+///
+/// Only appears once both have had a chance to answer, so a returning player is
+/// never asked again — the point is to stop generating a throwaway name on every
+/// visit, not to add a step for people who already have one.
+#[component]
+pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
+    let mut chosen = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    // Only prompt once the delegate has answered; before that we do not yet
+    // know whether this player already has a name.
+    let mut waited = use_signal(|| false);
+
+    let s = state.read();
+    let needs_name = s.nickname_unset;
+    let settled = s.account_settled;
+    let player_id = s.me();
+    drop(s);
+
+    use_future(move || async move {
+        crate::gloo_sleep(4000).await;
+        waited.set(true);
+    });
+
+    if !needs_name || !settled || !waited() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "modal-bg",
+            div { class: "modal", style: "max-width:400px",
+                h3 { "Choose a nickname" }
+                div { class: "body",
+                    div { class: "small muted",
+                        "This is how other players will see you. You can change it later."
+                    }
+                    input {
+                        id: "choose-nickname",
+                        value: "{chosen}",
+                        placeholder: "your name",
+                        maxlength: 32,
+                        autofocus: true,
+                        oninput: move |e| chosen.set(e.value()),
+                    }
+                    div { class: "small muted",
+                        "Your id: "
+                        span { class: "mono", "{player_id}" }
+                    }
+                    if let Some(err) = error() {
+                        div { class: "banner err small", "{err}" }
+                    }
+                    div { class: "actions",
+                        button {
+                            class: "primary",
+                            id: "confirm-nickname",
+                            onclick: move |_| {
+                                let value = chosen();
+                                match validate_nickname(&value) {
+                                    Ok(()) => {
+                                        sync.send(Cmd::SetNickname(value));
+                                        error.set(None);
+                                    }
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            },
+                            "Continue"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

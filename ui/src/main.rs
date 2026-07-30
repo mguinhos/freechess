@@ -64,6 +64,17 @@ fn App() -> Element {
         }
     });
 
+    // Ask the delegate for the stored nickname too, on the same schedule.
+    use_future(move || async move {
+        for _ in 0..15 {
+            if !state.read().nickname_unset {
+                return;
+            }
+            sync.send(app::Cmd::LoadNickname);
+            gloo_sleep(2000).await;
+        }
+    });
+
     // Settle the account quickly at startup. The heartbeat also retries, but at
     // 30s intervals — too slow to keep the first page load waiting on.
     use_future(move || async move {
@@ -103,6 +114,7 @@ fn App() -> Element {
         views::TopBar { state, sync }
         views::StatusBanner { state }
         views::NoticeBanners { state }
+        views::ChooseNicknamePrompt { state, sync }
         match state.read().route.clone() {
             Route::Home => rsx! { views::HomeView { state, sync } },
             Route::Game(id) => rsx! {
@@ -125,7 +137,7 @@ fn game_id_from_url() -> Option<GameId> {
 }
 
 /// A timer future, without pulling in another dependency.
-async fn gloo_sleep(millis: u32) {
+pub(crate) async fn gloo_sleep(millis: u32) {
     let (tx, rx) = futures::channel::oneshot::channel::<()>();
     let closure = wasm_bindgen::closure::Closure::once_into_js(move || {
         let _ = tx.send(());
