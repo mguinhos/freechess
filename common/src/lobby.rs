@@ -359,6 +359,21 @@ impl LobbyGamesV1 {
         }
     }
 
+    /// Games that have finished, most recently active first.
+    ///
+    /// A game leaves `live_games` and appears here as soon as its snapshot
+    /// carries a decided result, so the home page can move it out of "in
+    /// progress" without waiting for anything else.
+    pub fn finished_games(&self) -> Vec<&LobbyEntry> {
+        let mut out: Vec<&LobbyEntry> = self
+            .games
+            .values()
+            .filter(|e| e.result().is_over())
+            .collect();
+        out.sort_by_key(|e| (std::cmp::Reverse(e.last_activity()), e.game_id.0));
+        out
+    }
+
     /// Games waiting for a challenger, newest first.
     pub fn open_games(&self) -> Vec<&LobbyEntry> {
         let mut out: Vec<&LobbyEntry> = self.games.values().filter(|e| e.is_open()).collect();
@@ -616,6 +631,46 @@ pub struct LobbyStateV1 {
 }
 
 impl LobbyStateV1 {
+    /// The current display name for a player, looked up by id.
+    ///
+    /// Names embedded in a game's setup, join or certificate are frozen: they
+    /// are covered by signatures made when the game started, so they cannot be
+    /// rewritten later. Presence, by contrast, is republished on every
+    /// heartbeat and whenever the player renames. Resolving by id here is what
+    /// lets the UI show the *current* name everywhere while the signed records
+    /// stay verifiable — with the embedded copy as a fallback for a player who
+    /// is not currently around.
+    pub fn display_name(&self, player: PlayerId, embedded: &str) -> String {
+        self.presence
+            .players
+            .get(&player)
+            .map(|p| p.nickname.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| embedded.to_string())
+    }
+
+    /// `(white, black)` display names for a game, both resolved by id.
+    pub fn game_names(&self, entry: &LobbyEntry) -> (String, String) {
+        let (white_embedded, black_embedded) = entry.nicknames();
+        let creator = entry.creator_id();
+        let challenger = entry.opponent.as_ref().map(|j| j.player_id());
+
+        match entry.setup.setup.creator_plays {
+            Color::White => (
+                self.display_name(creator, &white_embedded),
+                challenger
+                    .map(|id| self.display_name(id, &black_embedded))
+                    .unwrap_or(black_embedded),
+            ),
+            Color::Black => (
+                challenger
+                    .map(|id| self.display_name(id, &white_embedded))
+                    .unwrap_or(white_embedded),
+                self.display_name(creator, &black_embedded),
+            ),
+        }
+    }
+
     /// Apply the anti-spam quotas and the ranking/presence caps after every
     /// merge.
     pub fn prune(&mut self, _params: &LobbyParametersV1) -> Result<(), String> {

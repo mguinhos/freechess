@@ -319,12 +319,15 @@ async fn ensure_lobby(
     let id = freenet::lobby_id()?;
     instances.insert(id, Subject::Lobby);
 
+    // GET with subscribe=true, and nothing else: a separate SUBSCRIBE sent
+    // straight after would arrive before this GET has primed the local store,
+    // and the node rejects subscribing to a contract whose code it does not
+    // hold yet ("contract WASM/parameters not cached locally"). The GET carries
+    // the subscription, so the second message was both redundant and the source
+    // of that error.
     api.send(freenet::get_request(id, true))
         .await
-        .map_err(|e| format!("could not fetch the lobby: {e}"))?;
-    api.send(freenet::subscribe_request(id))
-        .await
-        .map_err(|e| format!("could not subscribe to the lobby: {e}"))
+        .map_err(|e| format!("could not fetch the lobby: {e}"))
 }
 
 async fn handle_cmd(

@@ -7,6 +7,7 @@ use chess_core::account;
 use chess_core::chess::{Board, Color, Move, PieceKind};
 use chess_core::game::setup::TimeControl;
 use chess_core::identity::{GameId, PlayerId};
+use chess_core::lobby::LobbyEntry;
 use chess_core::player::validate_nickname;
 use dioxus::prelude::*;
 
@@ -261,6 +262,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     let mut show_new = use_signal(|| false);
     let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
     let mut query = use_signal(String::new);
+    let mut tab = use_signal(|| "live");
 
     let s = state.read();
     let me = s.me();
@@ -276,6 +278,18 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     // A takedown is advisory, and this is what honouring it looks like: the
     // game stops appearing where clients look.
     live.retain(|e| !s.lobby.administration.is_taken_down(&e.game_id));
+    let finished: Vec<_> = s
+        .lobby
+        .games
+        .finished_games()
+        .into_iter()
+        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
+        .cloned()
+        .collect();
+    // Names resolved by id, so a rename shows up everywhere immediately.
+    let name_of = |e: &LobbyEntry| s.lobby.game_names(e);
+    let live_named: Vec<_> = live.iter().map(|e| (e.clone(), name_of(e))).collect();
+    let finished_named: Vec<_> = finished.iter().map(|e| (e.clone(), name_of(e))).collect();
     let open: Vec<_> = s
         .lobby
         .games
@@ -347,41 +361,77 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                     }
 
                     div { class: "panel",
-                        h2 {
-                            if searching { "Search results" } else { "Games in progress" }
-                            span { class: "badge live", "{live.len()}" }
-                        }
-                        if live.is_empty() {
-                            div { class: "empty",
-                                if searching { "Nothing matched that search." }
-                                else { "No games running yet — start one and it will show up here for everyone." }
+                        if searching {
+                            h2 {
+                                "Search results"
+                                span { class: "badge live", "{live_named.len()}" }
                             }
                         } else {
-                            div { class: "games",
-                                for entry in live {
-                                    {
-                                        let (white, black) = entry.nicknames();
-                                        let id = entry.game_id;
-                                        let tc = entry.time_control();
-                                        rsx! {
-                                            div {
-                                                key: "{id}",
-                                                class: "game-card",
-                                                onclick: move |_| {
-                                                    sync.send(Cmd::WatchGame(id));
-                                                    state.with_mut(|s| s.route = Route::Game(id));
-                                                },
-                                                div { class: "mini",
-                                                    MiniBoard { fen: entry.fen(), orientation: Color::White }
-                                                }
-                                                div { class: "who",
-                                                    b { "{white}" }
-                                                    span { class: "muted", "vs" }
-                                                    b { "{black}" }
-                                                }
-                                                div { class: "meta",
-                                                    span { class: "badge {tc.category().to_lowercase()}", "{tc.label()}" }
-                                                    span { "move {entry.snapshot.as_ref().map(|s| s.ply / 2 + 1).unwrap_or(1)}" }
+                            div { class: "tabs",
+                                button {
+                                    class: if tab() == "live" { "active" } else { "" },
+                                    onclick: move |_| tab.set("live"),
+                                    "In progress ({live_named.len()})"
+                                }
+                                button {
+                                    class: if tab() == "finished" { "active" } else { "" },
+                                    onclick: move |_| tab.set("finished"),
+                                    "Finished ({finished_named.len()})"
+                                }
+                            }
+                        }
+
+                        {
+                            // Searching cuts across both, so it shows its own results.
+                            let showing = if searching || tab() == "live" {
+                                live_named.clone()
+                            } else {
+                                finished_named.clone()
+                            };
+                            let is_finished_tab = !searching && tab() == "finished";
+
+                            if showing.is_empty() {
+                                rsx! {
+                                    div { class: "empty",
+                                        if searching { "Nothing matched that search." }
+                                        else if is_finished_tab { "No finished games yet." }
+                                        else { "No games running yet — start one and it will show up here for everyone." }
+                                    }
+                                }
+                            } else {
+                                rsx! {
+                                    div { class: "games",
+                                        for (entry, (white, black)) in showing {
+                                            {
+                                                let id = entry.game_id;
+                                                let tc = entry.time_control();
+                                                let over = entry.result().is_over();
+                                                let class = if over { "game-card finished" } else { "game-card" };
+                                                rsx! {
+                                                    div {
+                                                        key: "{id}",
+                                                        class: "{class}",
+                                                        onclick: move |_| {
+                                                            sync.send(Cmd::WatchGame(id));
+                                                            state.with_mut(|s| s.route = Route::Game(id));
+                                                        },
+                                                        div { class: "mini",
+                                                            MiniBoard { fen: entry.fen(), orientation: Color::White }
+                                                        }
+                                                        div { class: "who",
+                                                            b { "{white}" }
+                                                            span { class: "muted", "vs" }
+                                                            b { "{black}" }
+                                                        }
+                                                        div { class: "meta",
+                                                            span { class: "badge {tc.category().to_lowercase()}", "{tc.label()}" }
+                                                            if over {
+                                                                span { class: "result-line", "{short_result(entry.result())}" }
+                                                            } else {
+                                                                span { "move {entry.snapshot.as_ref().map(|s| s.ply / 2 + 1).unwrap_or(1)}" }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -547,14 +597,25 @@ pub fn GameView(
         None
     };
 
+    // Resolved by id from presence, so a rename shows immediately here too; the
+    // signed copy in the setup/join is the fallback.
     let (white_name, black_name) = match game.setup.get() {
         Some(setup) => {
-            let creator = setup.setup.creator_nickname.clone();
-            let challenger = game
+            let creator_embedded = setup.setup.creator_nickname.clone();
+            let challenger_embedded = game
                 .opponent
                 .get()
                 .map(|j| j.nickname.clone())
                 .unwrap_or_else(|| "waiting\u{2026}".to_string());
+            let s = state.read();
+            let creator = s
+                .lobby
+                .display_name(PlayerId::from(&setup.creator), &creator_embedded);
+            let challenger = match game.opponent.get() {
+                Some(j) => s.lobby.display_name(j.player_id(), &challenger_embedded),
+                None => challenger_embedded,
+            };
+            drop(s);
             match setup.setup.creator_plays {
                 Color::White => (creator, challenger),
                 Color::Black => (challenger, creator),
@@ -1141,5 +1202,17 @@ pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()
                 }
             }
         }
+    }
+}
+
+/// Compact result label for a finished game in the lobby.
+pub fn short_result(result: chess_core::game::GameResult) -> &'static str {
+    use chess_core::game::GameResult::*;
+    match result {
+        WhiteWins(_) => "1-0",
+        BlackWins(_) => "0-1",
+        Draw(_) => "\u{00BD}-\u{00BD}",
+        InProgress => "playing",
+        AwaitingOpponent => "waiting",
     }
 }

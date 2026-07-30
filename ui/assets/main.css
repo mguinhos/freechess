@@ -144,6 +144,10 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .board {
   display: grid;
   grid-template-columns: repeat(8, 1fr);
+  /* Rows must be explicit too. Without this each row sizes to its content, so
+     ranks holding pieces grow to the glyph height while empty ranks collapse —
+     the board came out visibly uneven. */
+  grid-template-rows: repeat(8, 1fr);
   width: 100%;
   aspect-ratio: 1;
   border-radius: 4px;
@@ -156,6 +160,10 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
   display: flex;
   align-items: center;
   justify-content: center;
+  /* A square is a square: never let its content decide its size. */
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   /* Scale the glyph to the square, so the board works at any size — from the
      full game board down to the lobby's 96px previews. */
   font-size: min(9vw, 46px);
@@ -371,7 +379,9 @@ label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, .55);
+  /* Light enough that the final position stays readable underneath — the point
+     of showing the board at all is to see how the game ended. */
+  background: rgba(0, 0, 0, .35);
   z-index: 5;
   border-radius: 4px;
 }
@@ -411,3 +421,13 @@ code.key {
   padding: 5px 10px;
 }
 .conn.gh:hover { color: var(--text); border-color: var(--green); }
+
+/* A finished game in the lobby: still browsable, visibly not live. */
+.game-card.finished { opacity: .55; }
+.game-card.finished:hover { opacity: .85; }
+.game-card .result-line {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  letter-spacing: .4px;
+}
