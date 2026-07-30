@@ -27,7 +27,12 @@ const flag = (n, d) => {
 const PORT = flag("port", "7513");
 const NICK = flag("nick", "claude");
 const CMDFILE = flag("cmdfile", "/tmp/freechess-cmds");
-const CONTRACT = "9d5RfZUjBtVjE81yyRTVUctQdgfAvoD59QukeVFLSark";
+// Read from the file the publish step writes, rather than a constant edited by
+// hand on every release — that only ever showed up as a dirty working tree.
+const CONTRACT = readFileSync(
+  new URL("../target/webapp/contract-id", import.meta.url),
+  "utf8",
+).trim();
 const APP = `http://127.0.0.1:${PORT}/v1/contract/web/${CONTRACT}/`;
 
 let page, app, myColor = "white";
