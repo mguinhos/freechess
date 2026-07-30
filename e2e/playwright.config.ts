@@ -28,6 +28,12 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: [["list"], ["html", { open: "never" }]],
   use: {
+    // Actions default to NO timeout, so a click on an element that never
+    // appears hangs until the test cap and is reported as a bare "test
+    // timeout" naming nothing — the single most misleading failure mode in
+    // this suite. Bound them so the report says which action was stuck.
+    actionTimeout: 60_000,
+    navigationTimeout: 90_000,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",

@@ -28,17 +28,19 @@ export const PEER_PORT = 7512;
 export const PEER2_PORT = 7514;
 
 /**
- * The published webapp's contract id, written by `cargo make publish-webapp`.
- * Read from disk rather than hardcoded so the tests follow a republish.
+ * The published webapp's contract id.
+ *
+ * Read from the committed `published-contract/`, which is the address the app
+ * is actually published to — not from a build output. A build output would go
+ * stale or vanish on `cargo clean`, and worse, could disagree with where the
+ * publish landed.
  */
 export function contractId(): string {
-  const path = join(__dirname, "../../target/webapp/contract-id");
+  const path = join(__dirname, "../../published-contract/contract-id.txt");
   try {
     return readFileSync(path, "utf8").trim();
   } catch {
-    throw new Error(
-      `could not read ${path} — publish the app first with 'cargo make publish'`,
-    );
+    throw new Error(`could not read ${path} — is published-contract/ committed?`);
   }
 }
 

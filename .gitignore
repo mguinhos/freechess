@@ -34,6 +34,13 @@ node_modules/
 # silently changes contract keys. `cargo make build-contracts` regenerates it.
 *.wasm
 
+# The one exception, and it is the same rule read the other way round. The web
+# container's key IS the app's public address, so its bytes must never change by
+# accident — a dependency bump, a different machine, even a different $HOME is
+# enough to move it. It is therefore a committed artifact, published as-is and
+# never rebuilt for a release. See published-contract/README.md.
+!published-contract/*.wasm
+
 # The webapp publisher keys. Whoever holds one controls what that app URL
 # serves, so they are local-only and never committed. The glob covers the
 # rotated copies (.v2-<ts> and so on) left behind when publishing to a new

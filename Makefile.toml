@@ -12,6 +12,8 @@ skip_core_tasks = true
 # The node to talk to. Override for a second node:  WS_API_PORT=7510 cargo make publish
 WS_API_PORT = { value = "7509", condition = { env_not_set = ["WS_API_PORT"] } }
 WASM_DIR = "target/wasm32-unknown-unknown/release"
+# The app's identity, committed rather than rebuilt. See published-contract/README.md.
+PUBLISHED = "published-contract"
 CONTRACTS = "game-contract lobby-contract archive-contract player-contract"
 
 # ---------------------------------------------------------------- build
@@ -19,8 +21,12 @@ CONTRACTS = "game-contract lobby-contract archive-contract player-contract"
 [tasks.build-contracts]
 description = "Compile the contracts to WASM"
 command = "cargo"
+# `--locked` is load-bearing, not tidiness. A contract key is
+# BLAKE3(BLAKE3(wasm) || params), so a lock that re-resolves on a release
+# machine silently re-keys the contract. That is exactly how the app address
+# moved on 2026-07-30.
 args = [
-    "build", "--release", "--target", "wasm32-unknown-unknown",
+    "build", "--locked", "--release", "--target", "wasm32-unknown-unknown",
     "-p", "game-contract",
     "-p", "lobby-contract",
     "-p", "archive-contract",
@@ -31,7 +37,10 @@ args = [
 [tasks.build-delegate]
 description = "Compile the delegate to WASM"
 command = "cargo"
-args = ["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "chess-delegate"]
+# `--locked` matters even more here: the delegate key derives from these bytes
+# and the player's account seed is stored under it. A silent re-key loses every
+# account. See `check-delegate-migration`.
+args = ["build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "-p", "chess-delegate"]
 
 [tasks.webapp-params]
 description = "Load the publisher key and write the contract parameters"
@@ -56,6 +65,18 @@ cargo run --quiet -p webapp-packager -- \
   --key .freenet-publisher.key \
   --out-dir target/webapp \
   --params-only
+
+# The committed params are the app's identity; the local key must be the one
+# behind them. Catching a mismatch here turns "published to an address nobody
+# has" into a build error before anything reaches the network.
+if [ -f "${PUBLISHED}/webapp.params" ] \
+   && ! cmp -s target/webapp/webapp.params "${PUBLISHED}/webapp.params"; then
+  echo "ERROR: .freenet-publisher.key does not match ${PUBLISHED}/webapp.params." >&2
+  echo "       This key would publish to a different address than the committed one." >&2
+  echo "       Restore the right key, or migrate deliberately:" >&2
+  echo "         cargo make update-published-contract" >&2
+  exit 1
+fi
 '''
 
 [tasks.build-ui]
@@ -74,9 +95,11 @@ set -e
 # webapp too large to transfer reliably. Clear it first.
 rm -rf target/dx/chess-ui
 
+# From the COMMITTED container, not a fresh build: the base path baked into
+# every asset URL has to be the address we will actually publish to.
 KEY=$(fdev get-contract-id \
-  --code "${WASM_DIR}/web_container_contract.wasm" \
-  --parameters target/webapp/webapp.params | tr -d '[:space:]')
+  --code "${PUBLISHED}/web_container_contract.wasm" \
+  --parameters "${PUBLISHED}/webapp.params" | tr -d '[:space:]')
 
 if [ -z "$KEY" ]; then
   echo "ERROR: could not derive the webapp contract id" >&2
@@ -120,7 +143,13 @@ args = ["clippy", "--workspace", "--exclude", "chess-ui", "--", "-D", "warnings"
 
 [tasks.preflight]
 description = "Everything CI would run, before publishing"
-dependencies = ["fmt", "clippy", "test", "check-contract-keys"]
+dependencies = [
+    "fmt",
+    "clippy",
+    "test",
+    "check-contract-keys",
+    "check-published-contract",
+]
 
 [tasks.check-contract-keys]
 description = "Fail if two contracts hash to the same WASM"
@@ -196,11 +225,28 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
     -C "$DIST" -cf "$OUT/webapp.tar" .
 xz -f -9 "$OUT/webapp.tar"
 
-# Bump the version on every package so a republish is always accepted: the
-# contract rejects a version that is not greater than the one it holds.
-VERSION_FILE="$OUT/version"
-VERSION=$(( $(cat "$VERSION_FILE" 2>/dev/null || echo 0) + 1 ))
+# Bump the version so a republish is always accepted: the contract rejects a
+# version that is not greater than the one it holds.
+#
+# The counter is COMMITTED. It used to live under target/, which is gitignored,
+# so a `cargo clean` reset it to 1 and every publish afterwards was rejected by a
+# network already holding 55 — with nothing to tell you why. It is also a
+# counter and never a timestamp: River lost a day to a clock-derived version
+# that ended up permanently behind the on-network one.
+#
+# Bumping before publishing risks leaving the file ahead if the publish fails,
+# so snapshot first; publish-webapp restores the snapshot on failure.
+VERSION_FILE="${PUBLISHED}/contract-version.txt"
+if [ ! -f "$VERSION_FILE" ]; then
+  echo "ERROR: $VERSION_FILE is missing." >&2
+  echo "       Seed it with the version currently live on the network." >&2
+  exit 1
+fi
+CURRENT=$(tr -d '[:space:]' < "$VERSION_FILE")
+VERSION=$(( CURRENT + 1 ))
+cp "$VERSION_FILE" "$VERSION_FILE.prev"
 echo "$VERSION" > "$VERSION_FILE"
+echo "web-container version: $CURRENT -> $VERSION (commit $VERSION_FILE after a successful publish)"
 
 cargo run --quiet -p webapp-packager -- \
   --archive "$OUT/webapp.tar.xz" \
@@ -238,19 +284,45 @@ description = "Publish the UI at its stable address, and verify it really landed
 dependencies = ["package-webapp"]
 script_runner = "@shell"
 script = '''
-set -e
 OUT="target/webapp"
+VERSION_FILE="${PUBLISHED}/contract-version.txt"
 
+# Roll the version counter back if anything below fails, so a failed attempt
+# cannot leave us numbered ahead of what the network actually holds.
+rollback_version() {
+  if [ -f "$VERSION_FILE.prev" ]; then
+    mv "$VERSION_FILE.prev" "$VERSION_FILE"
+    echo "rolled $VERSION_FILE back to $(cat "$VERSION_FILE")" >&2
+  fi
+}
+trap 'rollback_version' EXIT
+set -e
+
+# Everything comes from the COMMITTED artifact — never a fresh build. That is
+# the whole point: rebuilding is what moves the address. See
+# published-contract/README.md.
 KEY=$(fdev get-contract-id \
-  --code "${WASM_DIR}/web_container_contract.wasm" \
-  --parameters "$OUT/webapp.params" 2>/dev/null | tr -d '[:space:]')
+  --code "${PUBLISHED}/web_container_contract.wasm" \
+  --parameters "${PUBLISHED}/webapp.params" 2>/dev/null | tr -d '[:space:]')
+PINNED=$(tr -d '[:space:]' < "${PUBLISHED}/contract-id.txt")
+
+# The gate. If these ever disagree, the committed files are inconsistent and
+# publishing would land somewhere nobody has bookmarked.
+if [ "$KEY" != "$PINNED" ]; then
+  echo "ERROR: the committed container does not derive the committed address." >&2
+  echo "  derived: $KEY" >&2
+  echo "  pinned:  $PINNED" >&2
+  echo "  Someone edited published-contract/ by hand. To change the address on" >&2
+  echo "  purpose, use: cargo make update-published-contract" >&2
+  exit 1
+fi
 
 # PUT, at the same address every time. `fdev execute update` is NOT the route:
 # it fails with "missing contract" even right after a successful GET, because
 # only a PUT registers the contract's code with the node.
 fdev --port "${WS_API_PORT}" publish \
-  --code "${WASM_DIR}/web_container_contract.wasm" \
-  --parameters "$OUT/webapp.params" \
+  --code "${PUBLISHED}/web_container_contract.wasm" \
+  --parameters "${PUBLISHED}/webapp.params" \
   contract \
   --state "$OUT/webapp.state"
 
@@ -269,11 +341,16 @@ SERVED=$(curl -s --max-time 90 \
   "http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/?__sandbox=1" \
   | grep -oE 'assets/chess-ui-[a-z0-9]+\.js' | head -1)
 
-echo "$KEY" > "$OUT/contract-id"
 echo
 if [ "$BUILT" = "$SERVED" ]; then
+  # Publish confirmed: the bumped counter is the new truth, so drop the
+  # snapshot and disarm the rollback.
+  rm -f "$VERSION_FILE.prev"
+  trap - EXIT
   echo "FreeChess is live at:"
   echo "  http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/"
+  echo
+  echo "Commit ${VERSION_FILE} (now $(cat "$VERSION_FILE"))."
 else
   echo "WARNING: the node is not serving the build that was just published."
   echo "  built:  ${BUILT:-<none>}"
@@ -281,6 +358,66 @@ else
   echo "  The publish reported success regardless — retry, and check with:"
   echo "    fdev --port ${WS_API_PORT} execute get ${KEY}"
   exit 1
+fi
+'''
+
+[tasks.update-published-contract]
+description = "Deliberately re-key the app: rebuild the container and move its address"
+dependencies = ["build-contracts"]
+script_runner = "@shell"
+script = '''
+set -e
+OLD_ID=$(tr -d '[:space:]' < "${PUBLISHED}/contract-id.txt" 2>/dev/null || echo "<none>")
+
+cargo run --quiet -p webapp-packager -- \
+  --key .freenet-publisher.key --out-dir target/webapp --params-only
+
+NEW_ID=$(fdev get-contract-id \
+  --code "${WASM_DIR}/web_container_contract.wasm" \
+  --parameters target/webapp/webapp.params | tr -d '[:space:]')
+
+if [ "$NEW_ID" = "$OLD_ID" ]; then
+  echo "The rebuilt container derives the same address ($NEW_ID). Nothing to do."
+  exit 0
+fi
+
+cp "${WASM_DIR}/web_container_contract.wasm" "${PUBLISHED}/"
+cp target/webapp/webapp.params "${PUBLISHED}/webapp.params"
+echo "$NEW_ID" > "${PUBLISHED}/contract-id.txt"
+
+echo
+echo "The app address has MOVED."
+echo "  old: $OLD_ID"
+echo "  new: $NEW_ID"
+echo
+echo "Every existing bookmark now points at the old address. Before shipping this:"
+echo "  1. Publish a migration notice AT THE OLD ADDRESS from the admin panel."
+echo "     It locks new games in the lobby, leaves games in progress running,"
+echo "     and shows players where to go. The old bytes are still in git history,"
+echo "     so the old address remains publishable — that is why we freeze them."
+echo "  2. Commit ${PUBLISHED}/ in one commit, recording the old address in the"
+echo "     message so it can be recovered from history."
+'''
+
+[tasks.check-published-contract]
+description = "Report whether a rebuilt container would still match the committed one"
+dependencies = ["build-contracts"]
+script_runner = "@shell"
+script = '''
+# Informational, never fatal. Drift here is expected and harmless — it just
+# means a dependency moved since the container was frozen, and we keep
+# publishing the frozen bytes anyway. It becomes interesting only when someone
+# edits the container's source and wonders why nothing changed.
+FROZEN=$(sha256sum "${PUBLISHED}/web_container_contract.wasm" | cut -d' ' -f1)
+FRESH=$(sha256sum "${WASM_DIR}/web_container_contract.wasm" | cut -d' ' -f1)
+echo "container (committed): $FROZEN"
+echo "container (rebuilt):   $FRESH"
+if [ "$FROZEN" = "$FRESH" ]; then
+  echo "-> identical; a rebuild would keep the address."
+else
+  echo "-> DRIFTED. Publishing still uses the committed bytes, so the address is safe."
+  echo "   If you changed the container's source and expect it to take effect,"
+  echo "   you must re-key deliberately: cargo make update-published-contract"
 fi
 '''
 
