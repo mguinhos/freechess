@@ -22,6 +22,7 @@ node_modules/
 # Local review notes
 /codebase-report.md
 /pr-mtrav.md
+/address.md
 
 # Editors
 .vscode/

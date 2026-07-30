@@ -306,6 +306,7 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
                         // contract arrives on this same channel. Reporting it as
                         // a dead node hides the real error behind "check that
                         // the node is running", which is what it did before.
+                        sync_log(&format!("host error: {e}"));
                         state.with_mut(|s| s.message = Some(e));
                     }
                     None => break,
@@ -904,6 +905,11 @@ fn handle_response(
 
     let (id, payload) = match contract_response {
         ContractResponse::GetResponse { key, state, .. } => {
+            sync_log(&format!(
+                "GetResponse {} ({} bytes)",
+                key.id(),
+                state.as_ref().len()
+            ));
             (*key.id(), Payload::Full(state.as_ref().to_vec()))
         }
         ContractResponse::UpdateNotification { key, update } => {
@@ -914,32 +920,60 @@ fn handle_response(
                 UpdateData::State(s) => Payload::Full(s.as_ref().to_vec()),
                 UpdateData::StateAndDelta { state, .. } => Payload::Full(state.as_ref().to_vec()),
                 UpdateData::Delta(d) => Payload::Delta(d.as_ref().to_vec()),
-                _ => return None,
+                _ => {
+                    sync_log(&format!(
+                        "DROP UpdateNotification {}: unknown UpdateData variant",
+                        key.id()
+                    ));
+                    return None;
+                }
             };
+            sync_log(&format!(
+                "UpdateNotification {} ({})",
+                key.id(),
+                match &payload {
+                    Payload::Full(b) => format!("full state, {} bytes", b.len()),
+                    Payload::Delta(b) => format!("delta, {} bytes", b.len()),
+                }
+            ));
             (*key.id(), payload)
         }
-        _ => return None,
+        other => {
+            sync_log(&format!(
+                "contract response (not routed): {}",
+                match other {
+                    ContractResponse::PutResponse { .. } => "PutResponse",
+                    ContractResponse::UpdateResponse { .. } => "UpdateResponse",
+                    ContractResponse::SubscribeResponse { .. } => "SubscribeResponse",
+                    _ => "other",
+                }
+            ));
+            return None;
+        }
     };
 
     match instances.get(&id) {
         Some(Subject::Lobby) => {
             let params = LobbyParametersV1::default();
             state.with_mut(|s| match &payload {
-                Payload::Full(bytes) => {
-                    if let Ok(lobby) = freenet::decode::<LobbyStateV1>(bytes) {
-                        s.lobby = lobby;
-                    }
-                }
+                Payload::Full(bytes) => match freenet::decode::<LobbyStateV1>(bytes) {
+                    Ok(lobby) => s.lobby = lobby,
+                    Err(e) => sync_log(&format!("DROP lobby full state: decode failed: {e}")),
+                },
                 Payload::Delta(bytes) => {
-                    if let Ok(delta) =
-                        freenet::decode::<chess_core::lobby::LobbyStateV1Delta>(bytes)
-                    {
-                        let base = s.lobby.clone();
-                        // Apply through the contract's own merge, so the client
-                        // converges by exactly the rules the network enforces.
-                        if s.lobby.apply_delta(&base, &params, &Some(delta)).is_ok() {
-                            let _ = s.lobby.prune(&params);
+                    match freenet::decode::<chess_core::lobby::LobbyStateV1Delta>(bytes) {
+                        Ok(delta) => {
+                            let base = s.lobby.clone();
+                            // Apply through the contract's own merge, so the client
+                            // converges by exactly the rules the network enforces.
+                            match s.lobby.apply_delta(&base, &params, &Some(delta)) {
+                                Ok(()) => {
+                                    let _ = s.lobby.prune(&params);
+                                }
+                                Err(e) => sync_log(&format!("DROP lobby delta: apply failed: {e}")),
+                            }
                         }
+                        Err(e) => sync_log(&format!("DROP lobby delta: decode failed: {e}")),
                     }
                 }
             });
@@ -950,29 +984,51 @@ fn handle_response(
             // The contract is now in the local store, so a deferred join can go.
             let resume_join = state.with(|s| s.pending_join == Some(game_id));
             state.with_mut(|s| match &payload {
-                Payload::Full(bytes) => {
-                    if let Ok(game) = freenet::decode::<ChessGameStateV1>(bytes) {
+                Payload::Full(bytes) => match freenet::decode::<ChessGameStateV1>(bytes) {
+                    Ok(game) => {
+                        sync_log(&format!(
+                            "game {game_id}: applied full state, {} plies",
+                            game.moves.moves.len()
+                        ));
                         if let Some(setup) = game.setup.get() {
                             s.creators.insert(game_id, setup.creator);
                         }
                         s.games.insert(game_id, game);
                     }
-                }
+                    Err(e) => sync_log(&format!(
+                        "DROP game {game_id} full state: decode failed: {e}"
+                    )),
+                },
                 Payload::Delta(bytes) => {
-                    let Ok(delta) =
-                        freenet::decode::<chess_core::game::ChessGameStateV1Delta>(bytes)
-                    else {
-                        return;
-                    };
+                    let delta =
+                        match freenet::decode::<chess_core::game::ChessGameStateV1Delta>(bytes) {
+                            Ok(delta) => delta,
+                            Err(e) => {
+                                sync_log(&format!("DROP game {game_id} delta: decode failed: {e}"));
+                                return;
+                            }
+                        };
                     let Some(creator) = s.creators.get(&game_id).copied() else {
+                        sync_log(&format!(
+                            "DROP game {game_id} delta: creator unknown, cannot build params"
+                        ));
                         return;
                     };
                     let params = chess_core::game::ChessGameParametersV1 { creator, game_id };
                     let mut game = s.games.get(&game_id).cloned().unwrap_or_default();
                     let base = game.clone();
-                    if game.apply_delta(&base, &params, &Some(delta)).is_ok() {
-                        let _ = game.prune(&params);
-                        s.games.insert(game_id, game);
+                    match game.apply_delta(&base, &params, &Some(delta)) {
+                        Ok(()) => {
+                            let _ = game.prune(&params);
+                            sync_log(&format!(
+                                "game {game_id}: applied delta, now {} plies",
+                                game.moves.moves.len()
+                            ));
+                            s.games.insert(game_id, game);
+                        }
+                        Err(e) => {
+                            sync_log(&format!("DROP game {game_id} delta: apply failed: {e}"))
+                        }
                     }
                 }
             });
@@ -981,10 +1037,21 @@ fn handle_response(
             }
         }
 
-        Some(Subject::Profile(_)) | None => {}
+        Some(Subject::Profile(_)) => {}
+        None => {
+            sync_log(&format!(
+                "DROP response for {id}: instance not in the routing map"
+            ));
+        }
     }
 
     None
+}
+
+/// Instrumentation for the notification path: everything the node sends and
+/// everything we drop, tagged for filtering in the browser console.
+fn sync_log(msg: &str) {
+    web_sys::console::log_1(&format!("[freechess-sync] {msg}").into());
 }
 
 /// Fold the delegate's answer into state.
