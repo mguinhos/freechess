@@ -34,11 +34,24 @@ command = "cargo"
 args = ["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "chess-delegate"]
 
 [tasks.webapp-params]
-description = "Create/load the publisher key and write the contract parameters"
+description = "Load the publisher key and write the contract parameters"
 script_runner = "@shell"
 script = '''
 set -e
 mkdir -p target/webapp
+
+# The app's address is BLAKE3(BLAKE3(container wasm) || params), and params IS
+# this key. So the key is what keeps the URL stable across releases — it is a
+# long-lived artifact, not a per-build one. Publishing a new version does NOT
+# need a new key: it rewrites the state at the same address, and the container
+# contract only accepts a state whose `version` is higher, so an old build
+# cannot overwrite a new one.
+if [ ! -f .freenet-publisher.key ]; then
+  echo "NOTE: no .freenet-publisher.key — creating one."
+  echo "      This mints a NEW app address; every existing bookmark breaks."
+  echo "      Restore the previous key instead if that is not what you want."
+fi
+
 cargo run --quiet -p webapp-packager -- \
   --key .freenet-publisher.key \
   --out-dir target/webapp \
@@ -207,26 +220,54 @@ fdev --port "${WS_API_PORT}" publish \
 '''
 
 [tasks.publish-webapp]
-description = "Publish the UI to the local node and print its URL"
+description = "Publish the UI at its stable address, and verify it really landed"
 dependencies = ["package-webapp"]
 script_runner = "@shell"
 script = '''
 set -e
 OUT="target/webapp"
+
+KEY=$(fdev get-contract-id \
+  --code "${WASM_DIR}/web_container_contract.wasm" \
+  --parameters "$OUT/webapp.params" 2>/dev/null | tr -d '[:space:]')
+
+# PUT, at the same address every time. `fdev execute update` is NOT the route:
+# it fails with "missing contract" even right after a successful GET, because
+# only a PUT registers the contract's code with the node.
 fdev --port "${WS_API_PORT}" publish \
   --code "${WASM_DIR}/web_container_contract.wasm" \
   --parameters "$OUT/webapp.params" \
   contract \
   --state "$OUT/webapp.state"
 
-KEY=$(fdev get-contract-id \
-  --code "${WASM_DIR}/web_container_contract.wasm" \
-  --parameters "$OUT/webapp.params" 2>/dev/null | tr -d '[:space:]')
+# Verify rather than trust the output. `fdev publish` prints "published
+# successfully" in cases where nothing was stored at all, and it has also
+# reported success while the node kept serving a previous build — both of which
+# cost hours to notice. Compare what is served against what was just built.
+DIST=""
+for candidate in "target/dx/chess-ui/release/web/public" "ui/dist/public" "ui/dist"; do
+  if [ -f "$candidate/index.html" ]; then DIST="$candidate"; break; fi
+done
+BUILT=$(grep -oE 'assets/chess-ui-[a-z0-9]+\.js' "$DIST/index.html" | head -1)
 
-echo
-echo "FreeChess is live at:"
-echo "  http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/"
+sleep 5
+SERVED=$(curl -s --max-time 90 \
+  "http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/?__sandbox=1" \
+  | grep -oE 'assets/chess-ui-[a-z0-9]+\.js' | head -1)
+
 echo "$KEY" > "$OUT/contract-id"
+echo
+if [ "$BUILT" = "$SERVED" ]; then
+  echo "FreeChess is live at:"
+  echo "  http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/"
+else
+  echo "WARNING: the node is not serving the build that was just published."
+  echo "  built:  ${BUILT:-<none>}"
+  echo "  served: ${SERVED:-<none>}"
+  echo "  The publish reported success regardless — retry, and check with:"
+  echo "    fdev --port ${WS_API_PORT} execute get ${KEY}"
+  exit 1
+fi
 '''
 
 [tasks.publish]
