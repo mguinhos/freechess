@@ -210,13 +210,27 @@ cargo run --quiet -p webapp-packager -- \
 '''
 
 [tasks.publish-delegate]
-description = "Publish the delegate to the local node"
+description = "Pre-register the delegate on the local node (optional)"
 dependencies = ["build-delegate"]
 script_runner = "@shell"
 script = '''
-fdev --port "${WS_API_PORT}" publish \
+# Belt and braces only. The app embeds the delegate WASM and registers it over
+# the websocket on every load (`register_delegate_request` in ui/src/freenet.rs),
+# because a delegate has to exist on whichever node the *browser* is talking to
+# — which is not necessarily the one this task publishes to.
+#
+# So a failure here is not fatal and must not abort a release. It currently
+# fails outright when fdev is newer than the node ("unsupported incremental API
+# version"), which took down the whole publish for a step that changes nothing.
+if fdev --port "${WS_API_PORT}" publish \
   --code "${WASM_DIR}/chess_delegate.wasm" \
-  delegate
+  delegate 2>&1; then
+  echo "delegate pre-registered on port ${WS_API_PORT}"
+else
+  echo "NOTE: could not pre-register the delegate on port ${WS_API_PORT}."
+  echo "      Harmless — the app registers it itself on load. Usually means"
+  echo "      fdev ($(fdev --version 2>/dev/null | tail -1)) is newer than the node."
+fi
 '''
 
 [tasks.publish-webapp]
