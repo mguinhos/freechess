@@ -9,7 +9,7 @@ use super::{
     ChessGameParametersV1, ChessGameStateV1, DrawReason, GameResult, WinReason, SIG_DOMAIN,
 };
 use crate::chess::Color;
-use crate::identity::{verify_sig, GameId, PlayerId};
+use crate::identity::{signature_digest, verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
@@ -415,7 +415,7 @@ impl ComposableState for ConclusionV1 {
     /// peers holding *different* claims both report "I have one" and neither
     /// ship a delta, so the total order that settles them is never reached and
     /// the divergence is permanent.
-    type Summary = Vec<Vec<u8>>;
+    type Summary = Vec<u64>;
     type Delta = Vec<SignedConclusion>;
     type Parameters = ChessGameParametersV1;
 
@@ -439,7 +439,7 @@ impl ComposableState for ConclusionV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.claims
             .iter()
-            .map(|c| c.signature.to_bytes().to_vec())
+            .map(|c| signature_digest(&c.signature))
             .collect()
     }
 
@@ -449,12 +449,11 @@ impl ComposableState for ConclusionV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: std::collections::BTreeSet<&[u8]> =
-            old_summary.iter().map(|s| s.as_slice()).collect();
+        let theirs: std::collections::BTreeSet<u64> = old_summary.iter().copied().collect();
         let missing: Vec<SignedConclusion> = self
             .claims
             .iter()
-            .filter(|c| !theirs.contains(c.signature.to_bytes().as_slice()))
+            .filter(|c| !theirs.contains(&signature_digest(&c.signature)))
             .cloned()
             .collect();
         if missing.is_empty() {

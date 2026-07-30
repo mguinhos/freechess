@@ -1398,3 +1398,310 @@ fn the_merged_state_always_survives_validation() {
         GameResult::WhiteWins(WinReason::Resignation)
     );
 }
+
+#[test]
+fn two_moves_signed_for_one_ply_still_exchange() {
+    // `absorb` settles a double-signed ply by signature bytes, but the summary
+    // was the ply list alone. Two peers each holding a different move for the
+    // same ply reported identical summaries, neither shipped, and the boards
+    // diverged permanently.
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let one = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("e2e4").unwrap(),
+        T0 + 2_000,
+    );
+    let two = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("d2d4").unwrap(),
+        T0 + 2_000,
+    );
+    let winner = if one.signature.to_bytes() < two.signature.to_bytes() {
+        one.clone()
+    } else {
+        two.clone()
+    };
+
+    let mut peer1 = base.clone();
+    peer1.moves.moves.insert(0, one);
+    let mut peer2 = base.clone();
+    peer2.moves.moves.insert(0, two);
+
+    for _ in 0..2 {
+        let s1 = peer1.moves.summarize(&peer1, &params);
+        if let Some(d) = peer2.moves.delta(&peer2, &params, &s1) {
+            peer1
+                .moves
+                .apply_delta(&peer1.clone(), &params, &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.moves.summarize(&peer2, &params);
+        if let Some(d) = peer1.moves.delta(&peer1, &params, &s2) {
+            peer2
+                .moves
+                .apply_delta(&peer2.clone(), &params, &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.moves, peer2.moves, "both peers must reach one board");
+    assert_eq!(peer1.moves.moves.get(&0), Some(&winner));
+}
+
+// --------------------------------------------------- convergence harness
+
+/// Drives `freenet_scaffold`'s convergence framework over the whole game state.
+///
+/// The platform's requirement on a contract is algebraic: the merge must be
+/// commutative, associative and idempotent, and the whitepaper is explicit that
+/// it "cannot statically verify the algebraic properties; a contract that
+/// violates them will fail to converge". The hand-written tests above each pin
+/// one specific way that could break. This pins the general property, over
+/// permuted orderings of a mixed operation stream, across every field at once —
+/// which is what actually catches an interaction nobody thought to write a test
+/// for.
+#[derive(Clone)]
+struct GameHarness {
+    white: SigningKey,
+    black: SigningKey,
+    state: ChessGameStateV1,
+    params: ChessGameParametersV1,
+    /// A fixed legal line, so ply *n* always carries the same move whatever
+    /// order the operations arrive in.
+    line: Vec<&'static str>,
+    /// Whether to generate move operations. See
+    /// [`the_game_state_merge_is_commutative`] for why the strict commutativity
+    /// run leaves them out.
+    include_moves: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Op {
+    /// Play the move at this ply from the fixed line.
+    PlayPly(usize),
+    /// Attest a clock reading. `who` is 0 for White, 1 for Black.
+    Attest { who: usize, tick: i64 },
+    /// Resign, which is always decisive and so always changes the result.
+    Resign { who: usize, at: i64 },
+}
+
+impl GameHarness {
+    fn new() -> GameHarness {
+        let white = key();
+        let black = key();
+        let (state, params) = started_game(&white, &black);
+        GameHarness {
+            white,
+            black,
+            state,
+            params,
+            line: vec![
+                "e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "d2d3", "d7d6",
+            ],
+            include_moves: true,
+        }
+    }
+
+    fn without_moves() -> GameHarness {
+        GameHarness {
+            include_moves: false,
+            ..GameHarness::new()
+        }
+    }
+
+    fn signer(&self, who: usize) -> &SigningKey {
+        if who == 0 {
+            &self.white
+        } else {
+            &self.black
+        }
+    }
+}
+
+impl freenet_scaffold::convergence::ConvergenceTestHarness for GameHarness {
+    type State = ChessGameStateV1;
+    type Delta = ChessGameStateV1Delta;
+    type Parameters = ChessGameParametersV1;
+    type Operation = Op;
+
+    fn initial_state(&self) -> (Self::State, Self::Parameters) {
+        (self.state.clone(), self.params.clone())
+    }
+
+    fn generate_operation<R: freenet_scaffold::convergence::Rng>(&mut self, rng: &mut R) -> Op {
+        match rng.gen_range(0..10) {
+            0..=4 if self.include_moves => Op::PlayPly(rng.gen_range(0..self.line.len())),
+            0..=4 => Op::Attest {
+                who: rng.gen_range(0..2),
+                tick: rng.gen_range(1..20) as i64,
+            },
+            5..=8 => Op::Attest {
+                who: rng.gen_range(0..2),
+                tick: rng.gen_range(1..20) as i64,
+            },
+            _ => Op::Resign {
+                who: rng.gen_range(0..2),
+                at: T0 + rng.gen_range(1..20) as i64 * 1000,
+            },
+        }
+    }
+
+    fn operation_to_delta(&mut self, _state: &Self::State, op: &Op) -> Self::Delta {
+        match op {
+            Op::PlayPly(ply) => {
+                let signer = self.signer(ply % 2);
+                let mv = Move::from_uci(self.line[*ply]).expect("fixture line is valid uci");
+                ChessGameStateV1Delta {
+                    moves: Some(vec![AuthorizedMove::new(
+                        signer,
+                        &self.params.game_id,
+                        *ply as u32,
+                        mv,
+                        T0 + 2_000 + *ply as i64 * 1_000,
+                    )]),
+                    ..Default::default()
+                }
+            }
+            Op::Attest { who, tick } => ChessGameStateV1Delta {
+                clocks: Some(vec![ClockAttestation::new(
+                    self.signer(*who),
+                    &self.params.game_id,
+                    T0 + tick * 1_000,
+                )]),
+                ..Default::default()
+            },
+            Op::Resign { who, at } => ChessGameStateV1Delta {
+                conclusion: Some(vec![SignedConclusion::resign(
+                    self.signer(*who),
+                    &self.params.game_id,
+                    0,
+                    *at,
+                )]),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[test]
+fn the_game_state_merge_is_commutative() {
+    // Moves are excluded here, and the exclusion is a real finding rather than a
+    // convenience: `MovesV1::prune` *clears* the list when a move arrives before
+    // its predecessor, so applying plies out of order destroys them and the raw
+    // delta merge is not commutative. See
+    // `a_move_arriving_before_its_predecessor_is_dropped_but_heals` for the
+    // behaviour and why it is survivable.
+    let result = freenet_scaffold::convergence::test_operation_commutativity(
+        GameHarness::without_moves(),
+        12,
+        25,
+        0xC0FFEE,
+    );
+    assert!(result.passed, "{result:?}");
+}
+
+#[test]
+fn the_game_state_merge_is_idempotent() {
+    let result = freenet_scaffold::convergence::test_idempotency(GameHarness::new(), 20, 0xC0FFEE);
+    assert!(result.passed, "{result:?}");
+}
+
+#[test]
+fn a_move_arriving_before_its_predecessor_is_dropped_but_heals() {
+    // Pins the known limitation the convergence harness surfaced.
+    //
+    // `prune` keeps the longest legal prefix from ply 0 and discards the rest,
+    // so a move that arrives before the one it follows is destroyed outright.
+    // The platform explicitly "tolerates arbitrary loss, reordering, and
+    // duplication", so this ordering is not hypothetical.
+    //
+    // It is survivable because the summary carries the plies actually held: the
+    // peer that dropped ply 1 no longer lists it, so the next anti-entropy round
+    // sends it again, and this time it lands on top of ply 0 and sticks. The
+    // cost is a wasted round, not a lost move — but note the merge is therefore
+    // convergent only *through* the sync protocol, not per-delta.
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let ply0 = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("e2e4").unwrap(),
+        T0 + 2_000,
+    );
+    let ply1 = AuthorizedMove::new(
+        &opponent,
+        &params.game_id,
+        1,
+        Move::from_uci("e7e5").unwrap(),
+        T0 + 3_000,
+    );
+
+    // Out of order: ply 1 first.
+    let mut late = base.clone();
+    for mv in [ply1.clone(), ply0.clone()] {
+        let snapshot = late.clone();
+        late.apply_delta(
+            &snapshot,
+            &params,
+            &Some(ChessGameStateV1Delta {
+                moves: Some(vec![mv]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    }
+    assert_eq!(late.moves.len(), 1, "ply 1 was dropped, as prune specifies");
+
+    // A peer that saw them in order holds both, and anti-entropy closes the gap.
+    let mut ordered = base.clone();
+    let snapshot = ordered.clone();
+    ordered
+        .apply_delta(
+            &snapshot,
+            &params,
+            &Some(ChessGameStateV1Delta {
+                moves: Some(vec![ply0, ply1]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(ordered.moves.len(), 2);
+
+    let summary = late.summarize(&late, &params);
+    let delta = ordered
+        .delta(&ordered, &params, &summary)
+        .expect("the missing ply must be offered again");
+    let snapshot = late.clone();
+    late.apply_delta(&snapshot, &params, &Some(delta)).unwrap();
+
+    assert_eq!(
+        late.moves, ordered.moves,
+        "the gap closes on the next round"
+    );
+}
+
+#[test]
+fn two_peers_seeing_different_operations_converge() {
+    // This one goes through `ComposableState::merge`, so it exercises
+    // summarize -> delta -> apply_delta rather than apply_delta alone: it is the
+    // property that a summary too coarse for its merge order would break.
+    for overlap in [0.0, 0.3, 0.7] {
+        let result = freenet_scaffold::convergence::test_merge_convergence(
+            GameHarness::new(),
+            14,
+            overlap,
+            0xBEEF,
+        );
+        assert!(result.passed, "overlap {overlap}: {result:?}");
+    }
+}

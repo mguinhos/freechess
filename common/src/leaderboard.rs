@@ -28,7 +28,7 @@ use crate::certificate::GameCertificate;
 use crate::elo::{self, STARTING_ELO};
 use crate::game::setup::MAX_NICKNAME_LEN;
 use crate::game::SIG_DOMAIN;
-use crate::identity::{verify_sig, PlayerId};
+use crate::identity::{signature_digest, verify_sig, PlayerId};
 use crate::lobby::{LobbyParametersV1, LobbyStateV1};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
@@ -276,11 +276,10 @@ impl LeaderboardV1 {
 
 impl ComposableState for LeaderboardV1 {
     type ParentState = LobbyStateV1;
-    /// Per player, the full merge-order key from [`RankEntry::order_key`]. Games
-    /// played alone is coarser than the order `absorb` imposes, so a fresher
-    /// entry with the same count never shipped and the two peers kept different
-    /// ratings for ever.
-    type Summary = Vec<(PlayerId, u32, i64, Vec<u8>)>;
+    /// Per player, a fingerprint of the entry we hold. Games played alone was
+    /// coarser than the order `absorb` imposes, so a fresher entry with the same
+    /// count never shipped and two peers kept different ratings for ever.
+    type Summary = Vec<(PlayerId, u64)>;
     type Delta = Vec<RankEntry>;
     type Parameters = LobbyParametersV1;
 
@@ -307,14 +306,7 @@ impl ComposableState for LeaderboardV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.entries
             .iter()
-            .map(|(id, e)| {
-                (
-                    *id,
-                    e.games_played,
-                    e.updated_at,
-                    e.signature.to_bytes().to_vec(),
-                )
-            })
+            .map(|(id, e)| (*id, signature_digest(&e.signature)))
             .collect()
     }
 
@@ -324,24 +316,11 @@ impl ComposableState for LeaderboardV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<PlayerId, (u32, i64, &[u8])> = old_summary
-            .iter()
-            .map(|(id, games, at, sig)| (*id, (*games, *at, sig.as_slice())))
-            .collect();
+        let theirs: BTreeMap<PlayerId, u64> = old_summary.iter().copied().collect();
         let changed: Vec<RankEntry> = self
             .entries
             .iter()
-            .filter(|(id, e)| match theirs.get(id) {
-                // Ship whenever ours wins the same total order `absorb` uses.
-                Some(theirs) => {
-                    (
-                        e.games_played,
-                        e.updated_at,
-                        e.signature.to_bytes().as_slice(),
-                    ) > *theirs
-                }
-                None => true,
-            })
+            .filter(|(id, e)| theirs.get(id) != Some(&signature_digest(&e.signature)))
             .map(|(_, e)| e.clone())
             .collect();
         if changed.is_empty() {

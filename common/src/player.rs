@@ -13,7 +13,7 @@ use crate::certificate::GameCertificate;
 use crate::elo::{self, RatedGame, STARTING_ELO};
 use crate::game::setup::MAX_NICKNAME_LEN;
 use crate::game::SIG_DOMAIN;
-use crate::identity::{verify_sig, GameId, PlayerId};
+use crate::identity::{signature_digest, verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -150,10 +150,11 @@ impl ProfileV1 {
 
 impl ComposableState for ProfileV1 {
     type ParentState = PlayerStateV1;
-    /// The full merge-order key, not just the timestamp: `absorb` breaks a tie on
-    /// `updated_at` by signature bytes, so a summary of the timestamp alone left
-    /// two profiles stamped the same millisecond unable to reconcile.
-    type Summary = Option<(i64, Vec<u8>)>;
+    /// A fingerprint of the profile we hold, not just its timestamp: `absorb`
+    /// breaks a tie on `updated_at` by signature bytes, so a summary of the
+    /// timestamp alone left two profiles stamped the same millisecond unable to
+    /// reconcile.
+    type Summary = Option<u64>;
     type Delta = SignedProfile;
     type Parameters = PlayerParametersV1;
 
@@ -165,9 +166,7 @@ impl ComposableState for ProfileV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.0
-            .as_ref()
-            .map(|p| (p.updated_at, p.signature.to_bytes().to_vec()))
+        self.0.as_ref().map(|p| signature_digest(&p.signature))
     }
 
     fn delta(
@@ -177,12 +176,10 @@ impl ComposableState for ProfileV1 {
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
         let current = self.0.as_ref()?;
-        let mine = (current.updated_at, current.signature.to_bytes());
-        match old_summary {
-            // Ship whenever ours wins the same total order `absorb` uses.
-            Some((at, sig)) if (*at, sig.as_slice()) >= (mine.0, mine.1.as_slice()) => None,
-            _ => Some(current.clone()),
+        if *old_summary == Some(signature_digest(&current.signature)) {
+            return None;
         }
+        Some(current.clone())
     }
 
     fn apply_delta(
@@ -293,10 +290,11 @@ impl HistoryV1 {
 
 impl ComposableState for HistoryV1 {
     type ParentState = PlayerStateV1;
-    /// Game id *and* the signature `absorb` settles equivocation by. A bare set
-    /// of ids meant a rival certificate for a game the peer already held never
-    /// shipped, so the tiebreak never ran and the two kept different history.
-    type Summary = Vec<(GameId, Vec<u8>)>;
+    /// Game id *and* a fingerprint of the certificate held for it. A bare set of
+    /// ids meant a rival certificate for a game the peer already had never
+    /// shipped, so the equivocation tiebreak never ran and the two kept
+    /// different history.
+    type Summary = Vec<(GameId, u64)>;
     type Delta = Vec<GameCertificate>;
     type Parameters = PlayerParametersV1;
 
@@ -327,7 +325,7 @@ impl ComposableState for HistoryV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.games
             .iter()
-            .map(|(id, c)| (*id, c.white_signature.to_bytes().to_vec()))
+            .map(|(id, c)| (*id, signature_digest(&c.white_signature)))
             .collect()
     }
 
@@ -337,18 +335,11 @@ impl ComposableState for HistoryV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: std::collections::BTreeMap<GameId, &[u8]> = old_summary
-            .iter()
-            .map(|(id, sig)| (*id, sig.as_slice()))
-            .collect();
+        let theirs: std::collections::BTreeMap<GameId, u64> = old_summary.iter().copied().collect();
         let missing: Vec<GameCertificate> = self
             .games
             .iter()
-            .filter(|(id, c)| match theirs.get(id) {
-                // Ship ours whenever it wins the tiebreak, so the peer can run it.
-                Some(theirs) => c.white_signature.to_bytes().as_slice() < *theirs,
-                None => true,
-            })
+            .filter(|(id, c)| theirs.get(id) != Some(&signature_digest(&c.white_signature)))
             .map(|(_, c)| c.clone())
             .collect();
         if missing.is_empty() {

@@ -68,7 +68,7 @@
 //! of the merged set and never of arrival order.
 
 use super::{ChessGameParametersV1, ChessGameStateV1, SIG_DOMAIN};
-use crate::identity::{verify_sig, GameId, PlayerId};
+use crate::identity::{signature_digest, verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
@@ -213,10 +213,11 @@ impl ClocksV1 {
 
 impl ComposableState for ClocksV1 {
     type ParentState = ChessGameStateV1;
-    /// Per player, the time they have attested to. Distinguishes exactly what
-    /// the merge order does, so a peer holding a later attestation always ships
-    /// it.
-    type Summary = Vec<(PlayerId, i64)>;
+    /// Per player, a fingerprint of the attestation we hold. The time alone is
+    /// coarser than the merge order, which breaks a tie on it by signature
+    /// bytes, so two attestations stamped the same millisecond would not have
+    /// reconciled.
+    type Summary = Vec<(PlayerId, u64)>;
     type Delta = Vec<ClockAttestation>;
     type Parameters = ChessGameParametersV1;
 
@@ -227,7 +228,7 @@ impl ComposableState for ClocksV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.attestations
             .iter()
-            .map(|(id, a)| (*id, a.at))
+            .map(|(id, a)| (*id, signature_digest(&a.signature)))
             .collect()
     }
 
@@ -237,17 +238,17 @@ impl ComposableState for ClocksV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<PlayerId, i64> = old_summary.iter().copied().collect();
-        let newer: Vec<ClockAttestation> = self
+        let theirs: BTreeMap<PlayerId, u64> = old_summary.iter().copied().collect();
+        let differing: Vec<ClockAttestation> = self
             .attestations
             .iter()
-            .filter(|(id, a)| theirs.get(id).map(|at| a.at > *at).unwrap_or(true))
+            .filter(|(id, a)| theirs.get(id) != Some(&signature_digest(&a.signature)))
             .map(|(_, a)| a.clone())
             .collect();
-        if newer.is_empty() {
+        if differing.is_empty() {
             None
         } else {
-            Some(newer)
+            Some(differing)
         }
     }
 

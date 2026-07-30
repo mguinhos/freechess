@@ -4,7 +4,9 @@ use super::*;
 use crate::game::opponent::SignedJoin;
 use crate::game::WinReason;
 use crate::leaderboard::{LeaderboardV1, RankEntry};
-use crate::presence::{PresenceStatus, SignedPresence, AWAY_WINDOW_MS, ONLINE_WINDOW_MS};
+use crate::presence::{
+    PresenceStatus, SignedPresence, AWAY_WINDOW_MS, MAX_PRESENCE_ENTRIES, ONLINE_WINDOW_MS,
+};
 use crate::testutil::{certified_game, key, open_game, T0};
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
@@ -756,5 +758,107 @@ fn snapshots_at_the_same_ply_still_exchange() {
             .and_then(|e| e.snapshot.as_ref())
             .map(|s| s.updated_at),
         Some(T0 + 8_000)
+    );
+}
+
+// ------------------------------------------------- summary size and bytes
+
+/// Encode with the same codec the contract's `summarize_state` uses.
+fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).expect("summary encodes");
+    buf
+}
+
+fn lobby_at_presence_cap() -> LobbyStateV1 {
+    let mut state = LobbyStateV1::default();
+    for i in 0..MAX_PRESENCE_ENTRIES {
+        let k = key();
+        let p = SignedPresence::watching_game(
+            &k,
+            format!("player{i}"),
+            PresenceStatus::Online,
+            None,
+            T0 + i as i64,
+        );
+        state.presence.players.insert(p.player_id(), p);
+    }
+    state
+}
+
+#[test]
+fn the_presence_summary_stays_delta_efficient_at_the_cap() {
+    // A summary exists so peers can detect divergence *without* shipping state,
+    // and it rides both directions on every anti-entropy round. freenet-core's
+    // own heuristic for whether that is worth it is `summary * 2 < state`.
+    // Carrying raw 64-byte signatures put this at 82KB against a 107KB state,
+    // which fails outright; a digest of the same bytes distinguishes just as
+    // much for a quarter of the size.
+    let state = lobby_at_presence_cap();
+    let summary = encoded(&state.presence.summarize(&state, &params()));
+    let full = encoded(&state.presence);
+    assert!(
+        summary.len() * 2 < full.len(),
+        "presence summary is {} bytes against a {} byte state; a summary that big \
+         is not worth sending",
+        summary.len(),
+        full.len()
+    );
+}
+
+#[test]
+fn summaries_are_byte_identical_regardless_of_insertion_order() {
+    // freenet-core decides a peer is stale by *byte-comparing* the output of
+    // `summarize_state`. A collection with non-deterministic iteration order
+    // (a `HashMap`, or an unsorted `Vec`) therefore makes two fully converged
+    // peers look permanently out of sync, and each ~5-minute heartbeat fires a
+    // pointless full-state heal. This guards every summary the lobby emits.
+    let creator = key();
+    let challenger = key();
+    let entries: Vec<LobbyEntry> = (0..12)
+        .map(|i| {
+            if i % 2 == 0 {
+                listing(&creator, T0 + i * 1000)
+            } else {
+                matched_listing(&creator, &challenger, T0 + i * 1000)
+            }
+        })
+        .collect();
+    let presences: Vec<SignedPresence> = (0..12)
+        .map(|i| {
+            SignedPresence::watching_game(
+                &key(),
+                format!("p{i}"),
+                PresenceStatus::Online,
+                None,
+                T0 + i,
+            )
+        })
+        .collect();
+
+    let build = |reversed: bool| {
+        let mut state = LobbyStateV1::default();
+        let mut entries = entries.clone();
+        let mut presences = presences.clone();
+        if reversed {
+            entries.reverse();
+            presences.reverse();
+        }
+        for e in entries {
+            state.games.games.insert(e.game_id, e);
+        }
+        for p in presences {
+            state.presence.players.insert(p.player_id(), p);
+        }
+        state
+    };
+
+    let forwards = build(false);
+    let backwards = build(true);
+    assert_eq!(forwards, backwards, "the two states must be the same state");
+    assert_eq!(
+        encoded(&forwards.summarize(&forwards, &params())),
+        encoded(&backwards.summarize(&backwards, &params())),
+        "the same logical state must summarize to the same bytes"
     );
 }

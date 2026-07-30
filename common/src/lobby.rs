@@ -48,7 +48,7 @@ use crate::chess::Color;
 use crate::game::opponent::SignedJoin;
 use crate::game::setup::{SignedGameSetup, TimeControl, MAX_NICKNAME_LEN};
 use crate::game::{GameResult, SIG_DOMAIN};
-use crate::identity::{verify_sig, GameId, PlayerId};
+use crate::identity::{summary_digest, verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -323,20 +323,33 @@ impl LobbyEntry {
     /// Merge another view of the same game into this one. Each component takes
     /// the winner of a total order, so the result is independent of order and
     /// stable under repetition.
-    /// The entry's position in the two orders [`absorb`](Self::absorb) applies,
-    /// which is what a merge summary has to carry.
-    fn key(&self) -> LobbyEntryKey {
-        LobbyEntryKey {
-            // Min-wins, so an absent opponent must sort *after* any real one.
-            opponent: self
-                .opponent
-                .as_ref()
-                .map(|j| (j.joined_at, j.player.to_bytes().to_vec())),
-            snapshot: self
-                .snapshot
-                .as_ref()
-                .map(|s| (s.ply, s.updated_at, s.signature.to_bytes().to_vec())),
+    /// Fingerprint of everything [`absorb`](Self::absorb) merges on.
+    ///
+    /// An entry is two independent lattices — the opponent slot settled by the
+    /// earliest join, the snapshot by the newest position — so both go in. One
+    /// combined digest is enough because the delta ships on *difference*: a peer
+    /// that is ahead on either part differs, and both parts travel together in
+    /// the entry anyway.
+    fn merge_digest(&self) -> u64 {
+        let mut buf = Vec::with_capacity(128);
+        match &self.opponent {
+            Some(join) => {
+                buf.push(1);
+                buf.extend_from_slice(&join.joined_at.to_le_bytes());
+                buf.extend_from_slice(join.player.as_bytes());
+            }
+            None => buf.push(0),
         }
+        match &self.snapshot {
+            Some(snapshot) => {
+                buf.push(1);
+                buf.extend_from_slice(&snapshot.ply.to_le_bytes());
+                buf.extend_from_slice(&snapshot.updated_at.to_le_bytes());
+                buf.extend_from_slice(&snapshot.signature.to_bytes());
+            }
+            None => buf.push(0),
+        }
+        summary_digest(&buf)
     }
 
     fn absorb(&mut self, other: LobbyEntry) {
@@ -359,38 +372,6 @@ impl LobbyEntry {
             }
             _ => {}
         }
-    }
-}
-
-/// Where a [`LobbyEntry`] sits in the orders its merge applies, as it travels in
-/// a summary.
-///
-/// The two parts are separate lattices — the opponent slot is settled by the
-/// earliest join, the snapshot by the newest position — so they are compared
-/// independently and a peer can be ahead on one while behind on the other.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LobbyEntryKey {
-    /// `(joined_at, player)` of the seated opponent, where *lower* wins.
-    opponent: Option<(i64, Vec<u8>)>,
-    /// `(ply, updated_at, signature)` of the latest snapshot, where *higher*
-    /// wins.
-    snapshot: Option<(u32, i64, Vec<u8>)>,
-}
-
-impl LobbyEntryKey {
-    /// Whether this entry has something the holder of `theirs` does not.
-    fn beats(&self, theirs: &LobbyEntryKey) -> bool {
-        let better_opponent = match (&self.opponent, &theirs.opponent) {
-            (Some(_), None) => true,
-            (Some(mine), Some(theirs)) => mine < theirs,
-            _ => false,
-        };
-        let better_snapshot = match (&self.snapshot, &theirs.snapshot) {
-            (Some(_), None) => true,
-            (Some(mine), Some(theirs)) => mine > theirs,
-            _ => false,
-        };
-        better_opponent || better_snapshot
     }
 }
 
@@ -617,15 +598,14 @@ impl LobbyGamesV1 {
 
 impl ComposableState for LobbyGamesV1 {
     type ParentState = LobbyStateV1;
-    /// Per game, the merge key of *each* independently-merged part: the seated
-    /// opponent and the latest snapshot.
+    /// Per game, a fingerprint of everything the entry merges on.
     ///
     /// A single "revision" number (it used to be `ply + 1 + opponent.is_some()`)
     /// is coarser than the orders [`LobbyEntry::absorb`] applies. Two peers
     /// holding different snapshots of the same ply — both players publishing
     /// after one move, the normal case — had equal revisions, so neither shipped
     /// and the two lobbies showed different clocks indefinitely.
-    type Summary = Vec<(GameId, LobbyEntryKey)>;
+    type Summary = Vec<(GameId, u64)>;
     type Delta = Vec<LobbyEntry>;
     type Parameters = LobbyParametersV1;
 
@@ -674,7 +654,10 @@ impl ComposableState for LobbyGamesV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.games.iter().map(|(id, e)| (*id, e.key())).collect()
+        self.games
+            .iter()
+            .map(|(id, e)| (*id, e.merge_digest()))
+            .collect()
     }
 
     fn delta(
@@ -683,17 +666,11 @@ impl ComposableState for LobbyGamesV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<GameId, &LobbyEntryKey> =
-            old_summary.iter().map(|(id, k)| (*id, k)).collect();
+        let theirs: BTreeMap<GameId, u64> = old_summary.iter().copied().collect();
         let changed: Vec<LobbyEntry> = self
             .games
             .iter()
-            .filter(|(id, e)| match theirs.get(id) {
-                // Ship if we win on *either* part: the two merge independently,
-                // so a peer can be ahead on one and behind on the other.
-                Some(theirs) => e.key().beats(theirs),
-                None => true,
-            })
+            .filter(|(id, e)| theirs.get(id) != Some(&e.merge_digest()))
             .map(|(_, e)| e.clone())
             .collect();
         if changed.is_empty() {
