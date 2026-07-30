@@ -149,7 +149,11 @@ pub fn update_state_request(key: ContractKey, state: Vec<u8>) -> ClientRequest<'
 pub fn get_request(id: ContractInstanceId, subscribe: bool) -> ClientRequest<'static> {
     ContractRequest::Get {
         key: id,
-        return_contract_code: false,
+        // Ask for the code, not just the state. A node refuses to UPDATE or
+        // SUBSCRIBE to a contract whose WASM it does not hold — "originator
+        // missing contract code/params" — so fetching state alone leaves the
+        // store half-primed and the next write fails.
+        return_contract_code: true,
         subscribe,
         blocking_subscribe: false,
     }
