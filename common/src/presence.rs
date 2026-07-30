@@ -166,7 +166,12 @@ impl SignedPresence {
     /// The status as of `now`: a stale heartbeat decays to away, then offline,
     /// no matter what it claimed.
     pub fn status_at(&self, now: i64) -> PresenceStatus {
-        let age = now - self.updated_at;
+        // Saturating: `updated_at` is self-asserted, so an extreme value would
+        // overflow the subtraction. A far-future stamp gives a negative age and
+        // therefore reads as online, which is the same thing an honest fresh
+        // heartbeat does — the bound that stops a player pinning themselves
+        // online for ever belongs on `updated_at` itself, not here.
+        let age = now.saturating_sub(self.updated_at);
         if age > AWAY_WINDOW_MS {
             PresenceStatus::Offline
         } else if age > ONLINE_WINDOW_MS || self.claimed == PresenceStatus::Away {
@@ -276,7 +281,11 @@ impl PresenceV1 {
 
 impl ComposableState for PresenceV1 {
     type ParentState = LobbyStateV1;
-    type Summary = Vec<(PlayerId, i64)>;
+    /// Per player, the full merge-order key: the heartbeat time *and* the
+    /// signature bytes that break a tie on it. A summary coarser than the order
+    /// `absorb` imposes makes two peers holding different entries report the
+    /// same thing, so neither ships a delta and the tiebreak is never reached.
+    type Summary = Vec<(PlayerId, i64, Vec<u8>)>;
     type Delta = Vec<SignedPresence>;
     type Parameters = LobbyParametersV1;
 
@@ -303,7 +312,7 @@ impl ComposableState for PresenceV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.players
             .iter()
-            .map(|(id, p)| (*id, p.updated_at))
+            .map(|(id, p)| (*id, p.updated_at, p.signature.to_bytes().to_vec()))
             .collect()
     }
 
@@ -313,15 +322,17 @@ impl ComposableState for PresenceV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<PlayerId, i64> = old_summary.iter().copied().collect();
+        let theirs: BTreeMap<PlayerId, (i64, &[u8])> = old_summary
+            .iter()
+            .map(|(id, at, sig)| (*id, (*at, sig.as_slice())))
+            .collect();
         let changed: Vec<SignedPresence> = self
             .players
             .iter()
-            .filter(|(id, p)| {
-                theirs
-                    .get(id)
-                    .map(|their_time| *their_time < p.updated_at)
-                    .unwrap_or(true)
+            .filter(|(id, p)| match theirs.get(id) {
+                // Ship whenever ours wins the same total order `absorb` uses.
+                Some(theirs) => (p.updated_at, p.signature.to_bytes().as_slice()) > *theirs,
+                None => true,
             })
             .map(|(_, p)| p.clone())
             .collect();

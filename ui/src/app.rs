@@ -14,6 +14,7 @@ use crate::freenet;
 use crate::identity::{now_ms, Account};
 use chess_core::certificate::CertificateDraft;
 use chess_core::chess::{Color, Move};
+use chess_core::game::clocks::ClockAttestation;
 use chess_core::game::conclusion::{ConclusionV1, SignedConclusion};
 use chess_core::game::moves::AuthorizedMove;
 use chess_core::game::opponent::SignedJoin;
@@ -157,6 +158,16 @@ pub enum Cmd {
         mv: Move,
     },
     Resign(GameId),
+    /// Sign the time I see in a game I am playing.
+    ///
+    /// This is what makes timeouts provable at all: a contract has no clock, so
+    /// the only trustworthy evidence that time passed is a signature from the
+    /// player it counts against. Stopping is how a player forfeits by absence,
+    /// so a client that is playing must keep this going — see
+    /// [`chess_core::game::clocks`].
+    AttestClock(GameId),
+    /// Claim the opponent's clock ran out.
+    ClaimTimeout(GameId),
     /// Publish my nickname to my profile contract and the ranking.
     SetNickname(String),
     /// Heartbeat, optionally announcing the game being watched.
@@ -524,7 +535,7 @@ async fn handle_cmd(
 
             let instance = freenet::game_instance(creator, game_id)?;
             let delta = chess_core::game::ChessGameStateV1Delta {
-                conclusion: Some(conclusion.clone()),
+                conclusion: Some(vec![conclusion.clone()]),
                 ..Default::default()
             };
             api.send(freenet::update_request(
@@ -535,12 +546,96 @@ async fn handle_cmd(
             .map_err(|e| format!("could not resign: {e}"))?;
 
             let mut updated = game.clone();
-            updated.conclusion = ConclusionV1(Some(conclusion));
+            updated.conclusion = ConclusionV1::single(conclusion);
             publish_snapshot(api, key, game_id, &updated, now).await?;
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
             certify_and_file(api, state, key, game_id, &updated, my_rating, now).await
+        }
+
+        Cmd::AttestClock(game_id) => {
+            let (creator, game) = state
+                .with(|s| {
+                    s.creators
+                        .get(&game_id)
+                        .copied()
+                        .zip(s.games.get(&game_id).cloned())
+                })
+                .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            // Only a player's attestation counts, and only while the game is
+            // still running. A spectator's would be pruned on arrival.
+            if game.color_of(&key.verifying_key()).is_none() || game.result().is_over() {
+                return Ok(());
+            }
+
+            let attestation = ClockAttestation::new(key, &game_id, now);
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                clocks: Some(vec![attestation.clone()]),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not publish the clock attestation: {e}"))?;
+
+            state.with_mut(|s| {
+                if let Some(g) = s.games.get_mut(&game_id) {
+                    g.clocks
+                        .attestations
+                        .insert(attestation.player_id(), attestation);
+                }
+            });
+            Ok(())
+        }
+
+        Cmd::ClaimTimeout(game_id) => {
+            let (creator, game) = state
+                .with(|s| {
+                    s.creators
+                        .get(&game_id)
+                        .copied()
+                        .zip(s.games.get(&game_id).cloned())
+                })
+                .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            let my_color = game
+                .color_of(&key.verifying_key())
+                .ok_or_else(|| "you are not playing in that game".to_string())?;
+            let at_ply = game.moves.move_list().len() as u32;
+            // The deadline is derived from the opponent's own attestations, so
+            // the client can name it exactly rather than asserting a time.
+            let provable = game
+                .timeout_provable_at(my_color.opposite(), at_ply)
+                .ok_or_else(|| "your opponent's clock is not running".to_string())?;
+            if now < provable {
+                return Err("your opponent still has time".to_string());
+            }
+
+            let conclusion = SignedConclusion::claim_timeout(key, &game_id, at_ply, provable);
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                conclusion: Some(vec![conclusion.clone()]),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not claim the timeout: {e}"))?;
+
+            let mut updated = game.clone();
+            updated.conclusion = ConclusionV1::single(conclusion);
+            publish_snapshot(api, key, game_id, &updated, provable).await?;
+            state.with_mut(|s| {
+                s.games.insert(game_id, updated.clone());
+            });
+            certify_and_file(api, state, key, game_id, &updated, my_rating, provable).await
         }
 
         Cmd::SetNickname(nickname) => {

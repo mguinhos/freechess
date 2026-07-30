@@ -9,14 +9,24 @@ use super::{
     ChessGameParametersV1, ChessGameStateV1, DrawReason, GameResult, WinReason, SIG_DOMAIN,
 };
 use crate::chess::Color;
-use crate::identity::{verify_sig, GameId};
+use crate::identity::{verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 
-/// Grace period added to a timeout claim, absorbing clock skew between peers
-/// and network delay before a claim is considered provable.
-pub const TIMEOUT_GRACE_MS: i64 = 5_000;
+/// How far past the instant it became provable a timeout claim may be dated.
+///
+/// The deadline itself is computed from state (see
+/// [`ChessGameStateV1::timeout_provable_at`]), so an honest client can always
+/// name it exactly and needs no slack below it. This window only absorbs the
+/// delay between a flag falling and the winner noticing, and bounds how stale a
+/// claim may be — without it, `at` would be free above the deadline and would
+/// land arbitrary finish times in certificates and archive ordering.
+pub const TIMEOUT_CLAIM_WINDOW_MS: i64 = 60_000;
+
+/// Structural ceiling on stored claims: each of the two players may hold one
+/// slot per kind, and nothing else is admissible.
+pub const MAX_CONCLUSIONS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConclusionKind {
@@ -106,6 +116,16 @@ mod opt_key_serde {
     }
 }
 
+/// Stable one-byte encoding of a kind, used both in the signed bytes and as
+/// part of a claim's slot.
+fn kind_tag(kind: ConclusionKind) -> u8 {
+    match kind {
+        ConclusionKind::Resignation => 0,
+        ConclusionKind::DrawAgreement => 1,
+        ConclusionKind::TimeoutClaim => 2,
+    }
+}
+
 fn conclusion_signing_bytes(
     game_id: &GameId,
     kind: ConclusionKind,
@@ -116,11 +136,7 @@ fn conclusion_signing_bytes(
     buf.extend_from_slice(SIG_DOMAIN);
     buf.extend_from_slice(b"conclusion:");
     buf.extend_from_slice(&game_id.0);
-    buf.push(match kind {
-        ConclusionKind::Resignation => 0,
-        ConclusionKind::DrawAgreement => 1,
-        ConclusionKind::TimeoutClaim => 2,
-    });
+    buf.push(kind_tag(kind));
     buf.extend_from_slice(&at_ply.to_le_bytes());
     buf.extend_from_slice(&at.to_le_bytes());
     buf
@@ -162,8 +178,12 @@ impl SignedConclusion {
         }
     }
 
-    /// Claim the opponent's clock expired. Verified against the move
-    /// timestamps, so it cannot be claimed early.
+    /// Claim the opponent's clock expired.
+    ///
+    /// `at` is not taken on trust: it must match the instant the claim became
+    /// provable from the opponent's *own* attestations, which
+    /// [`ChessGameStateV1::timeout_provable_at`] computes from state. A client
+    /// should pass exactly that value.
     pub fn claim_timeout(
         key: &SigningKey,
         game_id: &GameId,
@@ -186,12 +206,65 @@ impl SignedConclusion {
         conclusion_signing_bytes(game_id, self.kind, self.at_ply, self.at)
     }
 
-    /// Deterministic total order for settling concurrent conclusions.
-    fn tiebreak(&self) -> (i64, [u8; 64]) {
+    /// Deterministic total order for settling concurrent conclusions: the
+    /// earliest claim wins, signature bytes break an exact tie.
+    pub fn order_key(&self) -> (i64, [u8; 64]) {
         (self.at, self.signature.to_bytes())
     }
 
-    /// Validate against the game it claims to conclude.
+    pub fn claimant_id(&self) -> PlayerId {
+        PlayerId::from(&self.claimant)
+    }
+
+    /// The slot this claim occupies: one per player per kind. Structural, so a
+    /// player cannot flood the conclusion set to bury a real claim.
+    fn slot(&self) -> (PlayerId, u8) {
+        (self.claimant_id(), kind_tag(self.kind))
+    }
+
+    /// Whether this claim actually decides the game, as opposed to merely being
+    /// authentic.
+    ///
+    /// The split matters. Authenticity ([`verify`](Self::verify)) is a property
+    /// of the bytes and never changes, so it is safe to enforce when a delta
+    /// arrives. Whether a *timeout* claim holds depends on evidence that can
+    /// still be in flight — the loser's own attestations — and so can change as
+    /// state converges. Rejecting on that basis would let a state that was valid
+    /// when applied fail validation later; deciding effect here instead keeps
+    /// every stored claim permanently valid while making the outcome a pure
+    /// function of the merged state, which is what every peer agreeing requires.
+    ///
+    /// A claim that is stored but ineffective is inert: it cannot end the game,
+    /// and because slots are per-player-per-kind it cannot displace a claim that
+    /// does hold.
+    pub fn is_effective(&self, parent: &ChessGameStateV1) -> bool {
+        match self.kind {
+            // Costs only the signer, so it needs no corroboration.
+            ConclusionKind::Resignation => true,
+            // Both players signed; that is the whole authority for a draw.
+            ConclusionKind::DrawAgreement => true,
+            ConclusionKind::TimeoutClaim => {
+                let loser = match parent.color_of(&self.claimant) {
+                    Some(winner) => winner.opposite(),
+                    None => return false,
+                };
+                match parent.timeout_provable_at(loser, self.at_ply) {
+                    Some(provable) => {
+                        self.at >= provable
+                            && self.at <= provable.saturating_add(TIMEOUT_CLAIM_WINDOW_MS)
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Validate the claim as a signed statement: that it is authentic, and that
+    /// its author is entitled to make a statement of this kind about this game.
+    ///
+    /// Everything checked here is a property of the bytes and of facts that
+    /// cannot be retracted, so a claim that passes today passes forever. Whether
+    /// the claim *decides* the game is [`is_effective`](Self::is_effective).
     pub fn verify(
         &self,
         parent: &ChessGameStateV1,
@@ -243,37 +316,10 @@ impl SignedConclusion {
                 )
             }
 
-            ConclusionKind::TimeoutClaim => {
-                // A timeout is only valid if the clocks say so. Everything the
-                // check needs (time control, move timestamps) is in state, so
-                // every peer reaches the same verdict.
-                let loser = if self.claimant == white {
-                    Color::Black
-                } else {
-                    Color::White
-                };
-                let setup = parent
-                    .setup
-                    .get()
-                    .ok_or_else(|| "game has no setup".to_string())?;
-                let elapsed = parent.time_used_by(loser);
-                let budget_ms = setup.setup.time_control.initial_secs as i64 * 1000
-                    + setup.setup.time_control.increment_secs as i64
-                        * 1000
-                        * parent.moves_made_by(loser) as i64;
-
-                // Time the loser has burned since their opponent's last move,
-                // measured up to the moment of the claim.
-                let pending = parent.pending_time_for(loser, self.at);
-                if elapsed + pending <= budget_ms + TIMEOUT_GRACE_MS {
-                    return Err(format!(
-                        "timeout claimed too early: {}ms used of {}ms budget",
-                        elapsed + pending,
-                        budget_ms
-                    ));
-                }
-                Ok(())
-            }
+            // Nothing further to check on the bytes. Whether the clocks bear the
+            // claim out is decided by `is_effective`, because it turns on the
+            // loser's attestations, which may still be arriving.
+            ConclusionKind::TimeoutClaim => Ok(()),
         }
     }
 
@@ -296,50 +342,105 @@ impl SignedConclusion {
     }
 }
 
-/// The conclusion slot: empty while the game is live.
+/// Every claim made about how this game ended. Empty while the game is live.
+///
+/// # Why a set rather than one slot
+///
+/// A single slot has to pick a winner the moment a claim arrives, and the pick
+/// has to be a function of the claims alone — no parent state — or peers that
+/// merged in different orders would keep different ones. That is fine when every
+/// claim is unconditionally decisive, but a timeout claim is not: it holds only
+/// if the loser's attestations bear it out, and those may still be in flight.
+/// With one slot, a claim that turns out to be inert still occupies it, and can
+/// bury the resignation or agreed draw that would have ended the game — so a
+/// player could hang a game permanently by filing an early bogus timeout.
+///
+/// Keeping the set and choosing the effective claim at read time removes that:
+/// merging is a union (commutative, associative, idempotent), and the outcome is
+/// a pure function of the merged state, so every peer agrees without any claim
+/// having to be discarded.
+///
+/// The set is structurally bounded rather than capped by an eviction rule: one
+/// slot per player per kind, at most [`MAX_CONCLUSIONS`] in total. There is no
+/// truncation for an attacker to aim at.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConclusionV1(pub Option<SignedConclusion>);
+pub struct ConclusionV1 {
+    /// Sorted by [`SignedConclusion::order_key`], so the encoding is
+    /// deterministic for a given set of claims.
+    pub claims: Vec<SignedConclusion>,
+}
 
 impl ConclusionV1 {
-    pub fn get(&self) -> Option<&SignedConclusion> {
-        self.0.as_ref()
+    /// A set holding one claim, which is what a client publishing a resignation
+    /// or a timeout builds.
+    pub fn single(claim: SignedConclusion) -> ConclusionV1 {
+        ConclusionV1 {
+            claims: vec![claim],
+        }
     }
 
-    /// The result implied by the stored conclusion, if any. Needs the parent to
-    /// map the claimant's key to a color.
+    pub fn is_empty(&self) -> bool {
+        self.claims.is_empty()
+    }
+
+    /// The claim that decides the game: the earliest one whose evidence holds.
+    pub fn effective(&self, parent: &ChessGameStateV1) -> Option<&SignedConclusion> {
+        self.claims.iter().find(|c| c.is_effective(parent))
+    }
+
+    /// The result implied by the deciding claim, if any.
     pub(super) fn result_with(&self, parent: &ChessGameStateV1) -> Option<GameResult> {
-        self.0.as_ref()?.result(parent)
+        self.effective(parent)?.result(parent)
     }
 
+    /// Merge one claim in. Same-slot conflicts are settled by the total order,
+    /// never by arrival order.
     fn absorb(&mut self, incoming: SignedConclusion) {
-        match &self.0 {
-            None => self.0 = Some(incoming),
-            Some(current) => {
-                // Earliest claim wins, signature bytes break ties: a total
-                // order, so merging is commutative and idempotent.
-                if incoming.tiebreak() < current.tiebreak() {
-                    self.0 = Some(incoming);
+        match self.claims.iter_mut().find(|c| c.slot() == incoming.slot()) {
+            Some(existing) => {
+                if incoming.order_key() < existing.order_key() {
+                    *existing = incoming;
                 }
             }
+            None => self.claims.push(incoming),
         }
+        self.claims.sort_by_key(|c| c.order_key());
     }
 }
 
 impl ComposableState for ConclusionV1 {
     type ParentState = ChessGameStateV1;
-    type Summary = bool;
-    type Delta = SignedConclusion;
+    /// One signature per claim, which distinguishes exactly as much as the
+    /// merge does. A coarser summary (this used to be a bare `bool`) makes two
+    /// peers holding *different* claims both report "I have one" and neither
+    /// ship a delta, so the total order that settles them is never reached and
+    /// the divergence is permanent.
+    type Summary = Vec<Vec<u8>>;
+    type Delta = Vec<SignedConclusion>;
     type Parameters = ChessGameParametersV1;
 
     fn verify(&self, parent: &Self::ParentState, params: &Self::Parameters) -> Result<(), String> {
-        match &self.0 {
-            Some(c) => c.verify(parent, params),
-            None => Ok(()),
+        if self.claims.len() > MAX_CONCLUSIONS {
+            return Err(format!(
+                "{} conclusions recorded, over the {MAX_CONCLUSIONS} a two-player game admits",
+                self.claims.len()
+            ));
         }
+        let mut seen = std::collections::BTreeSet::new();
+        for claim in &self.claims {
+            claim.verify(parent, params)?;
+            if !seen.insert(claim.slot()) {
+                return Err("two conclusions of the same kind from the same player".to_string());
+            }
+        }
+        Ok(())
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.0.is_some()
+        self.claims
+            .iter()
+            .map(|c| c.signature.to_bytes().to_vec())
+            .collect()
     }
 
     fn delta(
@@ -348,10 +449,18 @@ impl ComposableState for ConclusionV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        if *old_summary {
+        let theirs: std::collections::BTreeSet<&[u8]> =
+            old_summary.iter().map(|s| s.as_slice()).collect();
+        let missing: Vec<SignedConclusion> = self
+            .claims
+            .iter()
+            .filter(|c| !theirs.contains(c.signature.to_bytes().as_slice()))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
             None
         } else {
-            self.0.clone()
+            Some(missing)
         }
     }
 
@@ -362,8 +471,10 @@ impl ComposableState for ConclusionV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(incoming) = delta {
-            incoming.verify(parent, params)?;
-            self.absorb(incoming.clone());
+            for claim in incoming {
+                claim.verify(parent, params)?;
+                self.absorb(claim.clone());
+            }
         }
         Ok(())
     }

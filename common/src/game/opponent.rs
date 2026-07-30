@@ -135,7 +135,12 @@ impl OpponentSlotV1 {
 
 impl ComposableState for OpponentSlotV1 {
     type ParentState = ChessGameStateV1;
-    type Summary = Option<[u8; 32]>;
+    /// The full race key, not just the joiner's identity: `race_key` is
+    /// `(joined_at, player)`, so a summary of the key alone left two peers
+    /// holding two joins from the *same* challenger unable to reconcile. That
+    /// matters more than it looks — `joined_at` is when the clocks start, so the
+    /// two would disagree about the time remaining for the rest of the game.
+    type Summary = Option<(i64, [u8; 32])>;
     type Delta = SignedJoin;
     type Parameters = ChessGameParametersV1;
 
@@ -162,7 +167,7 @@ impl ComposableState for OpponentSlotV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.0.as_ref().map(|j| j.player.to_bytes())
+        self.0.as_ref().map(|j| j.race_key())
     }
 
     fn delta(
@@ -175,7 +180,7 @@ impl ComposableState for OpponentSlotV1 {
         // Ship our join if the peer has none, or has a different one — they may
         // be holding the loser of a race and need ours to converge.
         match old_summary {
-            Some(theirs) if theirs == &current.player.to_bytes() => None,
+            Some(theirs) if theirs == &current.race_key() => None,
             _ => Some(current.clone()),
         }
     }

@@ -645,7 +645,7 @@ pub fn GameView(
     // resignation or agreed draw leaves the mover's clock still ticking.
     let clock_now = if is_over {
         game.conclusion
-            .get()
+            .effective(&game)
             .map(|c| c.at)
             .or_else(|| game.moves.timestamps().last().copied())
             .unwrap_or(now)
@@ -655,6 +655,18 @@ pub fn GameView(
     let white_ms = game.time_remaining(Color::White, clock_now);
     let black_ms = game.time_remaining(Color::Black, clock_now);
     let to_move = replay.side_to_move();
+
+    // A flag fall decides nothing on its own — someone has to claim it. The
+    // claim only holds once the opponent's *own* attestations put the deadline
+    // in the past, so offer it exactly when it would be accepted.
+    let timeout_claimable = my_color
+        .filter(|_| !is_over)
+        .and_then(|mine| {
+            let at_ply = game.moves.move_list().len() as u32;
+            game.timeout_provable_at(mine.opposite(), at_ply)
+        })
+        .map(|provable| now >= provable)
+        .unwrap_or(false);
 
     let sans = replay.san_list();
     let can_join = game.is_open()
@@ -817,6 +829,14 @@ pub fn GameView(
                                     style: "width:100%;margin-top:8px",
                                     onclick: move |_| sync.send(Cmd::Resign(game_id)),
                                     "Resign"
+                                }
+                            }
+                            if timeout_claimable {
+                                button {
+                                    class: "primary",
+                                    style: "width:100%;margin-top:8px",
+                                    onclick: move |_| sync.send(Cmd::ClaimTimeout(game_id)),
+                                    "Claim the win on time"
                                 }
                             }
                             div { class: "small muted", style: "margin-top:12px",

@@ -482,3 +482,186 @@ fn the_active_list_excludes_expired_players() {
     assert_eq!(active[0].player, fresh.verifying_key());
     assert_eq!(state.presence.online_count(T0), 1);
 }
+
+// ------------------------------------------------- summaries vs merge order
+
+#[test]
+fn presence_entries_differing_only_below_the_summary_still_exchange() {
+    // `absorb` settles a tie on `updated_at` by signature bytes, but the
+    // summary carried only `updated_at`. Two peers holding different heartbeats
+    // stamped the same millisecond therefore reported identical summaries,
+    // neither shipped a delta, and the tiebreak was unreachable.
+    let player = key();
+    let a =
+        SignedPresence::watching_game(&player, "one".to_string(), PresenceStatus::Online, None, T0);
+    let b =
+        SignedPresence::watching_game(&player, "two".to_string(), PresenceStatus::Online, None, T0);
+    assert_ne!(a.signature, b.signature, "test premise: distinct entries");
+
+    // Which of the two wins depends on random signature bytes, so sync both
+    // directions and assert the property that matters: they end up agreeing.
+    let winner = if a.signature.to_bytes() > b.signature.to_bytes() {
+        a.clone()
+    } else {
+        b.clone()
+    };
+
+    let mut peer1 = LobbyStateV1::default();
+    peer1.presence.players.insert(a.player_id(), a);
+    let mut peer2 = LobbyStateV1::default();
+    peer2.presence.players.insert(b.player_id(), b);
+
+    for _ in 0..2 {
+        let s1 = peer1.presence.summarize(&peer1, &params());
+        if let Some(d) = peer2.presence.delta(&peer2, &params(), &s1) {
+            peer1
+                .presence
+                .apply_delta(&peer1.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.presence.summarize(&peer2, &params());
+        if let Some(d) = peer1.presence.delta(&peer1, &params(), &s2) {
+            peer2
+                .presence
+                .apply_delta(&peer2.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.presence, peer2.presence);
+    assert_eq!(
+        peer1.presence.players.get(&winner.player_id()),
+        Some(&winner),
+        "and settle on the entry the total order picks"
+    );
+}
+
+#[test]
+fn rank_entries_with_equal_games_played_still_exchange() {
+    // `order_key` is (games_played, updated_at, signature) but the summary was
+    // games_played alone, so a later entry with the same count never shipped.
+    let player = key();
+    let other = key();
+    let (cert, _) = certified_game(&player, &other, T0, 1200, 1200);
+
+    // The rating has to follow from the cited game, so both entries carry the
+    // same (correct) one and differ only in `updated_at` — a field the old
+    // summary did not carry.
+    let me = PlayerId::from(&player.verifying_key());
+    let games_played = 4u32;
+    let rating = crate::elo::apply_result(
+        1200,
+        games_played - 1,
+        cert.opponent_rating_for(me).expect("player is in the game"),
+        cert.score_for(me).expect("game has a result"),
+    );
+    let stale = RankEntry::new(
+        &player,
+        "me".to_string(),
+        rating,
+        games_played,
+        cert.clone(),
+        T0 + 1_000,
+    );
+    let fresh = RankEntry::new(
+        &player,
+        "me".to_string(),
+        rating,
+        games_played,
+        cert,
+        T0 + 9_000,
+    );
+
+    let mut peer1 = LobbyStateV1::default();
+    peer1.leaderboard.entries.insert(stale.player_id(), stale);
+    let peer2 = {
+        let mut s = LobbyStateV1::default();
+        s.leaderboard.entries.insert(fresh.player_id(), fresh);
+        s
+    };
+
+    let summary = peer1.leaderboard.summarize(&peer1, &params());
+    let delta = peer2
+        .leaderboard
+        .delta(&peer2, &params(), &summary)
+        .expect("the later entry must ship");
+    peer1
+        .leaderboard
+        .apply_delta(&peer1.clone(), &params(), &Some(delta))
+        .unwrap();
+
+    assert_eq!(peer1.leaderboard, peer2.leaderboard);
+}
+
+#[test]
+fn snapshots_at_the_same_ply_still_exchange() {
+    // The summary's "revision" was `ply + 1 + opponent.is_some()`, but
+    // `SignedSnapshot::order_key` is (ply, updated_at, signature). Two peers
+    // holding different snapshots of the same ply — both players publishing
+    // after the same move, which is the normal case — had equal revisions, so
+    // neither shipped and the two lobbies showed different clocks for ever.
+    let creator = key();
+    let challenger = key();
+    let base = matched_listing(&creator, &challenger, T0);
+    let game_id = base.game_id;
+
+    let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1".to_string();
+    let mut peer1 = lobby_with(vec![{
+        let mut e = base.clone();
+        e.snapshot = Some(SignedSnapshot::new(
+            &creator,
+            &game_id,
+            fen.clone(),
+            1,
+            GameResult::InProgress,
+            599_000,
+            600_000,
+            T0 + 2_000,
+        ));
+        e
+    }]);
+    let mut peer2 = lobby_with(vec![{
+        let mut e = base.clone();
+        e.snapshot = Some(SignedSnapshot::new(
+            &challenger,
+            &game_id,
+            fen,
+            1,
+            GameResult::InProgress,
+            598_000,
+            600_000,
+            T0 + 8_000,
+        ));
+        e
+    }]);
+    assert_ne!(peer1.games, peer2.games, "test premise: they differ");
+
+    for _ in 0..2 {
+        let s1 = peer1.games.summarize(&peer1, &params());
+        if let Some(d) = peer2.games.delta(&peer2, &params(), &s1) {
+            peer1
+                .games
+                .apply_delta(&peer1.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.games.summarize(&peer2, &params());
+        if let Some(d) = peer1.games.delta(&peer1, &params(), &s2) {
+            peer2
+                .games
+                .apply_delta(&peer2.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.games, peer2.games);
+    // The later snapshot is the one they agree on.
+    assert_eq!(
+        peer1
+            .games
+            .games
+            .get(&game_id)
+            .and_then(|e| e.snapshot.as_ref())
+            .map(|s| s.updated_at),
+        Some(T0 + 8_000)
+    );
+}

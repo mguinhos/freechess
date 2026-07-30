@@ -28,7 +28,8 @@
 //! the attack, and ratings are only as meaningful as the opponents faced.
 
 use crate::chess::{Color, Game, GameStatus, Move};
-use crate::game::setup::TimeControl;
+use crate::elo::{MAX_ELO, MIN_ELO};
+use crate::game::setup::{leading_zero_bits, TimeControl, MAX_NICKNAME_LEN, POW_DIFFICULTY_BITS};
 use crate::game::{ChessGameStateV1, DrawReason, GameResult, WinReason, SIG_DOMAIN};
 use crate::identity::{verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -38,6 +39,14 @@ use serde::{Deserialize, Serialize};
 /// maximum of a legal game under the 50-move rule in practice, while bounding
 /// how large a single archive entry can get.
 pub const MAX_CERTIFIED_PLIES: usize = 1024;
+
+/// Upper bound on a certificate's timestamps: 2100-01-01 in Unix milliseconds.
+///
+/// A self-asserted timestamp that is merely *large* is not harmless here.
+/// `finished_at` chooses a game's archive shard and orders it inside that shard,
+/// so a far-future value both spawns shard contracts at absurd epochs and, under
+/// newest-first eviction, pushes real games out of the shard it lands in.
+pub const MAX_CERTIFICATE_TIME_MS: i64 = 4_102_444_800_000;
 
 /// The two players' agreed record of a finished game.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,11 +273,62 @@ impl GameCertificate {
                 self.moves.len()
             ));
         }
+        // The game id is a proof-of-work digest, so requiring the work here is
+        // what makes a certificate cost something. Without it the archive, every
+        // profile history and the leaderboard are free to fill with fabricated
+        // games: two throwaway keys are enough, and keys are free.
+        //
+        // This prices a *slot* rather than proving a real game happened — every
+        // collection is keyed by game id, so N entries cost N mined ids, the same
+        // as N honest games. It does not bind the id to either player's key,
+        // which would need the certificate to carry the setup terms it is
+        // derived from; two colluding keys can still co-sign a fabricated result
+        // between themselves, which the module docs above already concede is
+        // inherent.
+        if leading_zero_bits(&self.game_id.0) < POW_DIFFICULTY_BITS {
+            return Err(format!(
+                "certificate game id carries {} bits of proof-of-work, need {}",
+                leading_zero_bits(&self.game_id.0),
+                POW_DIFFICULTY_BITS
+            ));
+        }
         if self.finished_at < self.started_at {
             return Err("certificate finishes before it starts".to_string());
         }
         if self.started_at <= 0 {
             return Err("certificate has a non-positive start time".to_string());
+        }
+        // Bounded because `finished_at` places a game in an archive shard and
+        // orders it there, so an absurd value spawns shard contracts at absurd
+        // epochs and evicts real games from the ones it lands in.
+        if self.finished_at > MAX_CERTIFICATE_TIME_MS {
+            return Err(format!(
+                "certificate finishes at {}, past the {MAX_CERTIFICATE_TIME_MS} bound",
+                self.finished_at
+            ));
+        }
+        // Bounded everywhere else in the crate; this path was the exception.
+        for (whose, nickname) in [
+            ("white", &self.white_nickname),
+            ("black", &self.black_nickname),
+        ] {
+            if nickname.len() > MAX_NICKNAME_LEN {
+                return Err(format!(
+                    "{whose}'s nickname is longer than {MAX_NICKNAME_LEN} bytes"
+                ));
+            }
+        }
+        // Bounded because these feed `elo`, whose arithmetic is only meaningful
+        // over real ratings.
+        for (whose, rating) in [
+            ("white", self.white_rating_before),
+            ("black", self.black_rating_before),
+        ] {
+            if !(MIN_ELO..=MAX_ELO).contains(&rating) {
+                return Err(format!(
+                    "{whose}'s rating of {rating} is outside {MIN_ELO}..={MAX_ELO}"
+                ));
+            }
         }
         self.time_control.verify()?;
 
@@ -412,5 +472,85 @@ fn format_date(unix_ms: i64) -> String {
     match chrono::Utc.timestamp_millis_opt(unix_ms).single() {
         Some(dt) => dt.format("%Y.%m.%d").to_string(),
         None => "????.??.??".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::setup::{leading_zero_bits, MAX_NICKNAME_LEN, POW_DIFFICULTY_BITS};
+    use crate::testutil::{certified_game, key, T0};
+
+    /// A certificate over `game_id` that both throwaway keys signed. Nothing
+    /// about it corresponds to a real game.
+    fn forged(game_id: GameId, mutate: impl FnOnce(&mut CertificateDraft)) -> GameCertificate {
+        let white = key();
+        let black = key();
+        let mut draft = CertificateDraft {
+            game_id,
+            white: white.verifying_key(),
+            black: black.verifying_key(),
+            white_nickname: "w".to_string(),
+            black_nickname: "b".to_string(),
+            result: GameResult::WhiteWins(WinReason::Resignation),
+            moves: Vec::new(),
+            time_control: TimeControl::default(),
+            started_at: T0,
+            finished_at: T0 + 1_000,
+            white_rating_before: 1200,
+            black_rating_before: 1200,
+        };
+        mutate(&mut draft);
+        let ws = draft.sign(&white);
+        let bs = draft.sign(&black);
+        draft.assemble(ws, bs)
+    }
+
+    #[test]
+    fn a_certificate_costs_proof_of_work() {
+        // Without this the archive, every profile history and the leaderboard
+        // are free to spam: two throwaway keys co-sign a fabricated result and
+        // it verifies. The work is what prices a slot, exactly as it does for
+        // creating a game.
+        let cert = forged(GameId([0xff; 32]), |_| {});
+        let err = cert.verify().expect_err("must reject");
+        assert!(err.contains("proof-of-work"), "got: {err}");
+
+        // A real game's id carries the work, so a genuine certificate passes.
+        let (real, game_id) = certified_game(&key(), &key(), T0, 1200, 1200);
+        assert!(leading_zero_bits(&game_id.0) >= POW_DIFFICULTY_BITS);
+        real.verify().expect("a real game's certificate verifies");
+    }
+
+    #[test]
+    fn unbounded_certificate_fields_are_rejected() {
+        // Every one of these reaches code that assumes a sane value: nicknames
+        // are bounded everywhere else, and the ratings feed `elo`.
+        let (real, game_id) = certified_game(&key(), &key(), T0, 1200, 1200);
+        let _ = real;
+
+        let long_name = forged(game_id, |d| {
+            d.white_nickname = "n".repeat(MAX_NICKNAME_LEN + 1);
+        });
+        assert!(
+            long_name.verify().unwrap_err().contains("nickname"),
+            "an over-long nickname must be rejected"
+        );
+
+        let absurd_rating = forged(game_id, |d| {
+            d.white_rating_before = i32::MIN;
+        });
+        assert!(
+            absurd_rating.verify().unwrap_err().contains("rating"),
+            "a rating outside the Elo range must be rejected"
+        );
+
+        let far_future = forged(game_id, |d| {
+            d.finished_at = i64::MAX;
+        });
+        assert!(
+            far_future.verify().is_err(),
+            "an absurd finish time must be rejected"
+        );
     }
 }

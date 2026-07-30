@@ -477,3 +477,44 @@ fn pgn_escapes_quotes_in_nicknames() {
     let pgn = game.to_pgn(&[("White", "he said \"hi\"".to_string())], "*");
     assert!(pgn.contains(r#"[White "he said \"hi\""]"#));
 }
+
+// ------------------------------------------------------------ square bounds
+
+#[test]
+fn a_square_outside_the_board_is_rejected_on_deserialize() {
+    // `Square` indexes a fixed 64-element array, so a decoded value above 63 is
+    // a panic waiting for the first `piece_at`. Reject it at the boundary, which
+    // is the only place every path passes through.
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&64u8, &mut encoded).expect("encode");
+    assert!(ciborium::from_reader::<Square, _>(encoded.as_slice()).is_err());
+
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&200u8, &mut encoded).expect("encode");
+    assert!(ciborium::from_reader::<Square, _>(encoded.as_slice()).is_err());
+
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&63u8, &mut encoded).expect("encode");
+    assert_eq!(
+        ciborium::from_reader::<Square, _>(encoded.as_slice()).expect("63 is on the board"),
+        Square(63)
+    );
+}
+
+#[test]
+fn an_out_of_range_square_errors_instead_of_panicking() {
+    // Defence in depth for a value built in memory rather than decoded: the
+    // engine must return an error, never index out of bounds.
+    let mut board = Board::starting_position();
+    assert_eq!(board.piece_at(Square(200)), None);
+    assert_eq!(
+        board.make_move(Move::new(Square(200), Square(201))),
+        Err(MoveError::EmptySquare)
+    );
+
+    let moves = vec![Move::new(Square(200), Square(201))];
+    assert_eq!(
+        Game::from_moves(&moves).expect_err("must reject"),
+        (0, MoveError::EmptySquare)
+    );
+}

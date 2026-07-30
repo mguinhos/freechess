@@ -147,8 +147,14 @@ impl Board {
         }
     }
 
+    /// The piece on `sq`, or `None` if the square is empty.
+    ///
+    /// Indexes through `get` rather than `[]` so a `Square` built in memory
+    /// (rather than decoded, where the range is already enforced) reports an
+    /// empty square instead of panicking. Under `panic = 'abort'` in WASM a
+    /// panic here is a contract trap, not a caught error.
     pub fn piece_at(&self, sq: Square) -> Option<Piece> {
-        self.squares[sq.0 as usize]
+        self.squares.get(sq.0 as usize).copied().flatten()
     }
 
     pub fn set_piece(&mut self, sq: Square, piece: Option<Piece>) {

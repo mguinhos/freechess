@@ -109,6 +109,20 @@ fn App() -> Element {
         }
     });
 
+    // Clock attestation. Unlike the heartbeat above (which is presence, in the
+    // lobby) this goes into the game's own contract, because a contract cannot
+    // read another one. It is what makes a timeout provable: the only evidence
+    // in state that time really passed is a signature from the player it counts
+    // against, so a client that stops publishing these forfeits by absence.
+    use_future(move || async move {
+        loop {
+            if let Route::Game(id) = state.read().route.clone() {
+                sync.send(app::Cmd::AttestClock(id));
+            }
+            gloo_sleep(chess_core::game::clocks::CLOCK_TICK_MS as u32).await;
+        }
+    });
+
     rsx! {
         document::Stylesheet { href: MAIN_CSS }
         views::TopBar { state, sync }

@@ -202,3 +202,76 @@ fn searching_finds_games_by_nickname_and_player() {
     let stranger = crate::identity::PlayerId::from(&key().verifying_key());
     assert_eq!(games.games_of(stranger).len(), 0);
 }
+
+#[test]
+fn equivocating_certificates_are_exchanged_so_the_tiebreak_can_run() {
+    // `absorb` settles two valid certificates for one game by signature bytes,
+    // but the summary was a bare set of game ids, so a peer holding a different
+    // certificate for a game the other already had shipped nothing. The tiebreak
+    // was unreachable and the two peers kept different history for ever.
+    let white = key();
+    let black = key();
+    let (first, game_id) = certified_game(&white, &black, T0, 1200, 1200);
+
+    // Same game, same players, a different co-signed finish time: only possible
+    // if the pair equivocated, which is exactly what the tiebreak is for.
+    let draft = crate::certificate::CertificateDraft {
+        game_id: first.game_id,
+        white: first.white,
+        black: first.black,
+        white_nickname: first.white_nickname.clone(),
+        black_nickname: first.black_nickname.clone(),
+        result: first.result,
+        moves: first.moves.clone(),
+        time_control: first.time_control,
+        started_at: first.started_at,
+        finished_at: first.finished_at + 5_000,
+        white_rating_before: first.white_rating_before,
+        black_rating_before: first.black_rating_before,
+    };
+    let ws = draft.sign(&white);
+    let bs = draft.sign(&black);
+    let second = draft.assemble(ws, bs);
+    second.verify().expect("the rival certificate is valid too");
+    assert_ne!(first.white_signature, second.white_signature);
+
+    let shard = ShardId::for_game(first.finished_at, &game_id);
+    let params = shard_params(shard);
+
+    // Which of the two wins depends on random signature bytes, so sync both
+    // directions and assert the property that matters: they end up agreeing.
+    let winner = if first.white_signature.to_bytes() < second.white_signature.to_bytes() {
+        first.clone()
+    } else {
+        second.clone()
+    };
+
+    let mut peer1 = ArchiveStateV1::default();
+    peer1.games.games.insert(game_id, first);
+    let mut peer2 = ArchiveStateV1::default();
+    peer2.games.games.insert(game_id, second);
+
+    for _ in 0..2 {
+        let s1 = peer1.games.summarize(&peer1, &params);
+        if let Some(d) = peer2.games.delta(&peer2, &params, &s1) {
+            peer1
+                .games
+                .apply_delta(&peer1.clone(), &params, &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.games.summarize(&peer2, &params);
+        if let Some(d) = peer1.games.delta(&peer1, &params, &s2) {
+            peer2
+                .games
+                .apply_delta(&peer2.clone(), &params, &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.games, peer2.games, "the tiebreak must settle both");
+    assert_eq!(
+        peer1.games.games.get(&game_id),
+        Some(&winner),
+        "and settle them on the certificate the total order picks"
+    );
+}

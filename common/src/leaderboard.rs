@@ -276,7 +276,11 @@ impl LeaderboardV1 {
 
 impl ComposableState for LeaderboardV1 {
     type ParentState = LobbyStateV1;
-    type Summary = Vec<(PlayerId, u32)>;
+    /// Per player, the full merge-order key from [`RankEntry::order_key`]. Games
+    /// played alone is coarser than the order `absorb` imposes, so a fresher
+    /// entry with the same count never shipped and the two peers kept different
+    /// ratings for ever.
+    type Summary = Vec<(PlayerId, u32, i64, Vec<u8>)>;
     type Delta = Vec<RankEntry>;
     type Parameters = LobbyParametersV1;
 
@@ -303,7 +307,14 @@ impl ComposableState for LeaderboardV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         self.entries
             .iter()
-            .map(|(id, e)| (*id, e.games_played))
+            .map(|(id, e)| {
+                (
+                    *id,
+                    e.games_played,
+                    e.updated_at,
+                    e.signature.to_bytes().to_vec(),
+                )
+            })
             .collect()
     }
 
@@ -313,15 +324,23 @@ impl ComposableState for LeaderboardV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<PlayerId, u32> = old_summary.iter().copied().collect();
+        let theirs: BTreeMap<PlayerId, (u32, i64, &[u8])> = old_summary
+            .iter()
+            .map(|(id, games, at, sig)| (*id, (*games, *at, sig.as_slice())))
+            .collect();
         let changed: Vec<RankEntry> = self
             .entries
             .iter()
-            .filter(|(id, e)| {
-                theirs
-                    .get(id)
-                    .map(|their_games| *their_games < e.games_played)
-                    .unwrap_or(true)
+            .filter(|(id, e)| match theirs.get(id) {
+                // Ship whenever ours wins the same total order `absorb` uses.
+                Some(theirs) => {
+                    (
+                        e.games_played,
+                        e.updated_at,
+                        e.signature.to_bytes().as_slice(),
+                    ) > *theirs
+                }
+                None => true,
             })
             .map(|(_, e)| e.clone())
             .collect();

@@ -150,7 +150,10 @@ impl ProfileV1 {
 
 impl ComposableState for ProfileV1 {
     type ParentState = PlayerStateV1;
-    type Summary = Option<i64>;
+    /// The full merge-order key, not just the timestamp: `absorb` breaks a tie on
+    /// `updated_at` by signature bytes, so a summary of the timestamp alone left
+    /// two profiles stamped the same millisecond unable to reconcile.
+    type Summary = Option<(i64, Vec<u8>)>;
     type Delta = SignedProfile;
     type Parameters = PlayerParametersV1;
 
@@ -162,7 +165,9 @@ impl ComposableState for ProfileV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.0.as_ref().map(|p| p.updated_at)
+        self.0
+            .as_ref()
+            .map(|p| (p.updated_at, p.signature.to_bytes().to_vec()))
     }
 
     fn delta(
@@ -172,8 +177,10 @@ impl ComposableState for ProfileV1 {
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
         let current = self.0.as_ref()?;
+        let mine = (current.updated_at, current.signature.to_bytes());
         match old_summary {
-            Some(theirs) if *theirs >= current.updated_at => None,
+            // Ship whenever ours wins the same total order `absorb` uses.
+            Some((at, sig)) if (*at, sig.as_slice()) >= (mine.0, mine.1.as_slice()) => None,
             _ => Some(current.clone()),
         }
     }
@@ -286,7 +293,10 @@ impl HistoryV1 {
 
 impl ComposableState for HistoryV1 {
     type ParentState = PlayerStateV1;
-    type Summary = Vec<GameId>;
+    /// Game id *and* the signature `absorb` settles equivocation by. A bare set
+    /// of ids meant a rival certificate for a game the peer already held never
+    /// shipped, so the tiebreak never ran and the two kept different history.
+    type Summary = Vec<(GameId, Vec<u8>)>;
     type Delta = Vec<GameCertificate>;
     type Parameters = PlayerParametersV1;
 
@@ -315,7 +325,10 @@ impl ComposableState for HistoryV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.games.keys().copied().collect()
+        self.games
+            .iter()
+            .map(|(id, c)| (*id, c.white_signature.to_bytes().to_vec()))
+            .collect()
     }
 
     fn delta(
@@ -324,11 +337,18 @@ impl ComposableState for HistoryV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: std::collections::BTreeSet<GameId> = old_summary.iter().copied().collect();
+        let theirs: std::collections::BTreeMap<GameId, &[u8]> = old_summary
+            .iter()
+            .map(|(id, sig)| (*id, sig.as_slice()))
+            .collect();
         let missing: Vec<GameCertificate> = self
             .games
             .iter()
-            .filter(|(id, _)| !theirs.contains(id))
+            .filter(|(id, c)| match theirs.get(id) {
+                // Ship ours whenever it wins the tiebreak, so the peer can run it.
+                Some(theirs) => c.white_signature.to_bytes().as_slice() < *theirs,
+                None => true,
+            })
             .map(|(_, c)| c.clone())
             .collect();
         if missing.is_empty() {
