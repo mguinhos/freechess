@@ -17,7 +17,7 @@ use chess_core::chess::{Color, Move};
 use chess_core::game::clocks::ClockAttestation;
 use chess_core::game::conclusion::{ConclusionV1, SignedConclusion};
 use chess_core::game::moves::AuthorizedMove;
-use chess_core::game::opponent::SignedJoin;
+use chess_core::game::opponent::{OpponentDelta, SignedAcceptance, SignedJoin};
 use chess_core::game::setup::{GameSetup, GameSetupV1, TimeControl};
 use chess_core::game::{ChessGameStateV1, GameResult};
 use chess_core::identity::{GameId, PlayerId};
@@ -148,8 +148,14 @@ pub enum Cmd {
         time_control: TimeControl,
         challenged: Option<VerifyingKey>,
     },
-    /// Take the open seat in a game.
+    /// Offer to take the open seat in a game. Does not start the game — the
+    /// creator has to countersign, which their client does in
+    /// [`Cmd::SeatChallenger`].
     JoinGame(GameId),
+    /// Countersign a challenger's offer, which is what actually starts the
+    /// game. Only meaningful on the creator's own client: the acceptance is
+    /// checked against the creator key in the contract parameters.
+    SeatChallenger(GameId),
     /// Subscribe to a game's own contract (playing or spectating).
     WatchGame(GameId),
     /// Play a move in a game.
@@ -430,13 +436,17 @@ async fn handle_cmd(
                     .await
                     .map_err(|e| format!("could not fetch the game: {e}"));
             }
+            // An offer, not a seat. Only the creator's countersignature seats a
+            // player, so nothing here starts the game — see
+            // `chess_core::game::opponent`. Mining the proof-of-work takes a few
+            // milliseconds on the client.
             let join = SignedJoin::new(key, &game_id, now, account.nickname.clone());
 
             let instance = freenet::game_instance(creator, game_id)?;
             instances.insert(instance.id(), Subject::Game(game_id));
 
             let delta = chess_core::game::ChessGameStateV1Delta {
-                opponent: Some(join.clone()),
+                opponent: Some(OpponentDelta::offer(join)),
                 ..Default::default()
             };
             api.send(freenet::update_request(
@@ -444,7 +454,7 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not join: {e}"))?;
+            .map_err(|e| format!("could not offer to play: {e}"))?;
             // GET as well as subscribe: subscribing only delivers *future*
             // changes, so without this the board stays empty until the
             // opponent happens to move.
@@ -452,17 +462,61 @@ async fn handle_cmd(
                 .await
                 .map_err(|e| format!("could not fetch the game: {e}"))?;
 
-            // Mirror it into the lobby so the home page shows the game as live.
-            if let Some(mut entry) = state.with(|s| s.lobby.games.get(&game_id).cloned()) {
-                entry.opponent = Some(join);
-                push_lobby_entry(api, entry).await?;
-            }
+            // The lobby entry is only updated once the creator accepts, which
+            // happens in `Cmd::SeatChallenger` on the creator's own client.
             state.with_mut(|s| {
                 s.route = Route::Game(game_id);
                 if s.pending_join == Some(game_id) {
                     s.pending_join = None;
                 }
             });
+            Ok(())
+        }
+
+        Cmd::SeatChallenger(game_id) => {
+            let (creator, game) = state
+                .with(|s| {
+                    s.creators
+                        .get(&game_id)
+                        .copied()
+                        .zip(s.games.get(&game_id).cloned())
+                })
+                .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            // Nothing to do unless we are the creator and the seat is still
+            // open. Anyone else signing this produces a value every peer
+            // rejects, so bailing out here only saves the round trip.
+            if creator != key.verifying_key() || game.opponent.get().is_some() {
+                return Ok(());
+            }
+            // Take the first offer in the map's deterministic order. Any choice
+            // is sound — the point is that the choice is *ours* — and a stable
+            // one keeps two tabs of the same account from countersigning
+            // different challengers.
+            let Some(join) = game.opponent.pending_offers().first().map(|j| (*j).clone()) else {
+                return Ok(());
+            };
+
+            let acceptance = SignedAcceptance::new(key, &game_id, join);
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                opponent: Some(OpponentDelta::seat(acceptance.clone())),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not accept the challenger: {e}"))?;
+
+            // Mirror into the lobby so the home page moves the game from "open"
+            // to "live". The lobby carries the acceptance, not the bare offer,
+            // so it applies exactly the same check the game contract does.
+            if let Some(mut entry) = state.with(|s| s.lobby.games.get(&game_id).cloned()) {
+                entry.opponent = Some(acceptance);
+                push_lobby_entry(api, entry).await?;
+            }
             Ok(())
         }
 
@@ -817,7 +871,7 @@ async fn publish_snapshot(
     let entry = LobbyEntry {
         game_id,
         setup,
-        opponent: game.opponent.get().cloned(),
+        opponent: game.opponent.accepted().cloned(),
         snapshot: Some(snapshot),
     };
     push_lobby_entry(api, entry).await

@@ -1,0 +1,3 @@
+http://127.0.0.1:7511/v1/contract/web/GV3WZEAWC82nrXJcvgwYaXNLLd71AVtDuu5Pc7TnRR92/
+
+Unexpected response from node: Some(Result { id: ClientId(40000001), result: Ok(ContractResponse(NotFound { instance_id: ContractInstanceId("GV3WZEAWC82nrXJcvgwYaXNLLd71AVtDuu5Pc7TnRR92") })) })

@@ -10,7 +10,7 @@
 use super::clocks::{self, ClockAttestation};
 use super::conclusion::{self, SignedConclusion};
 use super::moves::AuthorizedMove;
-use super::opponent::SignedJoin;
+use super::opponent::{OpponentDelta, SignedAcceptance, SignedJoin};
 use super::setup::{leading_zero_bits, GameSetup, TimeControl, POW_DIFFICULTY_BITS};
 use super::*;
 use crate::chess::{Color, Move};
@@ -73,14 +73,23 @@ fn started_game_at(
     created_at: i64,
 ) -> (ChessGameStateV1, ChessGameParametersV1) {
     let (mut state, params) = open_game_at(creator, Color::White, created_at);
-    let join = SignedJoin::new(
-        opponent,
-        &params.game_id,
-        created_at + 1000,
-        "opponent".to_string(),
-    );
-    state.opponent = opponent::OpponentSlotV1(Some(join));
+    state.opponent = seat(creator, opponent, &params, created_at + 1000, "opponent");
     (state, params)
+}
+
+/// A seat filled the legitimate way: `joiner` offers, the creator countersigns.
+fn seat(
+    creator: &SigningKey,
+    joiner: &SigningKey,
+    params: &ChessGameParametersV1,
+    at: i64,
+    nickname: &str,
+) -> opponent::OpponentSlotV1 {
+    let join = SignedJoin::new(joiner, &params.game_id, at, nickname.to_string());
+    opponent::OpponentSlotV1 {
+        offers: Default::default(),
+        seated: Some(SignedAcceptance::new(creator, &params.game_id, join)),
+    }
 }
 
 /// Append a move signed by `signer`, without any validation.
@@ -212,58 +221,155 @@ fn absurd_time_controls_are_rejected() {
 fn the_creator_cannot_join_their_own_game() {
     let creator = key();
     let (mut state, params) = open_game(&creator, Color::White);
-    let join = SignedJoin::new(&creator, &params.game_id, T0 + 1, "me again".to_string());
-    state.opponent = opponent::OpponentSlotV1(Some(join));
+    state.opponent = seat(&creator, &creator, &params, T0 + 1, "me again");
     let err = state.verify(&state, &params).expect_err("must reject");
     assert!(err.contains("cannot join their own game"), "got: {err}");
 }
 
 #[test]
-fn a_join_race_resolves_identically_regardless_of_order() {
+fn competing_offers_converge_and_seat_nobody_on_their_own() {
     let creator = key();
     let alice = key();
     let bob = key();
     let (base, params) = open_game(&creator, Color::White);
 
-    let join_a = SignedJoin::new(&alice, &params.game_id, T0 + 500, "alice".to_string());
-    let join_b = SignedJoin::new(&bob, &params.game_id, T0 + 700, "bob".to_string());
+    let offer_a = OpponentDelta::offer(SignedJoin::new(
+        &alice,
+        &params.game_id,
+        T0 + 500,
+        "alice".to_string(),
+    ));
+    let offer_b = OpponentDelta::offer(SignedJoin::new(
+        &bob,
+        &params.game_id,
+        T0 + 700,
+        "bob".to_string(),
+    ));
 
     // Peer 1 sees Alice then Bob; peer 2 sees Bob then Alice.
     let mut peer1 = base.clone();
     peer1
         .opponent
-        .apply_delta(&base, &params, &Some(join_a.clone()))
+        .apply_delta(&base, &params, &Some(offer_a.clone()))
         .unwrap();
     peer1
         .opponent
-        .apply_delta(&base, &params, &Some(join_b.clone()))
+        .apply_delta(&base, &params, &Some(offer_b.clone()))
         .unwrap();
 
     let mut peer2 = base.clone();
     peer2
         .opponent
-        .apply_delta(&base, &params, &Some(join_b.clone()))
+        .apply_delta(&base, &params, &Some(offer_b.clone()))
         .unwrap();
     peer2
         .opponent
-        .apply_delta(&base, &params, &Some(join_a.clone()))
+        .apply_delta(&base, &params, &Some(offer_a))
         .unwrap();
 
-    assert_eq!(peer1.opponent, peer2.opponent, "race must converge");
-    // Alice joined earlier, so she wins under the total order.
-    assert_eq!(
-        peer1.opponent.get().unwrap().player,
-        alice.verifying_key(),
-        "earliest join must win"
+    assert_eq!(peer1.opponent, peer2.opponent, "offers must converge");
+    assert!(
+        peer1.opponent.get().is_none(),
+        "an offer alone must not seat anyone — only the creator can"
     );
+    assert_eq!(peer1.opponent.pending_offers().len(), 2);
 
-    // And re-merging is a no-op.
+    // Re-merging changes nothing.
     let before = peer1.opponent.clone();
     peer1
         .opponent
-        .apply_delta(&base, &params, &Some(join_b))
+        .apply_delta(&base, &params, &Some(offer_b))
         .unwrap();
     assert_eq!(before, peer1.opponent, "merge must be idempotent");
+}
+
+/// The creator picks, and the pick is what starts the game.
+#[test]
+fn the_creators_countersignature_is_what_fills_the_seat() {
+    let creator = key();
+    let alice = key();
+    let bob = key();
+    let (base, params) = open_game(&creator, Color::White);
+
+    let alice_join = SignedJoin::new(&alice, &params.game_id, T0 + 500, "alice".to_string());
+    let bob_join = SignedJoin::new(&bob, &params.game_id, T0 + 700, "bob".to_string());
+
+    let mut state = base.clone();
+    for join in [alice_join, bob_join.clone()] {
+        state
+            .opponent
+            .apply_delta(&base, &params, &Some(OpponentDelta::offer(join)))
+            .unwrap();
+    }
+
+    // The creator seats Bob, the later offer — proving the seat follows the
+    // countersignature and not the clock.
+    let accepted = SignedAcceptance::new(&creator, &params.game_id, bob_join);
+    state
+        .opponent
+        .apply_delta(&base, &params, &Some(OpponentDelta::seat(accepted)))
+        .unwrap();
+    state.prune(&params).unwrap();
+
+    assert_eq!(state.opponent.get().unwrap().player, bob.verifying_key());
+    assert!(
+        state.opponent.pending_offers().is_empty(),
+        "offers are dropped once the seat is filled"
+    );
+    state.verify(&state, &params).expect("state must validate");
+}
+
+/// Nobody but the creator can seat a player — the acceptance is checked against
+/// the creator key in the contract parameters, which is part of the address.
+#[test]
+fn an_acceptance_signed_by_anyone_else_is_refused() {
+    let creator = key();
+    let challenger = key();
+    let impostor = key();
+    let (base, params) = open_game(&creator, Color::White);
+
+    let join = SignedJoin::new(&challenger, &params.game_id, T0 + 500, "c".to_string());
+    let forged = SignedAcceptance::new(&impostor, &params.game_id, join);
+
+    let mut state = base.clone();
+    let err = state
+        .opponent
+        .apply_delta(&base, &params, &Some(OpponentDelta::seat(forged.clone())))
+        .expect_err("must refuse");
+    assert!(err.contains("seat acceptance"), "unexpected error: {err}");
+    assert!(state.opponent.get().is_none(), "the seat must stay empty");
+
+    // And the same on the full-state path, which skips the merge.
+    let mut state = base;
+    state.opponent.seated = Some(forged);
+    assert!(state.verify(&state, &params).is_err());
+}
+
+/// An offer with no proof-of-work is refused, so filling the offer list costs
+/// the same work as creating a game.
+#[test]
+fn an_offer_without_proof_of_work_is_refused() {
+    let creator = key();
+    let challenger = key();
+    let (base, params) = open_game(&creator, Color::White);
+
+    let mut join = SignedJoin::new(&challenger, &params.game_id, T0 + 500, "c".to_string());
+    join.pow_nonce = join.pow_nonce.wrapping_add(1);
+
+    let err = state_offer_error(&base, &params, join);
+    assert!(err.contains("proof-of-work"), "unexpected error: {err}");
+}
+
+fn state_offer_error(
+    base: &ChessGameStateV1,
+    params: &ChessGameParametersV1,
+    join: SignedJoin,
+) -> String {
+    let mut state = base.clone();
+    state
+        .opponent
+        .apply_delta(base, params, &Some(OpponentDelta::offer(join)))
+        .expect_err("must refuse")
 }
 
 #[test]
@@ -272,25 +378,23 @@ fn a_third_party_cannot_displace_a_seated_opponent() {
     let opponent = key();
     let latecomer = key();
     let (mut state, params) = open_game(&creator, Color::White);
+    let base = state.clone();
 
-    let first = SignedJoin::new(&opponent, &params.game_id, T0 + 100, "first".to_string());
-    state
-        .opponent
-        .apply_delta(&state.clone(), &params, &Some(first))
-        .unwrap();
+    state.opponent = seat(&creator, &opponent, &params, T0 + 100, "first");
 
-    // A later join, however well-formed, loses the total order.
+    // A later offer, however well-formed, cannot take a filled seat: it is only
+    // an offer, and prune drops it outright.
     let late = SignedJoin::new(&latecomer, &params.game_id, T0 + 900, "late".to_string());
-    let before = state.opponent.clone();
     state
         .opponent
-        .apply_delta(&state.clone(), &params, &Some(late))
+        .apply_delta(&base, &params, &Some(OpponentDelta::offer(late)))
         .unwrap();
-    assert_eq!(before, state.opponent);
+    state.prune(&params).unwrap();
     assert_eq!(
         state.opponent.get().unwrap().player,
         opponent.verifying_key()
     );
+    assert!(state.opponent.pending_offers().is_empty());
 }
 
 /// Backdating a join must not evict a seated opponent, nor erase the moves they
@@ -299,21 +403,13 @@ fn a_third_party_cannot_displace_a_seated_opponent() {
 /// signs `joined_at = 1` and wins every race — retroactively, in the middle of a
 /// game in progress.
 #[test]
-#[ignore = "KNOWN OPEN VULNERABILITY: the seat race is decided by the joiner's \
-            own unverifiable joined_at, so a backdated join wins retroactively. \
-            Closing it needs the creator to countersign the join; until then this \
-            test records the hole rather than pretending it is shut."]
 fn a_backdated_join_cannot_hijack_a_game_in_progress() {
     let creator = key();
     let opponent = key();
     let attacker = key();
     let (mut state, params) = open_game(&creator, Color::White);
 
-    let honest = SignedJoin::new(&opponent, &params.game_id, T0 + 100, "honest".to_string());
-    state
-        .opponent
-        .apply_delta(&state.clone(), &params, &Some(honest))
-        .unwrap();
+    state.opponent = seat(&creator, &opponent, &params, T0 + 100, "honest");
 
     push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 200);
     push_move(&mut state, &params, &opponent, 1, "e7e5", T0 + 300);
@@ -322,9 +418,11 @@ fn a_backdated_join_cannot_hijack_a_game_in_progress() {
 
     // The attacker claims to have joined before the honest player did.
     let backdated = SignedJoin::new(&attacker, &params.game_id, 1, "attacker".to_string());
-    let outcome = state
-        .opponent
-        .apply_delta(&state.clone(), &params, &Some(backdated));
+    let outcome = state.opponent.apply_delta(
+        &state.clone(),
+        &params,
+        &Some(OpponentDelta::offer(backdated.clone())),
+    );
     state.prune(&params).unwrap();
 
     assert!(
@@ -336,6 +434,18 @@ fn a_backdated_join_cannot_hijack_a_game_in_progress() {
         2,
         "the seated player's moves were erased by a backdated join"
     );
+
+    // Nor does self-signing an acceptance help: it is checked against the
+    // creator's key, which lives in the contract parameters.
+    let self_seated = SignedAcceptance::new(&attacker, &params.game_id, backdated);
+    assert!(state
+        .opponent
+        .apply_delta(
+            &state.clone(),
+            &params,
+            &Some(OpponentDelta::seat(self_seated))
+        )
+        .is_err());
 }
 
 // ---------------------------------------------------- direct challenges
@@ -374,23 +484,13 @@ fn only_the_invited_player_can_accept_a_direct_challenge() {
 
     // Someone else grabbing the seat must be rejected.
     let mut state = base.clone();
-    state.opponent = opponent::OpponentSlotV1(Some(SignedJoin::new(
-        &gatecrasher,
-        &params.game_id,
-        T0 + 1000,
-        "gatecrasher".to_string(),
-    )));
+    state.opponent = seat(&creator, &gatecrasher, &params, T0 + 1000, "gatecrasher");
     let err = state.verify(&state, &params).expect_err("must reject");
     assert!(err.contains("direct challenge"), "unexpected error: {err}");
 
     // The invited player is admitted.
     let mut state = base;
-    state.opponent = opponent::OpponentSlotV1(Some(SignedJoin::new(
-        &invited,
-        &params.game_id,
-        T0 + 1000,
-        "invited".to_string(),
-    )));
+    state.opponent = seat(&creator, &invited, &params, T0 + 1000, "invited");
     state
         .verify(&state, &params)
         .expect("the invited player may accept");
@@ -409,12 +509,12 @@ fn a_gatecrasher_is_refused_on_the_merge_path_too() {
         .apply_delta(
             &base,
             &params,
-            &Some(SignedJoin::new(
+            &Some(OpponentDelta::offer(SignedJoin::new(
                 &gatecrasher,
                 &params.game_id,
                 T0 + 1000,
                 "gatecrasher".to_string(),
-            )),
+            ))),
         )
         .expect_err("must refuse");
     assert!(err.contains("direct challenge"), "unexpected error: {err}");
@@ -1104,12 +1204,7 @@ fn increment_is_credited_per_move_made() {
     let game_id = setup.derive_game_id(&creator.verifying_key());
     let params = ChessGameParametersV1 { game_id, ..params };
     state.setup = setup::GameSetupV1(Some(setup.sign(&creator, &game_id)));
-    state.opponent = opponent::OpponentSlotV1(Some(SignedJoin::new(
-        &opponent,
-        &game_id,
-        T0 + 1000,
-        "opponent".to_string(),
-    )));
+    state.opponent = seat(&creator, &opponent, &params, T0 + 1000, "opponent");
 
     push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 4000);
     state.verify(&state, &params).unwrap();
@@ -1127,14 +1222,9 @@ fn a_challenger_cannot_backdate_a_join_to_steal_clock_time() {
     let creator = key();
     let opponent = key();
     let (mut state, params) = open_game(&creator, Color::White);
-    // Join claiming to have happened long before the game was created.
-    let join = SignedJoin::new(
-        &opponent,
-        &params.game_id,
-        T0 - 900_000,
-        "sneaky".to_string(),
-    );
-    state.opponent = opponent::OpponentSlotV1(Some(join));
+    // Join claiming to have happened long before the game was created — and
+    // countersigned, so the seat is legitimate; only the claimed time is a lie.
+    state.opponent = seat(&creator, &opponent, &params, T0 - 900_000, "sneaky");
 
     push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
     state.verify(&state, &params).unwrap();
@@ -1189,12 +1279,7 @@ fn colors_follow_the_creators_choice() {
     let opponent = key();
 
     let (mut state, params) = open_game(&creator, Color::Black);
-    state.opponent = opponent::OpponentSlotV1(Some(SignedJoin::new(
-        &opponent,
-        &params.game_id,
-        T0 + 1000,
-        "opponent".to_string(),
-    )));
+    state.opponent = seat(&creator, &opponent, &params, T0 + 1000, "opponent");
 
     // Creator chose Black, so the challenger is White and moves first.
     assert_eq!(state.color_of(&creator.verifying_key()), Some(Color::Black));
@@ -1301,12 +1386,11 @@ fn the_game_id_pins_every_term_of_the_setup() {
 }
 
 #[test]
-fn two_joins_from_one_key_still_exchange() {
-    // `race_key` is (joined_at, player) but the summary was the player key
-    // alone. One challenger signing two joins at different times therefore left
-    // two peers with matching summaries and different `joined_at` — and
-    // `joined_at` starts the clocks, so the two disagreed about the time
-    // remaining for the rest of the game.
+fn two_offers_from_one_key_still_exchange() {
+    // The summary must distinguish the offers a peer holds, or two peers each
+    // holding a different offer from the *same* challenger report identical
+    // summaries, neither ships, and the creator sees a different set on each
+    // peer — so which one it can countersign depends on where it is looking.
     let creator = key();
     let challenger = key();
     let (base, params) = open_game(&creator, Color::White);
@@ -1315,9 +1399,15 @@ fn two_joins_from_one_key_still_exchange() {
     let late = SignedJoin::new(&challenger, &params.game_id, T0 + 9_000, "c".to_string());
 
     let mut peer1 = base.clone();
-    peer1.opponent = opponent::OpponentSlotV1(Some(late));
+    peer1
+        .opponent
+        .apply_delta(&base, &params, &Some(OpponentDelta::offer(late)))
+        .unwrap();
     let mut peer2 = base.clone();
-    peer2.opponent = opponent::OpponentSlotV1(Some(early.clone()));
+    peer2
+        .opponent
+        .apply_delta(&base, &params, &Some(OpponentDelta::offer(early)))
+        .unwrap();
 
     for _ in 0..2 {
         let s1 = peer1.opponent.summarize(&peer1, &params);
@@ -1337,8 +1427,46 @@ fn two_joins_from_one_key_still_exchange() {
     }
 
     assert_eq!(peer1.opponent, peer2.opponent);
-    // The earliest join wins the race, so both peers run the same clock.
-    assert_eq!(peer1.opponent.get(), Some(&early));
+}
+
+/// The seat converges even if the creator countersigns two different offers —
+/// misbehaviour by the creator must not split the network.
+#[test]
+fn a_doubly_countersigned_seat_still_converges() {
+    let creator = key();
+    let alice = key();
+    let bob = key();
+    let (base, params) = open_game(&creator, Color::White);
+
+    let seat_a = SignedAcceptance::new(
+        &creator,
+        &params.game_id,
+        SignedJoin::new(&alice, &params.game_id, T0 + 500, "alice".to_string()),
+    );
+    let seat_b = SignedAcceptance::new(
+        &creator,
+        &params.game_id,
+        SignedJoin::new(&bob, &params.game_id, T0 + 700, "bob".to_string()),
+    );
+
+    let mut peer1 = base.clone();
+    let mut peer2 = base.clone();
+    for (peer, order) in [
+        (&mut peer1, [seat_a.clone(), seat_b.clone()]),
+        (&mut peer2, [seat_b.clone(), seat_a.clone()]),
+    ] {
+        for acceptance in order {
+            peer.opponent
+                .apply_delta(&base, &params, &Some(OpponentDelta::seat(acceptance)))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        peer1.opponent, peer2.opponent,
+        "a double acceptance must still converge"
+    );
+    assert!(peer1.opponent.get().is_some());
 }
 
 #[test]

@@ -45,7 +45,7 @@
 //! requires; an order-sensitive cap would silently diverge peers.
 
 use crate::chess::Color;
-use crate::game::opponent::SignedJoin;
+use crate::game::opponent::SignedAcceptance;
 use crate::game::setup::{SignedGameSetup, TimeControl, MAX_NICKNAME_LEN};
 use crate::game::{GameResult, SIG_DOMAIN};
 use crate::identity::{summary_digest, verify_sig, GameId, PlayerId};
@@ -194,14 +194,19 @@ impl SignedSnapshot {
 ///
 /// Every component is independently self-authorizing, so the lobby needs no
 /// privileged writer: `setup` is signed by the creator and bound to the
-/// proof-of-work `game_id`, `opponent` is signed by the challenger over the
-/// same `game_id`, and `snapshot` must be signed by one of those two.
+/// proof-of-work `game_id`, `opponent` is a challenger's offer countersigned by
+/// the creator over the same `game_id`, and `snapshot` must be signed by one of
+/// those two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobbyEntry {
     pub game_id: GameId,
     pub setup: SignedGameSetup,
+    /// The seat, and only once the creator has countersigned it. Holding the
+    /// bare offer here would reintroduce in the lobby exactly the race the game
+    /// contract dropped: `joined_at` is the joiner's own claim, so "earliest
+    /// wins" is won by whoever lies hardest.
     #[serde(default)]
-    pub opponent: Option<SignedJoin>,
+    pub opponent: Option<SignedAcceptance>,
     #[serde(default)]
     pub snapshot: Option<SignedSnapshot>,
 }
@@ -253,8 +258,8 @@ impl LobbyEntry {
     /// The two keys entitled to speak for this game, as far as the lobby knows.
     fn player_keys(&self) -> Vec<VerifyingKey> {
         let mut keys = vec![self.setup.creator];
-        if let Some(join) = &self.opponent {
-            keys.push(join.player);
+        if let Some(seat) = &self.opponent {
+            keys.push(seat.join.player);
         }
         keys
     }
@@ -265,7 +270,7 @@ impl LobbyEntry {
         let challenger = self
             .opponent
             .as_ref()
-            .map(|j| j.nickname.clone())
+            .map(|seat| seat.join.nickname.clone())
             .unwrap_or_else(|| "—".to_string());
         match self.setup.setup.creator_plays {
             Color::White => (creator, challenger),
@@ -287,7 +292,7 @@ impl LobbyEntry {
         self.snapshot
             .as_ref()
             .map(|s| s.updated_at)
-            .or_else(|| self.opponent.as_ref().map(|j| j.joined_at))
+            .or_else(|| self.opponent.as_ref().map(|seat| seat.join.joined_at))
             .unwrap_or_else(|| self.created_at())
     }
 
@@ -301,12 +306,16 @@ impl LobbyEntry {
             game_id: self.game_id,
         };
         self.setup.verify(&params)?;
-        if let Some(join) = &self.opponent {
-            join.verify(&params)?;
+        if let Some(seat) = &self.opponent {
+            // Checks the challenger's own signature and proof-of-work *and* the
+            // creator's countersignature — the same bytes the game contract
+            // checks, so the lobby can never disagree with it about who is
+            // playing.
+            seat.verify(&params)?;
             // Same rule the game contract applies: a direct challenge may only
             // be accepted by the player it names.
             if let Some(invited) = self.setup.setup.challenged {
-                if join.player != invited {
+                if seat.join.player != invited {
                     return Err("this game is a direct challenge to a different player".to_string());
                 }
             }
@@ -325,18 +334,17 @@ impl LobbyEntry {
     /// stable under repetition.
     /// Fingerprint of everything [`absorb`](Self::absorb) merges on.
     ///
-    /// An entry is two independent lattices — the opponent slot settled by the
-    /// earliest join, the snapshot by the newest position — so both go in. One
+    /// An entry is two independent lattices — the opponent seat settled by the
+    /// acceptance signature, the snapshot by the newest position — so both go in. One
     /// combined digest is enough because the delta ships on *difference*: a peer
     /// that is ahead on either part differs, and both parts travel together in
     /// the entry anyway.
     fn merge_digest(&self) -> u64 {
         let mut buf = Vec::with_capacity(128);
         match &self.opponent {
-            Some(join) => {
+            Some(seat) => {
                 buf.push(1);
-                buf.extend_from_slice(&join.joined_at.to_le_bytes());
-                buf.extend_from_slice(join.player.as_bytes());
+                buf.extend_from_slice(&seat.signature.to_bytes());
             }
             None => buf.push(0),
         }
@@ -356,11 +364,10 @@ impl LobbyEntry {
         if self.opponent.is_none() {
             self.opponent = other.opponent;
         } else if let (Some(mine), Some(theirs)) = (&self.opponent, &other.opponent) {
-            // Same deterministic race rule the game contract uses, so the lobby
-            // never disagrees with the game about who is playing.
-            if (theirs.joined_at, theirs.player.to_bytes())
-                < (mine.joined_at, mine.player.to_bytes())
-            {
+            // Same deterministic rule the game contract uses, so the lobby never
+            // disagrees with the game about who is playing: a creator who
+            // countersigned twice is settled by the acceptance signature bytes.
+            if theirs.signature.to_bytes() < mine.signature.to_bytes() {
                 self.opponent = other.opponent;
             }
         }
@@ -739,7 +746,7 @@ impl LobbyStateV1 {
     pub fn game_names(&self, entry: &LobbyEntry) -> (String, String) {
         let (white_embedded, black_embedded) = entry.nicknames();
         let creator = entry.creator_id();
-        let challenger = entry.opponent.as_ref().map(|j| j.player_id());
+        let challenger = entry.opponent.as_ref().map(|seat| seat.join.player_id());
 
         match entry.setup.setup.creator_plays {
             Color::White => (

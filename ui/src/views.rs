@@ -669,7 +669,17 @@ pub fn GameView(
         .unwrap_or(false);
 
     let sans = replay.san_list();
-    let can_join = game.is_open()
+    // Our offer is on the table but the creator has not countersigned it yet.
+    // Until they do the seat is empty and no move is legal — see
+    // `chess_core::game::opponent`.
+    let offer_pending = game.opponent.get().is_none()
+        && game
+            .opponent
+            .pending_offers()
+            .iter()
+            .any(|j| j.player_id() == me);
+    let can_join = !offer_pending
+        && game.is_open()
         && game
             .setup
             .get()
@@ -821,6 +831,11 @@ pub fn GameView(
                                     style: "width:100%",
                                     onclick: move |_| sync.send(Cmd::JoinGame(game_id)),
                                     "Take the open seat"
+                                }
+                            }
+                            if offer_pending {
+                                div { class: "small muted",
+                                    "Waiting for the creator to confirm you as their opponent\u{2026}"
                                 }
                             }
                             if my_color.is_some() && !is_over && game.opponent.get().is_some() {

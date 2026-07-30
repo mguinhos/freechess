@@ -7,10 +7,14 @@
 //!
 //! * The **creator** is fixed in the contract *parameters*, so it is part of the
 //!   contract key itself and cannot be changed by anyone.
-//! * The **opponent** is whoever wins the join race ([`OpponentSlotV1`]). Once
-//!   the state converges, that slot is immutable — a third party cannot
-//!   displace it, because the merge picks the winner by a deterministic rule
-//!   over the *set* of joins, not by arrival order.
+//! * The **opponent** is the challenger the creator *countersigned*
+//!   ([`OpponentSlotV1`]). Offering to play is open to anyone; being seated is
+//!   not, and requires a signature from the creator's key — which lives in the
+//!   parameters and so cannot be forged or replaced. That is what makes the
+//!   seat immutable once filled: a later message has nothing to displace it
+//!   with. Deciding the seat by "whoever joined earliest" instead was the
+//!   original design and was unsound, because the join time is the joiner's own
+//!   claim; see [`opponent`] for the attack it allowed.
 //! * Every move carries a signature ([`moves::AuthorizedMove`]) that must come
 //!   from the key owning the side to move at that ply. A spectator, or a peer
 //!   relaying the state, has no key that satisfies this, so no third party can
@@ -171,6 +175,9 @@ impl ChessGameStateV1 {
     /// states outright, which covers the full-state PUT path that skips this
     /// hook.
     pub fn prune(&mut self, params: &ChessGameParametersV1) -> Result<(), String> {
+        // Before the move list, because it decides who the players are: offers
+        // that were never countersigned are dropped once the seat is filled.
+        self.opponent.prune();
         let keys = self.player_keys();
         self.moves.prune(&params.game_id, keys);
         self.clocks.prune(keys);

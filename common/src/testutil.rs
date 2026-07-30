@@ -3,7 +3,7 @@
 use crate::certificate::{CertificateDraft, GameCertificate};
 use crate::chess::{Color, Move};
 use crate::game::moves::AuthorizedMove;
-use crate::game::opponent::{OpponentSlotV1, SignedJoin};
+use crate::game::opponent::{OpponentSlotV1, SignedAcceptance, SignedJoin};
 use crate::game::setup::{GameSetup, GameSetupV1, TimeControl};
 use crate::game::{ChessGameParametersV1, ChessGameStateV1};
 use crate::identity::GameId;
@@ -42,6 +42,22 @@ pub fn open_game(
     (state, params)
 }
 
+/// The opponent seat filled the legitimate way: the challenger offers and the
+/// creator countersigns. Nothing else fills it — see [`crate::game::opponent`].
+pub fn seated_slot(
+    creator: &SigningKey,
+    joiner: &SigningKey,
+    params: &ChessGameParametersV1,
+    at: i64,
+    nickname: &str,
+) -> OpponentSlotV1 {
+    let join = SignedJoin::new(joiner, &params.game_id, at, nickname.to_string());
+    OpponentSlotV1 {
+        offers: Default::default(),
+        seated: Some(SignedAcceptance::new(creator, &params.game_id, join)),
+    }
+}
+
 /// A game with both players seated.
 pub fn started_game(
     creator: &SigningKey,
@@ -49,12 +65,7 @@ pub fn started_game(
     created_at: i64,
 ) -> (ChessGameStateV1, ChessGameParametersV1) {
     let (mut state, params) = open_game(creator, created_at, "creator");
-    state.opponent = OpponentSlotV1(Some(SignedJoin::new(
-        opponent,
-        &params.game_id,
-        created_at + 1000,
-        "opponent".to_string(),
-    )));
+    state.opponent = seated_slot(creator, opponent, &params, created_at + 1000, "opponent");
     (state, params)
 }
 

@@ -1,7 +1,7 @@
 //! Lobby tests: anti-spam quotas, live snapshots, search, ranking, presence.
 
 use super::*;
-use crate::game::opponent::SignedJoin;
+use crate::game::opponent::{SignedAcceptance, SignedJoin};
 use crate::game::WinReason;
 use crate::leaderboard::{LeaderboardV1, RankEntry};
 use crate::presence::{
@@ -24,11 +24,15 @@ fn listing(creator: &SigningKey, created_at: i64) -> LobbyEntry {
 fn matched_listing(creator: &SigningKey, challenger: &SigningKey, created_at: i64) -> LobbyEntry {
     let (state, p) = open_game(creator, created_at, "creator");
     let mut entry = LobbyEntry::new(p.game_id, state.setup.0.clone().unwrap());
-    entry.opponent = Some(SignedJoin::new(
-        challenger,
+    entry.opponent = Some(SignedAcceptance::new(
+        creator,
         &p.game_id,
-        created_at + 500,
-        "challenger".to_string(),
+        SignedJoin::new(
+            challenger,
+            &p.game_id,
+            created_at + 500,
+            "challenger".to_string(),
+        ),
     ));
     entry
 }

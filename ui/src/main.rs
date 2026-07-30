@@ -109,6 +109,27 @@ fn App() -> Element {
         }
     });
 
+    // The creator's side of the seat handshake. A challenger's offer does not
+    // start the game; this is what does, and it has to run on the creator's own
+    // client because only their key can sign it. Cheap and idempotent: the
+    // command returns immediately unless we are the creator of a game whose
+    // seat is still open and which has an offer waiting.
+    use_future(move || async move {
+        loop {
+            let awaiting: Vec<GameId> = state.with(|s| {
+                s.games
+                    .iter()
+                    .filter(|(_, g)| g.opponent.get().is_none() && !g.opponent.offers.is_empty())
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+            for id in awaiting {
+                sync.send(app::Cmd::SeatChallenger(id));
+            }
+            gloo_sleep(2000).await;
+        }
+    });
+
     // Clock attestation. Unlike the heartbeat above (which is presence, in the
     // lobby) this goes into the game's own contract, because a contract cannot
     // read another one. It is what makes a timeout provable: the only evidence
