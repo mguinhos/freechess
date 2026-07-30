@@ -1,0 +1,55 @@
+[package]
+name = "chess-ui"
+version.workspace = true
+edition.workspace = true
+description = "FreeChess browser UI"
+
+[dependencies]
+chess-core.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+blake3.workspace = true
+bs58.workspace = true
+chrono.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+
+# The UI is the one crate that legitimately needs randomness: it generates the
+# account seed (contracts and the delegate must never pull this in — see
+# .cargo/config.toml).
+rand.workspace = true
+getrandom = { version = "0.2.16", features = ["js"] }
+
+dioxus = { version = "0.7.3", features = ["web"] }
+
+freenet-scaffold.workspace = true
+freenet-stdlib = { workspace = true, features = ["net"] }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Window",
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "ErrorEvent",
+    "Storage",
+    "Location",
+    "UrlSearchParams",
+    "Navigator",
+    "Clipboard",
+    "DomRect",
+    "MouseEvent",
+    "Performance",
+] }
+futures = "0.3"
+
+[build-dependencies]
+# The build script hashes the read-only contracts so the client can derive
+# their keys without shipping their WASM.
+blake3.workspace = true

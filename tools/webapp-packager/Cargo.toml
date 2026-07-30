@@ -1,0 +1,12 @@
+[package]
+name = "webapp-packager"
+version.workspace = true
+edition.workspace = true
+description = "Signs and assembles the FreeChess webapp into web-container contract state"
+
+[dependencies]
+chess-core.workspace = true
+ciborium.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
+bs58.workspace = true

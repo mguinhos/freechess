@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "common",
+    "contracts/contract-support",
+    "contracts/game-contract",
+    "contracts/lobby-contract",
+    "contracts/archive-contract",
+    "contracts/player-contract",
+    "contracts/web-container-contract",
+    "tools/webapp-packager",
+    "tools/bootstrap-contracts",
+    "tools/gen-account",
+    "delegates/chess-delegate",
+    "ui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# Serialization
+ciborium = "0.2.2"
+serde = { version = "1.0.130", features = ["derive"] }
+
+# Cryptography
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+blake3 = { version = "1.5.3", features = ["serde"] }
+bs58 = "0.5.1"
+
+# Utilities
+rand = { version = "0.8.5", features = ["getrandom"], default-features = true }
+# getrandom: the workspace declaration intentionally does NOT enable `js`.
+# Only the UI crate needs the wasm-bindgen JS backend; enabling it here would
+# contaminate the contract/delegate WASM with unresolvable wasm-bindgen imports
+# (same failure River hit in freenet/river#241).
+getrandom = { version = "0.2.16" }
+# chrono: `default-features = false` is critical. The default feature set
+# includes `wasmbind`, which on wasm32-unknown-unknown pulls wasm-bindgen and
+# js-sys into every contract's dependency graph. That produces WASM stuffed
+# with `__wbindgen_describe_*` placeholder imports that wasmtime cannot
+# resolve — the same class of failure River hit in freenet/river#241. We only
+# need timestamp conversion and formatting, neither of which needs a clock.
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+
+# Internal
+chess-core = { path = "common", package = "chess-core" }
+
+# Freenet
+freenet-scaffold = "0.2.2"
+freenet-scaffold-macro = "0.2.2"
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release.package."*"]
+opt-level = 'z'
+
+# Profile used by `dx build --release` for the web/WASM UI target. Defining it
+# ourselves stops dx from synthesising an ad-hoc one that overrides opt-level
+# to "s". UI-only: contracts and the delegate build under `--profile release`,
+# so their bytes (and therefore their keys) are unaffected by anything here.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"

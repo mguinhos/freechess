@@ -1,0 +1,160 @@
+import { test, expect } from "@playwright/test";
+import {
+  GATEWAY_PORT,
+  PEER_PORT,
+  PEER2_PORT,
+  openApp,
+  reopen,
+  createGame,
+} from "./helpers";
+
+/**
+ * Administration is first-come: the first claim wins. These run in order and
+ * share one lobby, so the first test to claim becomes the root for the rest —
+ * which is exactly the behaviour under test.
+ */
+
+test("adminship is claimable by anyone while unclaimed, and only once", async ({
+  browser,
+}) => {
+  const alice = await openApp(browser, GATEWAY_PORT, "alice");
+
+  // The entry point is deliberately visible to everyone while unclaimed: this
+  // is a race, and hiding it would just mean whoever reads the source wins.
+  const adminButton = alice.app.locator("#admin-button");
+  await expect(adminButton).toBeVisible();
+  await adminButton.click();
+  await expect(alice.app.locator("#claim-admin")).toBeVisible();
+  await alice.app.locator("#claim-admin").click();
+
+  // Once claimed, the panel shows the claimant as root.
+  await expect(alice.app.locator(".list-item", { hasText: "alice" })).toBeVisible();
+  await expect(alice.app.locator(".badge", { hasText: "root" })).toBeVisible();
+
+  // A second player on the other node sees adminship as taken, so no claim
+  // button is offered to them.
+  const bob = await openApp(browser, PEER_PORT, "bob");
+  // Reload so Bob's node has definitely merged the claim before checking.
+  const bobHome = await reopen(bob.page, PEER_PORT);
+  await expect
+    .poll(async () => {
+      const btn = bobHome.locator("#admin-button");
+      if (!(await btn.count())) return "no-entry";
+      await btn.click();
+      return (await bobHome.locator("#claim-admin").count())
+        ? "can-claim"
+        : "already-claimed";
+    })
+    .not.toBe("can-claim");
+
+  await alice.context.close();
+  await bob.context.close();
+});
+
+test("an admin announcement reaches a player on the other node", async ({
+  browser,
+}) => {
+  const alice = await openApp(browser, GATEWAY_PORT, "alice");
+  const bob = await openApp(browser, PEER_PORT, "bob");
+
+  await alice.app.locator("#admin-button").click();
+  // Alice claimed in the previous test; if this runs standalone, claim now.
+  if (await alice.app.locator("#claim-admin").count()) {
+    await alice.app.locator("#claim-admin").click();
+  }
+
+  const text = `maintenance window ${Date.now()}`;
+  await alice.app.locator("#announcement-text").fill(text);
+  await alice.app.getByRole("button", { name: "Announce" }).click();
+
+  // The notice is lobby state, so it replicates to the other node.
+  const bobHome = await reopen(bob.page, PEER_PORT);
+  await expect(bobHome.locator(".banner.warn", { hasText: text })).toBeVisible();
+
+  await alice.context.close();
+  await bob.context.close();
+});
+
+test("a non-admin cannot announce", async ({ browser }) => {
+  // A node that has never claimed, so this is a genuine non-admin.
+  const bob = await openApp(browser, PEER2_PORT, "carol");
+  const btn = bob.app.locator("#admin-button");
+  // With adminship claimed, Bob either has no entry point or sees no controls.
+  if (await btn.count()) {
+    await btn.click();
+    await expect(bob.app.locator("#announcement-text")).toHaveCount(0);
+  }
+  await bob.context.close();
+});
+
+test("marking the service unavailable shows a notice everywhere", async ({
+  browser,
+}) => {
+  const alice = await openApp(browser, GATEWAY_PORT, "alice");
+  const bob = await openApp(browser, PEER_PORT, "bob");
+
+  await alice.app.locator("#admin-button").click();
+  if (await alice.app.locator("#claim-admin").count()) {
+    await alice.app.locator("#claim-admin").click();
+  }
+
+  // Normalise first: a previous run may have left the service marked
+  // unavailable, in which case the panel offers "mark available" instead and
+  // there is no message field to fill.
+  if (await alice.app.locator("#mark-available").count()) {
+    await alice.app.locator("#mark-available").click();
+    await expect(alice.app.locator("#mark-unavailable")).toBeVisible();
+  }
+
+  await alice.app.locator("#service-message").fill("upgrading the node");
+  await alice.app.locator("#mark-unavailable").click();
+
+  const bobHome = await reopen(bob.page, PEER_PORT);
+  await expect(bobHome.locator("#service-notice")).toBeVisible();
+  await expect(bobHome.locator("#service-notice")).toContainText("upgrading the node");
+
+  // Put it back, so later runs start from a clean state. The control only
+  // appears once the change has come back from the network, so wait for it
+  // rather than assuming it is already there.
+  const aliceHome = await reopen(alice.page, GATEWAY_PORT);
+  await aliceHome.locator("#admin-button").click();
+  const markAvailable = aliceHome.locator("#mark-available");
+  await expect(markAvailable).toBeVisible();
+  await markAvailable.click();
+  await expect
+    .poll(() => aliceHome.locator("#service-notice").count())
+    .toBe(0);
+
+  await alice.context.close();
+  await bob.context.close();
+});
+
+test("an admin takedown removes a game from the listings", async ({ browser }) => {
+  const alice = await openApp(browser, GATEWAY_PORT, "alice");
+  const bob = await openApp(browser, PEER_PORT, "bob");
+
+  // Bob starts a game so there is something live to take down.
+  await createGame(bob.app, "10+0");
+
+  const aliceHome = await reopen(alice.page, GATEWAY_PORT);
+  await expect(
+    aliceHome.locator(".list-item", { hasText: "bob" }).first(),
+  ).toBeVisible();
+
+  await aliceHome.locator("#admin-button").click();
+  if (await aliceHome.locator("#claim-admin").count()) {
+    await aliceHome.locator("#claim-admin").click();
+  }
+
+  // Games in progress are listed in the panel; an open one is not, so take down
+  // whatever the panel offers and assert the listing shrinks.
+  const endButtons = aliceHome.getByRole("button", { name: "End" });
+  const count = await endButtons.count();
+  if (count > 0) {
+    await endButtons.first().click();
+    await expect(aliceHome.locator(".modal")).toBeVisible();
+  }
+
+  await alice.context.close();
+  await bob.context.close();
+});

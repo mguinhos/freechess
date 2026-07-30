@@ -1,0 +1,7 @@
+[target.wasm32-unknown-unknown]
+# Contracts and the delegate run under wasmtime, which has no getrandom backend
+# on this target. Declaring a custom backend stops any transitive dependency
+# from emitting wasm-bindgen placeholder imports that wasmtime cannot resolve
+# (the failure mode documented in freenet/river#241). Contracts are pure
+# deterministic state transitions and never need randomness anyway.
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]

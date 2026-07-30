@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Dioxus web build output
+/ui/dist
+/ui/.dioxus
+
+# Packaged webapp
+/target/webapp
+
+# Node (Playwright E2E)
+node_modules/
+/e2e/test-results
+/e2e/playwright-report
+/e2e/.cache
+
+# Local node data from test runs
+/.freenet-test
+/e2e/.nodes
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Never commit built contract WASM: it is a build output, and a stale copy
+# silently changes contract keys. `cargo make build-contracts` regenerates it.
+*.wasm
+
+# The webapp publisher keys. Whoever holds one controls what that app URL
+# serves, so they are local-only and never committed. The glob covers the
+# rotated copies (.v2-<ts> and so on) left behind when publishing to a new
+# address — those are private keys too.
+.freenet-publisher.key*
+.freenet-public/
+.freechess-account

@@ -1,0 +1,10 @@
+[package]
+name = "bootstrap-contracts"
+version.workspace = true
+edition.workspace = true
+description = "Emits initial parameters and state for the FreeChess singleton contracts"
+
+[dependencies]
+chess-core.workspace = true
+ciborium.workspace = true
+serde.workspace = true

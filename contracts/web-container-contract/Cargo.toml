@@ -1,0 +1,21 @@
+[package]
+name = "web-container-contract"
+version.workspace = true
+edition.workspace = true
+description = "Hosts the FreeChess web UI as signed contract state"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+contract = ["freenet-stdlib/contract"]
+
+[dependencies]
+chess-core.workspace = true
+ciborium.workspace = true
+freenet-stdlib.workspace = true
+# `default-features = false` keeps `rand_core` out of the WASM build; the
+# contract only ever verifies signatures, never creates them.
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }

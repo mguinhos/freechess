@@ -1,0 +1,25 @@
+[package]
+name = "chess-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared chess engine and contract state types for FreeChess"
+
+[features]
+default = []
+# Legacy contract migration registry. Feature-gated so the contract/delegate
+# WASM builds (which do not enable it) keep byte-identical WASM and stable keys.
+migration = []
+
+[dependencies]
+serde.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+bs58.workspace = true
+chrono.workspace = true
+freenet-scaffold.workspace = true
+freenet-scaffold-macro.workspace = true
+
+[dev-dependencies]
+rand = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

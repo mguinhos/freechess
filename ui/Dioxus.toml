@@ -1,0 +1,16 @@
+[application]
+name = "FreeChess"
+default_platform = "web"
+
+[web.app]
+title = "FreeChess"
+
+# base_path is rewritten by `cargo make build-ui` to the webapp's contract id,
+# because the gateway serves the app under /v1/contract/web/<key>/ and every
+# asset URL needs that prefix. It stays commented out otherwise so `dx serve`
+# works from the root during development.
+#base_path = "v1/contract/web/PLACEHOLDER"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]

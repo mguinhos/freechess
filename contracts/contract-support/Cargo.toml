@@ -1,0 +1,12 @@
+[package]
+name = "chess-contract-support"
+version.workspace = true
+edition.workspace = true
+description = "Shared ContractInterface plumbing for the FreeChess contracts"
+
+[dependencies]
+chess-core.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+freenet-scaffold.workspace = true
+freenet-stdlib.workspace = true

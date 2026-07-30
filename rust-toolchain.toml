@@ -1,0 +1,11 @@
+[toolchain]
+# Pinned to keep the contract and delegate WASM builds deterministic.
+#
+# Why this matters: a contract key is BLAKE3(BLAKE3(wasm) || params). A
+# different rustc version produces different WASM bytes and therefore a
+# different contract key, stranding every game, lobby entry and player
+# profile already published under the old key. When bumping this pin, record
+# the outgoing code hash in `legacy_contracts.toml` in the SAME commit.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

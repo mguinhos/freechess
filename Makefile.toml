@@ -1,0 +1,271 @@
+# Build orchestration for FreeChess.
+#
+# Ordering matters in one place: the UI embeds the contract WASM at build time
+# (a client PUTs the contract itself, not just its state), so contracts must be
+# built first. Every task that builds the UI depends on `build-contracts`.
+
+[config]
+default_to_workspace = false
+skip_core_tasks = true
+
+[env]
+# The node to talk to. Override for a second node:  WS_API_PORT=7510 cargo make publish
+WS_API_PORT = { value = "7509", condition = { env_not_set = ["WS_API_PORT"] } }
+WASM_DIR = "target/wasm32-unknown-unknown/release"
+CONTRACTS = "game-contract lobby-contract archive-contract player-contract"
+
+# ---------------------------------------------------------------- build
+
+[tasks.build-contracts]
+description = "Compile the contracts to WASM"
+command = "cargo"
+args = [
+    "build", "--release", "--target", "wasm32-unknown-unknown",
+    "-p", "game-contract",
+    "-p", "lobby-contract",
+    "-p", "archive-contract",
+    "-p", "player-contract",
+    "-p", "web-container-contract",
+]
+
+[tasks.build-delegate]
+description = "Compile the delegate to WASM"
+command = "cargo"
+args = ["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "chess-delegate"]
+
+[tasks.webapp-params]
+description = "Create/load the publisher key and write the contract parameters"
+script_runner = "@shell"
+script = '''
+set -e
+mkdir -p target/webapp
+cargo run --quiet -p webapp-packager -- \
+  --key .freenet-publisher.key \
+  --out-dir target/webapp \
+  --params-only
+'''
+
+[tasks.build-ui]
+description = "Build the web UI with the gateway base path baked in"
+dependencies = ["build-contracts", "webapp-params"]
+script_runner = "@shell"
+script = '''
+set -e
+# The gateway serves the app under /v1/contract/web/<key>/, so every asset URL
+# has to be prefixed with that path. The key depends only on the container WASM
+# and the publisher key — NOT on the bundle contents — so it can be computed
+# before the UI is built, which is what breaks the apparent circular dependency.
+# dx writes each build under a content-hashed name and never removes the old
+# ones, so the output directory accumulates every past bundle. Packaging that
+# directory wholesale shipped ~9MB of stale WASM — which is what made the
+# webapp too large to transfer reliably. Clear it first.
+rm -rf target/dx/chess-ui
+
+KEY=$(fdev get-contract-id \
+  --code "${WASM_DIR}/web_container_contract.wasm" \
+  --parameters target/webapp/webapp.params | tr -d '[:space:]')
+
+if [ -z "$KEY" ]; then
+  echo "ERROR: could not derive the webapp contract id" >&2
+  exit 1
+fi
+echo "webapp contract id: $KEY"
+
+# Rewrite base_path in place, then restore it afterwards so `dx serve` (which
+# serves from the root) keeps working during development.
+cp ui/Dioxus.toml ui/Dioxus.toml.bak
+sed -i "s|^#*base_path = .*|base_path = \"v1/contract/web/$KEY\"|" ui/Dioxus.toml
+( cd ui && dx build --release --platform web )
+status=$?
+mv ui/Dioxus.toml.bak ui/Dioxus.toml
+exit $status
+'''
+
+[tasks.build]
+description = "Build everything"
+dependencies = ["build-contracts", "build-delegate", "build-ui"]
+
+# ---------------------------------------------------------------- checks
+
+[tasks.test]
+description = "Run the test suite"
+command = "cargo"
+args = ["test", "--workspace", "--exclude", "chess-ui"]
+
+[tasks.test-deep]
+description = "Run the slow perft checks"
+command = "cargo"
+args = ["test", "-p", "chess-core", "--release", "--", "--ignored"]
+
+[tasks.fmt]
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--exclude", "chess-ui", "--", "-D", "warnings"]
+
+[tasks.preflight]
+description = "Everything CI would run, before publishing"
+dependencies = ["fmt", "clippy", "test", "check-contract-keys"]
+
+[tasks.check-contract-keys]
+description = "Fail if two contracts hash to the same WASM"
+dependencies = ["build-contracts"]
+script_runner = "@shell"
+script = '''
+cd "${WASM_DIR}"
+duplicates=$(sha256sum game_contract.wasm lobby_contract.wasm archive_contract.wasm player_contract.wasm \
+  | awk '{print $1}' | sort | uniq -d)
+if [ -n "$duplicates" ]; then
+  echo "ERROR: two or more contracts compiled to identical WASM."
+  echo "Their contract keys would collide. This usually means the"
+  echo "'freenet-main-contract' feature is missing, so no entry points were"
+  echo "emitted and the contract logic was dead-code eliminated."
+  sha256sum game_contract.wasm lobby_contract.wasm archive_contract.wasm player_contract.wasm
+  exit 1
+fi
+echo "contract WASMs are distinct:"
+sha256sum game_contract.wasm lobby_contract.wasm archive_contract.wasm player_contract.wasm
+'''
+
+[tasks.check-no-wasm-bindgen]
+description = "Fail if a contract or the delegate imports wasm-bindgen"
+dependencies = ["build-contracts", "build-delegate"]
+script_runner = "@shell"
+script = '''
+# wasm-bindgen imports cannot be resolved by wasmtime and make a contract fail
+# at instantiation, usually with an opaque error. Catch it at build time.
+failed=0
+for f in ${WASM_DIR}/*_contract.wasm ${WASM_DIR}/chess_delegate.wasm; do
+  if strings "$f" | grep -q "__wbindgen"; then
+    echo "ERROR: $f imports wasm-bindgen"
+    failed=1
+  fi
+done
+if [ "$failed" = "1" ]; then
+  echo "A dependency pulled wasm-bindgen into the contract graph."
+  echo "Find it with: cargo tree -p <crate> --target wasm32-unknown-unknown -i wasm-bindgen"
+  exit 1
+fi
+echo "no wasm-bindgen imports in contracts or delegate"
+'''
+
+# ---------------------------------------------------------------- publish
+
+[tasks.package-webapp]
+description = "Package, sign and assemble the UI into web-container state"
+dependencies = ["build-ui"]
+script_runner = "@shell"
+script = '''
+set -e
+OUT="target/webapp"
+# dx 0.7 emits the bundle here; older layouts used ui/dist. Probe both so the
+# task keeps working across CLI versions rather than silently packaging nothing.
+DIST=""
+for candidate in \
+  "target/dx/chess-ui/release/web/public" \
+  "ui/dist/public" \
+  "ui/dist"; do
+  if [ -d "$candidate" ] && [ -f "$candidate/index.html" ]; then DIST="$candidate"; break; fi
+done
+if [ -z "$DIST" ]; then
+  echo "ERROR: no built webapp found — run 'cargo make build-ui' first" >&2
+  exit 1
+fi
+echo "packaging from $DIST"
+mkdir -p "$OUT"
+
+# GNU tar flags for a byte-reproducible archive: identical inputs must give an
+# identical archive, or the webapp state (and its signature) churn on every
+# build for no reason.
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+    -C "$DIST" -cf "$OUT/webapp.tar" .
+xz -f -9 "$OUT/webapp.tar"
+
+# Bump the version on every package so a republish is always accepted: the
+# contract rejects a version that is not greater than the one it holds.
+VERSION_FILE="$OUT/version"
+VERSION=$(( $(cat "$VERSION_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$VERSION" > "$VERSION_FILE"
+
+cargo run --quiet -p webapp-packager -- \
+  --archive "$OUT/webapp.tar.xz" \
+  --key .freenet-publisher.key \
+  --version "$VERSION" \
+  --out-dir "$OUT"
+'''
+
+[tasks.publish-delegate]
+description = "Publish the delegate to the local node"
+dependencies = ["build-delegate"]
+script_runner = "@shell"
+script = '''
+fdev --port "${WS_API_PORT}" publish \
+  --code "${WASM_DIR}/chess_delegate.wasm" \
+  delegate
+'''
+
+[tasks.publish-webapp]
+description = "Publish the UI to the local node and print its URL"
+dependencies = ["package-webapp"]
+script_runner = "@shell"
+script = '''
+set -e
+OUT="target/webapp"
+fdev --port "${WS_API_PORT}" publish \
+  --code "${WASM_DIR}/web_container_contract.wasm" \
+  --parameters "$OUT/webapp.params" \
+  contract \
+  --state "$OUT/webapp.state"
+
+KEY=$(fdev get-contract-id \
+  --code "${WASM_DIR}/web_container_contract.wasm" \
+  --parameters "$OUT/webapp.params" 2>/dev/null | tr -d '[:space:]')
+
+echo
+echo "FreeChess is live at:"
+echo "  http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/"
+echo "$KEY" > "$OUT/contract-id"
+'''
+
+[tasks.publish]
+description = "Build and publish everything to the local node"
+dependencies = [
+    "build",
+    "check-contract-keys",
+    "check-no-wasm-bindgen",
+    "publish-delegate",
+    "publish-webapp",
+]
+
+# ---------------------------------------------------------------- dev
+
+[tasks.dev]
+description = "Serve the UI with hot reload against the local node"
+dependencies = ["build-contracts"]
+cwd = "ui"
+command = "dx"
+args = ["serve", "--platform", "web"]
+
+[tasks.nodes-up]
+description = "Start the isolated two-node test network"
+script_runner = "@shell"
+script = "./scripts/nodes.sh up"
+
+[tasks.nodes-down]
+script_runner = "@shell"
+script = "./scripts/nodes.sh down"
+
+[tasks.test-e2e]
+description = "Two-node browser test"
+dependencies = ["build"]
+script_runner = "@shell"
+script = '''
+./scripts/nodes.sh up
+cd e2e && npx playwright test
+'''
+
+[tasks.clean]
+command = "cargo"
+args = ["clean"]

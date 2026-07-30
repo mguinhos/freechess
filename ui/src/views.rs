@@ -1,0 +1,1145 @@
+//! The screens.
+
+use crate::app::{format_clock, result_headline, AppState, Cmd, Route, Sync};
+use crate::board::{captured_material, GameBoard, MiniBoard};
+use crate::identity::now_ms;
+use chess_core::account;
+use chess_core::chess::{Board, Color, Move, PieceKind};
+use chess_core::game::setup::TimeControl;
+use chess_core::identity::{GameId, PlayerId};
+use chess_core::player::validate_nickname;
+use dioxus::prelude::*;
+
+/// Header: brand, connection state, account.
+#[component]
+pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
+    let mut show_account = use_signal(|| false);
+    let mut show_admin = use_signal(|| false);
+    let s = state.read();
+    let status = s.status;
+    let nickname = s.account.nickname.clone();
+    let rating = s.my_rating();
+    let online = s.lobby.presence.online_count(now_ms());
+    let is_admin = s.is_admin();
+    // Visible to admins, and to everyone while nobody has claimed it — hiding
+    // an unclaimed race would only mean whoever reads the source wins it.
+    let show_admin_entry = is_admin || s.admin_unclaimed();
+    drop(s);
+
+    rsx! {
+        div { class: "topbar",
+            div {
+                class: "brand",
+                onclick: move |_| state.with_mut(|s| s.route = Route::Home),
+                span { class: "mark", "\u{265E}" }
+                span { "FreeChess" }
+            }
+            div { class: "spacer" }
+            div { class: "conn",
+                span { class: "dot {status.css()}" }
+                span { "{status.label()}" }
+            }
+            div { class: "conn", "{online} online" }
+            // A plain hyperlink, not a fetched resource — nothing is loaded
+            // from outside, so the gateway's same-origin CSP is unaffected.
+            a {
+                class: "conn gh",
+                href: "https://github.com/mguinhos/freechess",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                title: "Source code on GitHub",
+                "GitHub"
+            }
+            if show_admin_entry {
+                button {
+                    class: "ghost",
+                    id: "admin-button",
+                    title: "Administration",
+                    onclick: move |_| show_admin.set(true),
+                    if is_admin { "\u{2699} admin" } else { "\u{2699}" }
+                }
+            }
+            button {
+                class: "ghost",
+                id: "account-button",
+                onclick: move |_| show_account.set(true),
+                "{nickname} ({rating})"
+            }
+        }
+        if show_account() {
+            AccountModal { state, sync, on_close: move |_| show_account.set(false) }
+        }
+        if show_admin() {
+            AdminModal { state, sync, on_close: move |_| show_admin.set(false) }
+        }
+    }
+}
+
+/// Nickname, and importing/exporting the account key.
+#[component]
+pub fn AccountModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()>) -> Element {
+    let account = state.read().account.clone();
+    let mut nickname = use_signal(|| account.nickname.clone());
+    let mut import_text = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    let mut revealed = use_signal(|| false);
+    let export_string = account.export();
+    let player_id = account.id();
+
+    rsx! {
+        div { class: "modal-bg", onclick: move |_| on_close.call(()),
+            div { class: "modal", onclick: move |e| e.stop_propagation(),
+                h3 { "Your account" }
+                div { class: "body",
+                    div {
+                        label { "Nickname" }
+                        input {
+                            value: "{nickname}",
+                            oninput: move |e| nickname.set(e.value()),
+                            maxlength: 32,
+                        }
+                        div { class: "small muted", style: "margin-top:6px",
+                            "Player id: "
+                            span { class: "mono", "{player_id}" }
+                        }
+                    }
+                    if let Some(err) = error() {
+                        div { class: "banner err small", "{err}" }
+                    }
+                    div { class: "actions",
+                        button {
+                            class: "primary",
+                            onclick: move |_| {
+                                let value = nickname();
+                                match validate_nickname(&value) {
+                                    Ok(()) => {
+                                        sync.send(Cmd::SetNickname(value));
+                                        error.set(None);
+                                        on_close.call(());
+                                    }
+                                    Err(e) => error.set(Some(e)),
+                                }
+                            },
+                            "Save"
+                        }
+                    }
+
+                    hr { style: "border:none;border-top:1px solid var(--border)" }
+
+                    div {
+                        label { "Export account" }
+                        div { class: "small muted", style: "margin-bottom:6px",
+                            "This key IS your account — anyone holding it can play as you. There is no way to reset it."
+                        }
+                        if revealed() {
+                            code { class: "key", "{export_string}" }
+                        } else {
+                            button { class: "ghost", onclick: move |_| revealed.set(true), "Reveal key" }
+                        }
+                    }
+
+                    div {
+                        label { "Import an account" }
+                        input {
+                            value: "{import_text}",
+                            placeholder: "fchess1...",
+                            oninput: move |e| import_text.set(e.value()),
+                        }
+                        div { class: "actions", style: "margin-top:8px",
+                            button {
+                                class: "ghost",
+                                onclick: move |_| {
+                                    match account::import(&import_text()) {
+                                        Ok(key) => {
+                                            crate::identity::save_local(&key);
+                                            // A full reload is the honest way to
+                                            // swap identity: every subscription,
+                                            // cached game and signature context
+                                            // belongs to the old key.
+                                            if let Some(w) = web_sys::window() {
+                                                let _ = w.location().reload();
+                                            }
+                                        }
+                                        Err(e) => error.set(Some(e.to_string())),
+                                    }
+                                },
+                                "Import and reload"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Create-a-game dialog.
+#[component]
+pub fn NewGameModal(
+    sync: Sync,
+    #[props(default = None)] challenged: Option<(String, ed25519_dalek::VerifyingKey)>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let mut minutes = use_signal(|| 10u32);
+    let mut increment = use_signal(|| 0u32);
+    let mut color = use_signal(|| Color::White);
+    let challenge_name = challenged.as_ref().map(|(n, _)| n.clone());
+    let challenge_key = challenged.as_ref().map(|(_, k)| *k);
+
+    let tc = TimeControl {
+        initial_secs: minutes() * 60,
+        increment_secs: increment(),
+    };
+
+    rsx! {
+        div { class: "modal-bg", onclick: move |_| on_close.call(()),
+            div { class: "modal", onclick: move |e| e.stop_propagation(),
+                h3 {
+                    if let Some(name) = challenge_name.clone() {
+                        "Challenge {name}"
+                    } else {
+                        "New game"
+                    }
+                }
+                div { class: "body",
+                    div {
+                        label { "Time control" }
+                        div { class: "row",
+                            for preset in [(1u32, 0u32), (3, 2), (5, 0), (10, 0), (15, 10), (30, 0)] {
+                                button {
+                                    key: "{preset.0}-{preset.1}",
+                                    class: if minutes() == preset.0 && increment() == preset.1 { "primary" } else { "ghost" },
+                                    onclick: move |_| { minutes.set(preset.0); increment.set(preset.1); },
+                                    "{preset.0}+{preset.1}"
+                                }
+                            }
+                        }
+                        div { class: "small muted", style: "margin-top:8px",
+                            span { class: "badge {tc.category().to_lowercase()}", "{tc.category()}" }
+                        }
+                    }
+                    div {
+                        label { "Play as" }
+                        div { class: "row",
+                            button {
+                                class: if color() == Color::White { "primary" } else { "ghost" },
+                                onclick: move |_| color.set(Color::White),
+                                "White"
+                            }
+                            button {
+                                class: if color() == Color::Black { "primary" } else { "ghost" },
+                                onclick: move |_| color.set(Color::Black),
+                                "Black"
+                            }
+                        }
+                    }
+                    div { class: "actions",
+                        button { class: "ghost", onclick: move |_| on_close.call(()), "Cancel" }
+                        button {
+                            class: "primary",
+                            onclick: move |_| {
+                                sync.send(Cmd::CreateGame {
+                                    color: color(),
+                                    time_control: tc,
+                                    challenged: challenge_key,
+                                });
+                                on_close.call(());
+                            },
+                            if challenge_name.is_some() { "Send challenge" } else { "Create game" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The home page: every game in progress, plus open challenges, ranking and
+/// who is around.
+#[component]
+pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
+    let mut show_new = use_signal(|| false);
+    let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
+    let mut query = use_signal(String::new);
+
+    let s = state.read();
+    let me = s.me();
+    let now = now_ms();
+    let search = query();
+    let searching = !search.trim().is_empty();
+
+    let mut live: Vec<_> = if searching {
+        s.lobby.games.search(&search).into_iter().cloned().collect()
+    } else {
+        s.lobby.games.live_games().into_iter().cloned().collect()
+    };
+    // A takedown is advisory, and this is what honouring it looks like: the
+    // game stops appearing where clients look.
+    live.retain(|e| !s.lobby.administration.is_taken_down(&e.game_id));
+    let open: Vec<_> = s
+        .lobby
+        .games
+        .public_open_games()
+        .into_iter()
+        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
+        .cloned()
+        .collect();
+    let invites: Vec<_> = s
+        .lobby
+        .games
+        .challenges_for(me)
+        .into_iter()
+        .cloned()
+        .collect();
+    let ranked: Vec<_> = s.lobby.leaderboard.ranked().into_iter().cloned().collect();
+    let players: Vec<_> = s
+        .lobby
+        .presence
+        .challengeable(me, now)
+        .into_iter()
+        .cloned()
+        .collect();
+    drop(s);
+
+    rsx! {
+        div { class: "page",
+            div { class: "columns",
+                div {
+                    div { class: "row", style: "margin-bottom:16px",
+                        input {
+                            placeholder: "Search games by player or id\u{2026}",
+                            value: "{query}",
+                            oninput: move |e| query.set(e.value()),
+                        }
+                        button {
+                            class: "primary",
+                            style: "white-space:nowrap",
+                            onclick: move |_| show_new.set(true),
+                            "New game"
+                        }
+                    }
+
+                    if !invites.is_empty() {
+                        div { class: "panel",
+                            h2 { "Challenges for you" }
+                            div { class: "list",
+                                for entry in invites {
+                                    div { key: "{entry.game_id}", class: "list-item",
+                                        span { class: "grow",
+                                            b { "{entry.setup.setup.creator_nickname}" }
+                                            span { class: "muted small", " wants to play " }
+                                            span { class: "badge {entry.time_control().category().to_lowercase()}",
+                                                "{entry.time_control().label()}"
+                                            }
+                                        }
+                                        button {
+                                            class: "primary",
+                                            onclick: {
+                                                let id = entry.game_id;
+                                                move |_| sync.send(Cmd::JoinGame(id))
+                                            },
+                                            "Accept"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 {
+                            if searching { "Search results" } else { "Games in progress" }
+                            span { class: "badge live", "{live.len()}" }
+                        }
+                        if live.is_empty() {
+                            div { class: "empty",
+                                if searching { "Nothing matched that search." }
+                                else { "No games running yet — start one and it will show up here for everyone." }
+                            }
+                        } else {
+                            div { class: "games",
+                                for entry in live {
+                                    {
+                                        let (white, black) = entry.nicknames();
+                                        let id = entry.game_id;
+                                        let tc = entry.time_control();
+                                        rsx! {
+                                            div {
+                                                key: "{id}",
+                                                class: "game-card",
+                                                onclick: move |_| {
+                                                    sync.send(Cmd::WatchGame(id));
+                                                    state.with_mut(|s| s.route = Route::Game(id));
+                                                },
+                                                div { class: "mini",
+                                                    MiniBoard { fen: entry.fen(), orientation: Color::White }
+                                                }
+                                                div { class: "who",
+                                                    b { "{white}" }
+                                                    span { class: "muted", "vs" }
+                                                    b { "{black}" }
+                                                }
+                                                div { class: "meta",
+                                                    span { class: "badge {tc.category().to_lowercase()}", "{tc.label()}" }
+                                                    span { "move {entry.snapshot.as_ref().map(|s| s.ply / 2 + 1).unwrap_or(1)}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 { "Open challenges" }
+                        if open.is_empty() {
+                            div { class: "empty", "Nobody is waiting for an opponent right now." }
+                        } else {
+                            div { class: "list",
+                                for entry in open {
+                                    div { key: "{entry.game_id}", class: "list-item",
+                                        span { class: "grow",
+                                            b { "{entry.setup.setup.creator_nickname}" }
+                                        }
+                                        span { class: "badge {entry.time_control().category().to_lowercase()}",
+                                            "{entry.time_control().label()}"
+                                        }
+                                        if entry.creator_id() == me {
+                                            span { class: "muted small", "yours" }
+                                        } else {
+                                            button {
+                                                class: "primary",
+                                                onclick: {
+                                                    let id = entry.game_id;
+                                                    move |_| sync.send(Cmd::JoinGame(id))
+                                                },
+                                                "Play"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div {
+                    div { class: "panel",
+                        h2 { "Ranking" }
+                        if ranked.is_empty() {
+                            div { class: "empty", "No rated games yet." }
+                        } else {
+                            div { class: "list",
+                                for (i, entry) in ranked.iter().take(20).enumerate() {
+                                    div { key: "{entry.player_id()}", class: "list-item",
+                                        span { class: "rank", "{i + 1}" }
+                                        span { class: "grow", "{entry.nickname}" }
+                                        span { class: "elo", "{entry.rating}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 { "Players" }
+                        if players.is_empty() {
+                            div { class: "empty", "Nobody else is online." }
+                        } else {
+                            div { class: "list",
+                                for p in players {
+                                    div { key: "{p.player_id()}", class: "list-item",
+                                        span { class: "dot {p.status_at(now).label()}" }
+                                        span { class: "grow", "{p.nickname}" }
+                                        button {
+                                            class: "ghost small",
+                                            onclick: {
+                                                let name = p.nickname.clone();
+                                                let key = p.player;
+                                                move |_| challenge_target.set(Some((name.clone(), key)))
+                                            },
+                                            "Challenge"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if show_new() {
+            NewGameModal { sync, on_close: move |_| show_new.set(false) }
+        }
+        if let Some(target) = challenge_target() {
+            NewGameModal {
+                sync,
+                challenged: Some(target),
+                on_close: move |_| challenge_target.set(None),
+            }
+        }
+    }
+}
+
+/// A single game — playing or spectating, plus the replay scrubber once it is
+/// over.
+#[component]
+pub fn GameView(
+    state: Signal<AppState>,
+    sync: Sync,
+    game_id: GameId,
+    replay_mode: bool,
+) -> Element {
+    let mut promotion = use_signal(|| None::<(Move, Vec<PieceKind>)>);
+    let mut viewing_ply = use_signal(|| None::<usize>);
+    let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
+
+    let s = state.read();
+    let me = s.me();
+    let now = now_ms();
+    let game = match s.game(&game_id) {
+        Some(g) => g.clone(),
+        None => {
+            drop(s);
+            return rsx! {
+                div { class: "page",
+                    div { class: "panel", div { class: "empty", "Loading game\u{2026}" } }
+                }
+            };
+        }
+    };
+    let spectators: Vec<_> = s
+        .lobby
+        .presence
+        .spectators_of(game_id, now)
+        .into_iter()
+        .filter(|p| p.player_id() != me)
+        .cloned()
+        .collect();
+    drop(s);
+
+    let replay = game.replay();
+    let my_color = game
+        .player_keys()
+        .and_then(|_| game.color_of(&state.read().account.key.verifying_key()));
+    let orientation = my_color.unwrap_or(Color::White);
+    let result = game.result();
+    let is_over = result.is_over();
+
+    // In replay mode (or when scrubbing) the board shows a past position and is
+    // not playable.
+    let total_plies = replay.ply();
+    let shown_ply = viewing_ply().unwrap_or(total_plies).min(total_plies);
+    let scrubbing = shown_ply != total_plies;
+    let fen = replay.fen_at(shown_ply).to_string();
+
+    let playable = if replay_mode || scrubbing || is_over {
+        None
+    } else {
+        my_color.filter(|c| game.replay().side_to_move() == *c && game.opponent.get().is_some())
+    };
+
+    let last_move = if shown_ply > 0 {
+        replay.moves().get(shown_ply - 1).copied()
+    } else {
+        None
+    };
+
+    let (white_name, black_name) = match game.setup.get() {
+        Some(setup) => {
+            let creator = setup.setup.creator_nickname.clone();
+            let challenger = game
+                .opponent
+                .get()
+                .map(|j| j.nickname.clone())
+                .unwrap_or_else(|| "waiting\u{2026}".to_string());
+            match setup.setup.creator_plays {
+                Color::White => (creator, challenger),
+                Color::Black => (challenger, creator),
+            }
+        }
+        None => ("White".to_string(), "Black".to_string()),
+    };
+
+    let board_now = Board::from_fen(&fen).unwrap_or_default();
+    let (captured_by_white, captured_by_black) = captured_material(&board_now);
+    let white_ms = game.time_remaining(Color::White, now);
+    let black_ms = game.time_remaining(Color::Black, now);
+    let to_move = replay.side_to_move();
+
+    let sans = replay.san_list();
+    let can_join = game.is_open()
+        && game
+            .setup
+            .get()
+            .map(|s| s.creator)
+            .map(|c| PlayerId::from(&c))
+            != Some(me)
+        && game
+            .setup
+            .get()
+            .and_then(|s| s.setup.challenged)
+            .map(|k| PlayerId::from(&k) == me)
+            .unwrap_or(true);
+
+    let seat = |name: String, ms: i64, color: Color, captured: String| {
+        let active = !is_over && to_move == color && game.opponent.get().is_some();
+        let low = ms < 20_000;
+        let mut class = String::from("clock");
+        if active {
+            class.push_str(" active");
+        }
+        if active && low {
+            class.push_str(" low");
+        }
+        let piece_class = if color == Color::White {
+            "piece white"
+        } else {
+            "piece black"
+        };
+        rsx! {
+            div { class: "seat",
+                span { class: "{piece_class}", style: "font-size:20px", "\u{265F}" }
+                span { class: "name", "{name}" }
+                span { class: "captured", "{captured}" }
+                span { class: "spacer" }
+                span { class: "{class}", "{format_clock(ms)}" }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "page",
+            div { class: "game-layout",
+                div {
+                    { seat(black_name.clone(), black_ms, Color::Black, captured_by_black) }
+                    div { class: "board-wrap",
+                        GameBoard {
+                            fen: fen.clone(),
+                            orientation,
+                            playable,
+                            last_move,
+                            on_move: move |mv: Move| {
+                                // A pawn reaching the last rank needs a piece
+                                // chosen before the move can be signed.
+                                let board = Board::from_fen(&fen).unwrap_or_default();
+                                let is_promo = board
+                                    .piece_at(mv.from)
+                                    .map(|p| p.kind == PieceKind::Pawn
+                                        && mv.to.rank() == p.color.promotion_rank())
+                                    .unwrap_or(false);
+                                if is_promo {
+                                    promotion.set(Some((mv, vec![
+                                        PieceKind::Queen, PieceKind::Rook,
+                                        PieceKind::Bishop, PieceKind::Knight,
+                                    ])));
+                                } else {
+                                    sync.send(Cmd::PlayMove { game: game_id, mv });
+                                }
+                            },
+                        }
+                        if is_over && !scrubbing {
+                            div { class: "result-overlay",
+                                div { class: "result-card",
+                                    div { class: "headline", "{result_headline(result, my_color)}" }
+                                    div { class: "muted small", "Replay is shareable — copy the page link." }
+                                }
+                            }
+                        }
+                    }
+                    { seat(white_name.clone(), white_ms, Color::White, captured_by_white) }
+                }
+
+                div {
+                    div { class: "panel",
+                        h2 { "Moves" }
+                        div { class: "moves",
+                            if sans.is_empty() {
+                                div { class: "empty", "No moves yet." }
+                            } else {
+                                for (i, pair) in sans.chunks(2).enumerate() {
+                                    div { key: "{i}", class: "mv-row",
+                                        span { class: "num", "{i + 1}." }
+                                        span {
+                                            class: if shown_ply == i * 2 + 1 { "mv current" } else { "mv" },
+                                            onclick: move |_| viewing_ply.set(Some(i * 2 + 1)),
+                                            "{pair[0]}"
+                                        }
+                                        if pair.len() > 1 {
+                                            span {
+                                                class: if shown_ply == i * 2 + 2 { "mv current" } else { "mv" },
+                                                onclick: move |_| viewing_ply.set(Some(i * 2 + 2)),
+                                                "{pair[1]}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "body",
+                            div { class: "replay-bar",
+                                button { class: "ghost", onclick: move |_| viewing_ply.set(Some(0)), "\u{23EE}" }
+                                button {
+                                    class: "ghost",
+                                    onclick: move |_| viewing_ply.set(Some(shown_ply.saturating_sub(1))),
+                                    "\u{25C0}"
+                                }
+                                button {
+                                    class: "ghost",
+                                    onclick: move |_| viewing_ply.set(Some((shown_ply + 1).min(total_plies))),
+                                    "\u{25B6}"
+                                }
+                                button { class: "ghost", onclick: move |_| viewing_ply.set(None), "\u{23ED}" }
+                            }
+                            if scrubbing {
+                                div {
+                                    class: "banner warn small",
+                                    id: "replay-position",
+                                    style: "margin-top:10px",
+                                    "Viewing move {shown_ply} of {total_plies}. "
+                                    span {
+                                        style: "cursor:pointer;text-decoration:underline",
+                                        onclick: move |_| viewing_ply.set(None),
+                                        "Jump to live"
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 { "Game" }
+                        div { class: "body",
+                            div { class: "small muted", style: "margin-bottom:10px",
+                                if my_color.is_some() { "You are playing this game." }
+                                else { "You are spectating." }
+                            }
+                            if can_join {
+                                button {
+                                    class: "primary",
+                                    style: "width:100%",
+                                    onclick: move |_| sync.send(Cmd::JoinGame(game_id)),
+                                    "Take the open seat"
+                                }
+                            }
+                            if my_color.is_some() && !is_over && game.opponent.get().is_some() {
+                                button {
+                                    class: "danger",
+                                    style: "width:100%;margin-top:8px",
+                                    onclick: move |_| sync.send(Cmd::Resign(game_id)),
+                                    "Resign"
+                                }
+                            }
+                            div { class: "small muted", style: "margin-top:12px",
+                                "Share this game"
+                                // The address bar cannot be updated from here:
+                                // the gateway runs the app in a sandboxed
+                                // iframe without `allow-same-origin`, so
+                                // history.replaceState is not permitted. The
+                                // shell does forward its query string into the
+                                // frame, so a link built here works when
+                                // opened — it just has to be shown rather than
+                                // reflected in the URL.
+                                code {
+                                    class: "key",
+                                    id: "share-link",
+                                    "{share_link(game_id)}"
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 { "Spectators" }
+                        if spectators.is_empty() {
+                            div { class: "empty", "Nobody else is watching." }
+                        } else {
+                            div { class: "list",
+                                for p in spectators {
+                                    div { key: "{p.player_id()}", class: "list-item",
+                                        span { class: "dot {p.status_at(now).label()}" }
+                                        span { class: "grow", "{p.nickname}" }
+                                        button {
+                                            class: "ghost small",
+                                            onclick: {
+                                                let name = p.nickname.clone();
+                                                let key = p.player;
+                                                move |_| challenge_target.set(Some((name.clone(), key)))
+                                            },
+                                            "Challenge"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((mv, choices)) = promotion() {
+            div { class: "modal-bg",
+                div { class: "modal", style: "max-width:320px",
+                    h3 { "Promote to" }
+                    div { class: "body",
+                        div { class: "promo",
+                            for kind in choices {
+                                button {
+                                    key: "{kind:?}",
+                                    onclick: move |_| {
+                                        sync.send(Cmd::PlayMove {
+                                            game: game_id,
+                                            mv: Move::promoting(mv.from, mv.to, kind),
+                                        });
+                                        promotion.set(None);
+                                    },
+                                    "{crate::board::glyph(kind)}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(target) = challenge_target() {
+            NewGameModal {
+                sync,
+                challenged: Some(target),
+                on_close: move |_| challenge_target.set(None),
+            }
+        }
+    }
+}
+
+/// Banner shown when the node connection is not healthy.
+#[component]
+pub fn StatusBanner(state: Signal<AppState>) -> Element {
+    let s = state.read();
+    let message = s.message.clone();
+    let status = s.status;
+    drop(s);
+
+    rsx! {
+        if status == crate::app::ConnStatus::Error {
+            div { class: "page", style: "padding-bottom:0",
+                div { class: "banner err",
+                    b { "Cannot reach the Freenet node." }
+                    div { class: "small muted",
+                        "This app talks to the node that served it. Check that the node is running."
+                    }
+                    if let Some(msg) = message.clone() {
+                        div { class: "small mono muted", id: "app-message", style: "margin-top:6px", "{msg}" }
+                    }
+                }
+            }
+        } else if let Some(msg) = message.clone() {
+            // Surface non-fatal problems too. A silently swallowed error here
+            // reads as "the app just does not work", which is far harder to
+            // diagnose than a visible line of text.
+            div { class: "page", style: "padding-bottom:0",
+                div { class: "banner warn small mono", id: "app-message", "{msg}" }
+            }
+        }
+    }
+}
+
+/// The URL that opens this game for someone else.
+///
+/// Built from the frame's own location minus the shell's `__sandbox` marker.
+/// The gateway shell forwards any extra query parameters into the iframe, so a
+/// link of this shape lands the visitor straight in the game.
+pub fn share_link(game_id: GameId) -> String {
+    let fallback = format!("?game={game_id}");
+    let Some(window) = web_sys::window() else {
+        return fallback;
+    };
+    let location = window.location();
+    let (Ok(origin), Ok(pathname)) = (location.origin(), location.pathname()) else {
+        return fallback;
+    };
+    // A sandboxed frame reports its origin as "null"; fall back to a relative
+    // link rather than emitting a nonsense absolute URL.
+    if origin == "null" || origin.is_empty() {
+        return format!("{pathname}?game={game_id}");
+    }
+    format!("{origin}{pathname}?game={game_id}")
+}
+
+/// Notices every visitor sees: the service state and any announcements.
+///
+/// Both are advisory by design — nothing in a contract refuses work because of
+/// them (see `chess_core::admin`), so the honest presentation is a notice
+/// rather than a blocked screen.
+#[component]
+pub fn NoticeBanners(state: Signal<AppState>) -> Element {
+    let s = state.read();
+    let unavailable = !s.lobby.administration.available();
+    let service_message = s.lobby.administration.service_message();
+    let announcements: Vec<_> = s
+        .lobby
+        .administration
+        .recent_announcements()
+        .into_iter()
+        .take(3)
+        .cloned()
+        .collect();
+    drop(s);
+
+    if !unavailable && announcements.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "page", style: "padding-bottom:0",
+            if unavailable {
+                div { class: "banner err", id: "service-notice",
+                    b { "FreeChess is marked unavailable." }
+                    if let Some(msg) = service_message {
+                        div { class: "small", style: "margin-top:4px", "{msg}" }
+                    }
+                }
+            }
+            for a in announcements {
+                div { key: "{a.id:?}", class: "banner warn", style: "margin-top:8px",
+                    div { class: "small", "{a.text}" }
+                }
+            }
+        }
+    }
+}
+
+/// The administration panel.
+///
+/// Shown to admins, and to anyone at all while adminship is unclaimed — which
+/// is what "first to claim it" means in practice, and is deliberately visible
+/// rather than hidden, since it is a race anyone can win.
+#[component]
+pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()>) -> Element {
+    let mut announcement = use_signal(String::new);
+    let mut service_message = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+
+    let s = state.read();
+    let me = s.me();
+    let is_admin = s.is_admin();
+    let unclaimed = s.admin_unclaimed();
+    let available = s.lobby.administration.available();
+    let admins: Vec<_> = s
+        .lobby
+        .administration
+        .admins
+        .listed()
+        .into_iter()
+        .cloned()
+        .collect();
+    let now = now_ms();
+    // Candidates to promote: anyone present who is not already an admin.
+    let candidates: Vec<_> = s
+        .lobby
+        .presence
+        .active(now)
+        .into_iter()
+        .filter(|p| !s.lobby.administration.is_admin(p.player_id()) && p.player_id() != me)
+        .cloned()
+        .collect();
+    let live: Vec<_> = s
+        .lobby
+        .games
+        .live_games()
+        .into_iter()
+        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
+        .cloned()
+        .collect();
+    drop(s);
+
+    rsx! {
+        div { class: "modal-bg", onclick: move |_| on_close.call(()),
+            div { class: "modal", onclick: move |e| e.stop_propagation(),
+                h3 { "Administration" }
+                div { class: "body",
+                    if let Some(err) = error() {
+                        div { class: "banner err small", "{err}" }
+                    }
+
+                    if !is_admin {
+                        if unclaimed {
+                            div {
+                                div { class: "banner warn small",
+                                    b { "Nobody has claimed adminship yet." }
+                                    div { style: "margin-top:4px",
+                                        "The first claim wins, and anyone can make it \u{2014} including someone else, at any moment."
+                                    }
+                                }
+                                button {
+                                    class: "primary",
+                                    id: "claim-admin",
+                                    style: "width:100%;margin-top:10px",
+                                    onclick: move |_| {
+                                        sync.send(Cmd::ClaimAdmin);
+                                        error.set(None);
+                                    },
+                                    "Claim adminship"
+                                }
+                            }
+                        } else {
+                            div { class: "banner small", "You are not an administrator." }
+                        }
+                    }
+
+                    div {
+                        label { "Administrators ({admins.len()})" }
+                        if admins.is_empty() {
+                            div { class: "small muted", "None." }
+                        } else {
+                            div { class: "list",
+                                for a in admins {
+                                    div { key: "{a.grantee_id()}", class: "list-item",
+                                        span { class: "grow", "{a.nickname}" }
+                                        if a.is_self_claim() {
+                                            span { class: "badge", "root" }
+                                        }
+                                        if a.grantee_id() == me {
+                                            span { class: "badge rapid", "you" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if is_admin {
+                        div {
+                            label { "Promote a player" }
+                            if candidates.is_empty() {
+                                div { class: "small muted", "Nobody else is online." }
+                            } else {
+                                div { class: "list",
+                                    for p in candidates {
+                                        div { key: "{p.player_id()}", class: "list-item",
+                                            span { class: "grow", "{p.nickname}" }
+                                            button {
+                                                class: "ghost small",
+                                                onclick: {
+                                                    let player = p.player;
+                                                    let nick = p.nickname.clone();
+                                                    move |_| sync.send(Cmd::GrantAdmin {
+                                                        player,
+                                                        nickname: nick.clone(),
+                                                    })
+                                                },
+                                                "Make admin"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        div {
+                            label { "Publish an announcement" }
+                            input {
+                                id: "announcement-text",
+                                value: "{announcement}",
+                                placeholder: "Shown to everyone\u{2026}",
+                                maxlength: 500,
+                                oninput: move |e| announcement.set(e.value()),
+                            }
+                            div { class: "actions", style: "margin-top:8px",
+                                button {
+                                    class: "primary",
+                                    onclick: move |_| {
+                                        let text = announcement();
+                                        if text.trim().is_empty() {
+                                            error.set(Some("the announcement is empty".to_string()));
+                                        } else {
+                                            sync.send(Cmd::Announce { text });
+                                            announcement.set(String::new());
+                                            error.set(None);
+                                        }
+                                    },
+                                    "Announce"
+                                }
+                            }
+                        }
+
+                        div {
+                            label { "End a game" }
+                            div { class: "small muted", style: "margin-bottom:6px",
+                                "Advisory: the game disappears from listings, but its two players can still finish it."
+                            }
+                            if live.is_empty() {
+                                div { class: "small muted", "No games in progress." }
+                            } else {
+                                div { class: "list",
+                                    for e in live {
+                                        {
+                                            let (white, black) = e.nicknames();
+                                            let id = e.game_id;
+                                            rsx! {
+                                                div { key: "{id}", class: "list-item",
+                                                    span { class: "grow small", "{white} vs {black}" }
+                                                    button {
+                                                        class: "danger small",
+                                                        onclick: move |_| sync.send(Cmd::TakeDownGame {
+                                                            game: id,
+                                                            reason: "ended by an administrator".to_string(),
+                                                        }),
+                                                        "End"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        div {
+                            label { "Service state" }
+                            div { class: "small muted", style: "margin-bottom:6px",
+                                "Advisory: clients show a notice. Nothing is blocked, and a modified client can ignore it."
+                            }
+                            if available {
+                                input {
+                                    id: "service-message",
+                                    value: "{service_message}",
+                                    placeholder: "Reason shown to players\u{2026}",
+                                    oninput: move |e| service_message.set(e.value()),
+                                }
+                                button {
+                                    class: "danger",
+                                    id: "mark-unavailable",
+                                    style: "width:100%;margin-top:8px",
+                                    onclick: move |_| {
+                                        sync.send(Cmd::SetService {
+                                            available: false,
+                                            message: service_message(),
+                                        });
+                                        error.set(None);
+                                    },
+                                    "Mark unavailable"
+                                }
+                            } else {
+                                button {
+                                    class: "primary",
+                                    id: "mark-available",
+                                    style: "width:100%",
+                                    onclick: move |_| {
+                                        sync.send(Cmd::SetService {
+                                            available: true,
+                                            message: String::new(),
+                                        });
+                                        error.set(None);
+                                    },
+                                    "Mark available again"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

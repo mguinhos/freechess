@@ -1,0 +1,25 @@
+[package]
+name = "chess-delegate"
+version.workspace = true
+edition.workspace = true
+description = "Holds the player's signing key in the local Freenet trust zone"
+
+[features]
+# Emits the WASM entry points the host calls; without it the delegate compiles
+# to a module with no exports.
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+
+[dependencies]
+chess-core.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+freenet-stdlib.workspace = true
+# NOTE: do NOT add `rand` or `getrandom` here. The delegate runtime on
+# wasm32-unknown-unknown has no getrandom backend, and pulling those crates in
+# produces wasm-bindgen placeholder imports wasmtime cannot resolve
+# (freenet/river#241). Key generation happens in the UI, which has
+# `crypto.getRandomValues`, and the seed is handed here for storage.
+
+[lib]
+crate-type = ["cdylib", "rlib"]

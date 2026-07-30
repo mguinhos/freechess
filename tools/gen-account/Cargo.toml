@@ -1,0 +1,10 @@
+[package]
+name = "gen-account"
+version.workspace = true
+edition.workspace = true
+description = "Generates a FreeChess account string (test/CLI use)"
+
+[dependencies]
+chess-core.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true

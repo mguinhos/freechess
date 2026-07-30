@@ -1,0 +1,21 @@
+[package]
+name = "lobby-contract"
+version.workspace = true
+edition.workspace = true
+description = "The lobby: live games, the Elo ranking and player presence."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+chess-core.workspace = true
+chess-contract-support = { path = "../contract-support" }
+freenet-stdlib.workspace = true
+
+[features]
+# `freenet-main-contract` is what makes the `#[contract]` macro emit the WASM
+# export symbols the host calls. Without it the contract compiles to a module
+# with no entry points and every instance silently does nothing.
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+contract = ["freenet-stdlib/contract"]
