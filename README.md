@@ -230,6 +230,11 @@ randomness anyway.
 
 Created by **Marcel Guinhos** — <https://github.com/mguinhos/freechess>
 
+Contributors:
+
+- **[MitchTravis0](https://github.com/MitchTravis0)** — provable timeouts via
+  peer clock attestation, and the convergence and contract-hardening pass.
+
 Built on [Freenet](https://freenet.org) by the Freenet Project. Architecture
 follows the patterns established by [River](https://github.com/freenet/river),
 Freenet's reference decentralized chat application, and the
@@ -265,3 +270,10 @@ publish output:
 ```bash
 fdev --port <ws> execute get <contract-id> -o /tmp/state
 ```
+
+---
+
+FreeChess runs on [Freenet](https://freenet.org), a peer-to-peer platform for
+decentralized applications. If you want to see what else it can do, start with
+[River](https://freenet.org/river/) — Freenet's group chat app, and the
+reference implementation this project's state design follows.

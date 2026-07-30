@@ -597,6 +597,39 @@ impl AdministrationV1 {
         }
     }
 
+    /// Deterministic digest of the whole administrative set, used as the merge
+    /// summary.
+    ///
+    /// Covers each element's key *and* its signature, so any difference between
+    /// two peers shows up — including one that leaves every collection the same
+    /// length. Every collection is a `BTreeMap`, so the iteration order (and
+    /// therefore the digest) is identical on every peer.
+    fn content_digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SIG_DOMAIN);
+        hasher.update(b"admin-summary:");
+        hasher.update(b"grants:");
+        for (id, grant) in &self.admins.grants {
+            hasher.update(&id.0);
+            hasher.update(&grant.signature.to_bytes());
+        }
+        hasher.update(b"announcements:");
+        for (id, announcement) in &self.announcements {
+            hasher.update(id);
+            hasher.update(&announcement.signature.to_bytes());
+        }
+        hasher.update(b"takedowns:");
+        for (id, takedown) in &self.takedowns {
+            hasher.update(&id.0);
+            hasher.update(&takedown.signature.to_bytes());
+        }
+        hasher.update(b"service:");
+        if let Some(service) = &self.service {
+            hasher.update(&service.signature.to_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     /// Reject state that is not already well-formed.
     pub(crate) fn check(&self) -> Result<(), String> {
         self.admins.check()?;
@@ -630,7 +663,14 @@ pub enum AdminAction {
 
 impl freenet_scaffold::ComposableState for AdministrationV1 {
     type ParentState = crate::lobby::LobbyStateV1;
-    type Summary = (usize, usize, usize, i64);
+    /// A digest of the whole administrative set.
+    ///
+    /// `delta` ships everything whenever anything differs (the set is tens of
+    /// entries and the merge is idempotent), so the summary's only job is to
+    /// detect "differs" — and collection *lengths* did not. Two peers each
+    /// holding one different announcement, grant or takedown summarized
+    /// identically, so neither shipped and the split was permanent.
+    type Summary = [u8; 32];
     type Delta = Vec<AdminAction>;
     type Parameters = crate::lobby::LobbyParametersV1;
 
@@ -643,12 +683,7 @@ impl freenet_scaffold::ComposableState for AdministrationV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        (
-            self.admins.len(),
-            self.announcements.len(),
-            self.takedowns.len(),
-            self.service.as_ref().map(|s| s.at).unwrap_or(0),
-        )
+        self.content_digest()
     }
 
     fn delta(
@@ -657,16 +692,11 @@ impl freenet_scaffold::ComposableState for AdministrationV1 {
         _params: &Self::Parameters,
         old: &Self::Summary,
     ) -> Option<Self::Delta> {
-        // Counts are a coarse summary, so when anything differs we ship the
-        // whole administrative set. It is small (tens of entries) and the merge
-        // is idempotent, so re-sending costs little and cannot corrupt state.
-        let mine = (
-            self.admins.len(),
-            self.announcements.len(),
-            self.takedowns.len(),
-            self.service.as_ref().map(|s| s.at).unwrap_or(0),
-        );
-        if mine == *old {
+        // The digest says only whether the peer differs, so when it does we ship
+        // the whole administrative set. It is small (tens of entries) and the
+        // merge is idempotent, so re-sending costs little and cannot corrupt
+        // state.
+        if self.content_digest() == *old {
             return None;
         }
         let mut actions: Vec<AdminAction> = Vec::new();

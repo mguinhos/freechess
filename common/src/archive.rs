@@ -24,7 +24,7 @@
 //! list, so a replay served from the archive is complete.
 
 use crate::certificate::GameCertificate;
-use crate::identity::{GameId, PlayerId};
+use crate::identity::{signature_digest, GameId, PlayerId};
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -182,7 +182,11 @@ impl ArchivedGamesV1 {
 
 impl ComposableState for ArchivedGamesV1 {
     type ParentState = ArchiveStateV1;
-    type Summary = Vec<GameId>;
+    /// Game id *and* a fingerprint of the certificate held for it. A bare set of
+    /// ids meant a rival certificate for a game the peer already had never
+    /// shipped, so the equivocation tiebreak never ran and the two archives
+    /// stayed split.
+    type Summary = Vec<(GameId, u64)>;
     type Delta = Vec<GameCertificate>;
     type Parameters = ArchiveParametersV1;
 
@@ -212,7 +216,10 @@ impl ComposableState for ArchivedGamesV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        self.games.keys().copied().collect()
+        self.games
+            .iter()
+            .map(|(id, c)| (*id, signature_digest(&c.white_signature)))
+            .collect()
     }
 
     fn delta(
@@ -221,11 +228,11 @@ impl ComposableState for ArchivedGamesV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: std::collections::BTreeSet<GameId> = old_summary.iter().copied().collect();
+        let theirs: std::collections::BTreeMap<GameId, u64> = old_summary.iter().copied().collect();
         let missing: Vec<GameCertificate> = self
             .games
             .iter()
-            .filter(|(id, _)| !theirs.contains(id))
+            .filter(|(id, c)| theirs.get(id) != Some(&signature_digest(&c.white_signature)))
             .map(|(_, c)| c.clone())
             .collect();
         if missing.is_empty() {

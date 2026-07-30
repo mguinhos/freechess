@@ -139,8 +139,29 @@ impl Piece {
 /// A board square, indexed 0..64 with a1 = 0, b1 = 1, ... h8 = 63.
 ///
 /// Stored as a plain `u8` so a move fits in three bytes on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written to enforce the range, because a `Square` is
+/// used to index a fixed 64-element array. Doing it here rather than at each
+/// indexing site covers every path a square can arrive by — a move in a game
+/// delta, a move list inside a certificate — with one check, and makes an
+/// out-of-range value unrepresentable in anything decoded from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Square(pub u8);
+
+/// Number of squares on a board; also the exclusive upper bound on a [`Square`].
+pub const BOARD_SQUARES: u8 = 64;
+
+impl<'de> Deserialize<'de> for Square {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Square, D::Error> {
+        let index = u8::deserialize(d)?;
+        if index >= BOARD_SQUARES {
+            return Err(serde::de::Error::custom(format!(
+                "square {index} is off the board (must be 0..{BOARD_SQUARES})"
+            )));
+        }
+        Ok(Square(index))
+    }
+}
 
 impl Square {
     /// Build from file (0 = a) and rank (0 = rank 1). Returns `None` if either

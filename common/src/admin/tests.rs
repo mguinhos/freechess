@@ -529,3 +529,56 @@ fn prune_is_idempotent() {
     admin.prune();
     assert_eq!(once, admin);
 }
+
+#[test]
+fn peers_holding_different_announcements_exchange_them() {
+    // The summary was a triple of collection *lengths*. Two peers each holding
+    // one different announcement therefore summarized identically, neither
+    // shipped a delta, and the divergence was permanent — the same for a grant
+    // each and a takedown each.
+    let root = key();
+    let claim = AdminAction::Grant(AdminGrant::claim(&root, "root".to_string(), T0));
+
+    let mut peer1 = AdministrationV1::default();
+    apply(&mut peer1, vec![claim.clone()]).unwrap();
+    let mut peer2 = peer1.clone();
+
+    apply(
+        &mut peer1,
+        vec![AdminAction::Announce(Announcement::new(
+            &root,
+            "first notice".to_string(),
+            T0 + 1_000,
+        ))],
+    )
+    .unwrap();
+    apply(
+        &mut peer2,
+        vec![AdminAction::Announce(Announcement::new(
+            &root,
+            "second notice".to_string(),
+            T0 + 2_000,
+        ))],
+    )
+    .unwrap();
+
+    assert_eq!(peer1.announcements.len(), peer2.announcements.len());
+    assert_ne!(peer1.announcements, peer2.announcements);
+
+    let parent = LobbyStateV1::default();
+    let s1 = peer1.summarize(&parent, &params());
+    let d = peer2
+        .delta(&parent, &params(), &s1)
+        .expect("a differing announcement set must ship");
+    peer1.apply_delta(&parent, &params(), &Some(d)).unwrap();
+    peer1.prune();
+
+    let s2 = peer2.summarize(&parent, &params());
+    if let Some(d) = peer1.delta(&parent, &params(), &s2) {
+        peer2.apply_delta(&parent, &params(), &Some(d)).unwrap();
+        peer2.prune();
+    }
+
+    assert_eq!(peer1.announcements.len(), 2);
+    assert_eq!(peer1.announcements, peer2.announcements);
+}

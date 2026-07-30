@@ -148,24 +148,11 @@ mod opt_key_serde {
 }
 
 impl GameSetup {
-    /// The `game_id` implied by these terms. This *is* the proof of work: the
-    /// creator searches `pow_nonce` until the digest has enough leading zeros.
-    pub fn derive_game_id(&self, creator: &VerifyingKey) -> GameId {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(SIG_DOMAIN);
-        hasher.update(b"gameid:");
-        hasher.update(creator.as_bytes());
-        hasher.update(&self.created_at.to_le_bytes());
-        hasher.update(&self.pow_nonce.to_le_bytes());
-        GameId(*hasher.finalize().as_bytes())
-    }
-
-    /// Bytes covered by the creator's signature.
-    fn signing_bytes(&self, game_id: &GameId) -> Vec<u8> {
+    /// Every term of the setup, in a canonical encoding. Shared by the
+    /// proof-of-work digest and the creator's signature so the two cannot
+    /// diverge on which fields they cover.
+    fn terms_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(96);
-        buf.extend_from_slice(SIG_DOMAIN);
-        buf.extend_from_slice(b"setup:");
-        buf.extend_from_slice(&game_id.0);
         buf.push(match self.creator_plays {
             Color::White => 0,
             Color::Black => 1,
@@ -178,8 +165,8 @@ impl GameSetup {
         // field to forge a different setup under the same signature.
         buf.extend_from_slice(&(self.creator_nickname.len() as u32).to_le_bytes());
         buf.extend_from_slice(self.creator_nickname.as_bytes());
-        // Covered by the signature, so nobody can strip the restriction off a
-        // direct challenge and walk into someone else's invitation.
+        // Covered so nobody can strip the restriction off a direct challenge and
+        // walk into someone else's invitation.
         match &self.challenged {
             Some(key) => {
                 buf.push(1);
@@ -187,6 +174,35 @@ impl GameSetup {
             }
             None => buf.push(0),
         }
+        buf
+    }
+
+    /// The `game_id` implied by these terms. This *is* the proof of work: the
+    /// creator searches `pow_nonce` until the digest has enough leading zeros.
+    ///
+    /// The digest covers *all* the terms, not just the creator and the nonce.
+    /// It has to: the id is the contract parameter, and
+    /// [`GameSetupV1::apply_delta`] is write-once on the grounds that a verified
+    /// setup is uniquely determined by the parameters. Leave a term out and the
+    /// creator can sign two equally valid setups that disagree on it, with peers
+    /// keeping whichever arrived first — a permanent split on the game's own
+    /// terms that no merge rule can heal.
+    pub fn derive_game_id(&self, creator: &VerifyingKey) -> GameId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SIG_DOMAIN);
+        hasher.update(b"gameid:");
+        hasher.update(creator.as_bytes());
+        hasher.update(&self.terms_bytes());
+        GameId(*hasher.finalize().as_bytes())
+    }
+
+    /// Bytes covered by the creator's signature.
+    fn signing_bytes(&self, game_id: &GameId) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(96 + 64);
+        buf.extend_from_slice(SIG_DOMAIN);
+        buf.extend_from_slice(b"setup:");
+        buf.extend_from_slice(&game_id.0);
+        buf.extend_from_slice(&self.terms_bytes());
         buf
     }
 
@@ -332,6 +348,11 @@ impl GameSetupV1 {
 
 impl ComposableState for GameSetupV1 {
     type ParentState = ChessGameStateV1;
+    /// "Do you have it?" is sufficient here, and only here, because a valid
+    /// setup is *unique*: the game id is a digest of every term and is fixed in
+    /// the contract parameters, so two peers that each hold a verified setup
+    /// necessarily hold the same one. Every other field in this crate needs a
+    /// summary as fine as its merge order — see [`derive_game_id`](GameSetup::derive_game_id).
     type Summary = bool;
     type Delta = SignedGameSetup;
     type Parameters = ChessGameParametersV1;

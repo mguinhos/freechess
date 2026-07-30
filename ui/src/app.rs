@@ -14,6 +14,7 @@ use crate::freenet;
 use crate::identity::{now_ms, Account};
 use chess_core::certificate::CertificateDraft;
 use chess_core::chess::{Color, Move};
+use chess_core::game::clocks::ClockAttestation;
 use chess_core::game::conclusion::{ConclusionV1, SignedConclusion};
 use chess_core::game::moves::AuthorizedMove;
 use chess_core::game::opponent::SignedJoin;
@@ -157,6 +158,16 @@ pub enum Cmd {
         mv: Move,
     },
     Resign(GameId),
+    /// Sign the time I see in a game I am playing.
+    ///
+    /// This is what makes timeouts provable at all: a contract has no clock, so
+    /// the only trustworthy evidence that time passed is a signature from the
+    /// player it counts against. Stopping is how a player forfeits by absence,
+    /// so a client that is playing must keep this going — see
+    /// [`chess_core::game::clocks`].
+    AttestClock(GameId),
+    /// Claim the opponent's clock ran out.
+    ClaimTimeout(GameId),
     /// Publish my nickname to my profile contract and the ranking.
     SetNickname(String),
     /// Heartbeat, optionally announcing the game being watched.
@@ -295,6 +306,7 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
                         // contract arrives on this same channel. Reporting it as
                         // a dead node hides the real error behind "check that
                         // the node is running", which is what it did before.
+                        sync_log(&format!("host error: {e}"));
                         state.with_mut(|s| s.message = Some(e));
                     }
                     None => break,
@@ -524,7 +536,7 @@ async fn handle_cmd(
 
             let instance = freenet::game_instance(creator, game_id)?;
             let delta = chess_core::game::ChessGameStateV1Delta {
-                conclusion: Some(conclusion.clone()),
+                conclusion: Some(vec![conclusion.clone()]),
                 ..Default::default()
             };
             api.send(freenet::update_request(
@@ -535,12 +547,96 @@ async fn handle_cmd(
             .map_err(|e| format!("could not resign: {e}"))?;
 
             let mut updated = game.clone();
-            updated.conclusion = ConclusionV1(Some(conclusion));
+            updated.conclusion = ConclusionV1::single(conclusion);
             publish_snapshot(api, key, game_id, &updated, now).await?;
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
             certify_and_file(api, state, key, game_id, &updated, my_rating, now).await
+        }
+
+        Cmd::AttestClock(game_id) => {
+            let (creator, game) = state
+                .with(|s| {
+                    s.creators
+                        .get(&game_id)
+                        .copied()
+                        .zip(s.games.get(&game_id).cloned())
+                })
+                .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            // Only a player's attestation counts, and only while the game is
+            // still running. A spectator's would be pruned on arrival.
+            if game.color_of(&key.verifying_key()).is_none() || game.result().is_over() {
+                return Ok(());
+            }
+
+            let attestation = ClockAttestation::new(key, &game_id, now);
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                clocks: Some(vec![attestation.clone()]),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not publish the clock attestation: {e}"))?;
+
+            state.with_mut(|s| {
+                if let Some(g) = s.games.get_mut(&game_id) {
+                    g.clocks
+                        .attestations
+                        .insert(attestation.player_id(), attestation);
+                }
+            });
+            Ok(())
+        }
+
+        Cmd::ClaimTimeout(game_id) => {
+            let (creator, game) = state
+                .with(|s| {
+                    s.creators
+                        .get(&game_id)
+                        .copied()
+                        .zip(s.games.get(&game_id).cloned())
+                })
+                .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            let my_color = game
+                .color_of(&key.verifying_key())
+                .ok_or_else(|| "you are not playing in that game".to_string())?;
+            let at_ply = game.moves.move_list().len() as u32;
+            // The deadline is derived from the opponent's own attestations, so
+            // the client can name it exactly rather than asserting a time.
+            let provable = game
+                .timeout_provable_at(my_color.opposite(), at_ply)
+                .ok_or_else(|| "your opponent's clock is not running".to_string())?;
+            if now < provable {
+                return Err("your opponent still has time".to_string());
+            }
+
+            let conclusion = SignedConclusion::claim_timeout(key, &game_id, at_ply, provable);
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                conclusion: Some(vec![conclusion.clone()]),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not claim the timeout: {e}"))?;
+
+            let mut updated = game.clone();
+            updated.conclusion = ConclusionV1::single(conclusion);
+            publish_snapshot(api, key, game_id, &updated, provable).await?;
+            state.with_mut(|s| {
+                s.games.insert(game_id, updated.clone());
+            });
+            certify_and_file(api, state, key, game_id, &updated, my_rating, provable).await
         }
 
         Cmd::SetNickname(nickname) => {
@@ -809,6 +905,11 @@ fn handle_response(
 
     let (id, payload) = match contract_response {
         ContractResponse::GetResponse { key, state, .. } => {
+            sync_log(&format!(
+                "GetResponse {} ({} bytes)",
+                key.id(),
+                state.as_ref().len()
+            ));
             (*key.id(), Payload::Full(state.as_ref().to_vec()))
         }
         ContractResponse::UpdateNotification { key, update } => {
@@ -819,32 +920,60 @@ fn handle_response(
                 UpdateData::State(s) => Payload::Full(s.as_ref().to_vec()),
                 UpdateData::StateAndDelta { state, .. } => Payload::Full(state.as_ref().to_vec()),
                 UpdateData::Delta(d) => Payload::Delta(d.as_ref().to_vec()),
-                _ => return None,
+                _ => {
+                    sync_log(&format!(
+                        "DROP UpdateNotification {}: unknown UpdateData variant",
+                        key.id()
+                    ));
+                    return None;
+                }
             };
+            sync_log(&format!(
+                "UpdateNotification {} ({})",
+                key.id(),
+                match &payload {
+                    Payload::Full(b) => format!("full state, {} bytes", b.len()),
+                    Payload::Delta(b) => format!("delta, {} bytes", b.len()),
+                }
+            ));
             (*key.id(), payload)
         }
-        _ => return None,
+        other => {
+            sync_log(&format!(
+                "contract response (not routed): {}",
+                match other {
+                    ContractResponse::PutResponse { .. } => "PutResponse",
+                    ContractResponse::UpdateResponse { .. } => "UpdateResponse",
+                    ContractResponse::SubscribeResponse { .. } => "SubscribeResponse",
+                    _ => "other",
+                }
+            ));
+            return None;
+        }
     };
 
     match instances.get(&id) {
         Some(Subject::Lobby) => {
             let params = LobbyParametersV1::default();
             state.with_mut(|s| match &payload {
-                Payload::Full(bytes) => {
-                    if let Ok(lobby) = freenet::decode::<LobbyStateV1>(bytes) {
-                        s.lobby = lobby;
-                    }
-                }
+                Payload::Full(bytes) => match freenet::decode::<LobbyStateV1>(bytes) {
+                    Ok(lobby) => s.lobby = lobby,
+                    Err(e) => sync_log(&format!("DROP lobby full state: decode failed: {e}")),
+                },
                 Payload::Delta(bytes) => {
-                    if let Ok(delta) =
-                        freenet::decode::<chess_core::lobby::LobbyStateV1Delta>(bytes)
-                    {
-                        let base = s.lobby.clone();
-                        // Apply through the contract's own merge, so the client
-                        // converges by exactly the rules the network enforces.
-                        if s.lobby.apply_delta(&base, &params, &Some(delta)).is_ok() {
-                            let _ = s.lobby.prune(&params);
+                    match freenet::decode::<chess_core::lobby::LobbyStateV1Delta>(bytes) {
+                        Ok(delta) => {
+                            let base = s.lobby.clone();
+                            // Apply through the contract's own merge, so the client
+                            // converges by exactly the rules the network enforces.
+                            match s.lobby.apply_delta(&base, &params, &Some(delta)) {
+                                Ok(()) => {
+                                    let _ = s.lobby.prune(&params);
+                                }
+                                Err(e) => sync_log(&format!("DROP lobby delta: apply failed: {e}")),
+                            }
                         }
+                        Err(e) => sync_log(&format!("DROP lobby delta: decode failed: {e}")),
                     }
                 }
             });
@@ -855,29 +984,51 @@ fn handle_response(
             // The contract is now in the local store, so a deferred join can go.
             let resume_join = state.with(|s| s.pending_join == Some(game_id));
             state.with_mut(|s| match &payload {
-                Payload::Full(bytes) => {
-                    if let Ok(game) = freenet::decode::<ChessGameStateV1>(bytes) {
+                Payload::Full(bytes) => match freenet::decode::<ChessGameStateV1>(bytes) {
+                    Ok(game) => {
+                        sync_log(&format!(
+                            "game {game_id}: applied full state, {} plies",
+                            game.moves.moves.len()
+                        ));
                         if let Some(setup) = game.setup.get() {
                             s.creators.insert(game_id, setup.creator);
                         }
                         s.games.insert(game_id, game);
                     }
-                }
+                    Err(e) => sync_log(&format!(
+                        "DROP game {game_id} full state: decode failed: {e}"
+                    )),
+                },
                 Payload::Delta(bytes) => {
-                    let Ok(delta) =
-                        freenet::decode::<chess_core::game::ChessGameStateV1Delta>(bytes)
-                    else {
-                        return;
-                    };
+                    let delta =
+                        match freenet::decode::<chess_core::game::ChessGameStateV1Delta>(bytes) {
+                            Ok(delta) => delta,
+                            Err(e) => {
+                                sync_log(&format!("DROP game {game_id} delta: decode failed: {e}"));
+                                return;
+                            }
+                        };
                     let Some(creator) = s.creators.get(&game_id).copied() else {
+                        sync_log(&format!(
+                            "DROP game {game_id} delta: creator unknown, cannot build params"
+                        ));
                         return;
                     };
                     let params = chess_core::game::ChessGameParametersV1 { creator, game_id };
                     let mut game = s.games.get(&game_id).cloned().unwrap_or_default();
                     let base = game.clone();
-                    if game.apply_delta(&base, &params, &Some(delta)).is_ok() {
-                        let _ = game.prune(&params);
-                        s.games.insert(game_id, game);
+                    match game.apply_delta(&base, &params, &Some(delta)) {
+                        Ok(()) => {
+                            let _ = game.prune(&params);
+                            sync_log(&format!(
+                                "game {game_id}: applied delta, now {} plies",
+                                game.moves.moves.len()
+                            ));
+                            s.games.insert(game_id, game);
+                        }
+                        Err(e) => {
+                            sync_log(&format!("DROP game {game_id} delta: apply failed: {e}"))
+                        }
                     }
                 }
             });
@@ -886,10 +1037,21 @@ fn handle_response(
             }
         }
 
-        Some(Subject::Profile(_)) | None => {}
+        Some(Subject::Profile(_)) => {}
+        None => {
+            sync_log(&format!(
+                "DROP response for {id}: instance not in the routing map"
+            ));
+        }
     }
 
     None
+}
+
+/// Instrumentation for the notification path: everything the node sends and
+/// everything we drop, tagged for filtering in the browser console.
+fn sync_log(msg: &str) {
+    web_sys::console::log_1(&format!("[freechess-sync] {msg}").into());
 }
 
 /// Fold the delegate's answer into state.

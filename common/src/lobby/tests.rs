@@ -4,7 +4,9 @@ use super::*;
 use crate::game::opponent::SignedJoin;
 use crate::game::WinReason;
 use crate::leaderboard::{LeaderboardV1, RankEntry};
-use crate::presence::{PresenceStatus, SignedPresence, AWAY_WINDOW_MS, ONLINE_WINDOW_MS};
+use crate::presence::{
+    PresenceStatus, SignedPresence, AWAY_WINDOW_MS, MAX_PRESENCE_ENTRIES, ONLINE_WINDOW_MS,
+};
 use crate::testutil::{certified_game, key, open_game, T0};
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
@@ -574,4 +576,289 @@ fn the_global_cap_is_idempotent_and_independent_of_arrival_order() {
     let once = forwards.games.games.clone();
     forwards.prune(&params()).unwrap();
     assert_eq!(forwards.games.games, once, "prune is not idempotent");
+}
+
+// ------------------------------------------------- summaries vs merge order
+
+#[test]
+fn presence_entries_differing_only_below_the_summary_still_exchange() {
+    // `absorb` settles a tie on `updated_at` by signature bytes, but the
+    // summary carried only `updated_at`. Two peers holding different heartbeats
+    // stamped the same millisecond therefore reported identical summaries,
+    // neither shipped a delta, and the tiebreak was unreachable.
+    let player = key();
+    let a =
+        SignedPresence::watching_game(&player, "one".to_string(), PresenceStatus::Online, None, T0);
+    let b =
+        SignedPresence::watching_game(&player, "two".to_string(), PresenceStatus::Online, None, T0);
+    assert_ne!(a.signature, b.signature, "test premise: distinct entries");
+
+    // Which of the two wins depends on random signature bytes, so sync both
+    // directions and assert the property that matters: they end up agreeing.
+    let winner = if a.signature.to_bytes() > b.signature.to_bytes() {
+        a.clone()
+    } else {
+        b.clone()
+    };
+
+    let mut peer1 = LobbyStateV1::default();
+    peer1.presence.players.insert(a.player_id(), a);
+    let mut peer2 = LobbyStateV1::default();
+    peer2.presence.players.insert(b.player_id(), b);
+
+    for _ in 0..2 {
+        let s1 = peer1.presence.summarize(&peer1, &params());
+        if let Some(d) = peer2.presence.delta(&peer2, &params(), &s1) {
+            peer1
+                .presence
+                .apply_delta(&peer1.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.presence.summarize(&peer2, &params());
+        if let Some(d) = peer1.presence.delta(&peer1, &params(), &s2) {
+            peer2
+                .presence
+                .apply_delta(&peer2.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.presence, peer2.presence);
+    assert_eq!(
+        peer1.presence.players.get(&winner.player_id()),
+        Some(&winner),
+        "and settle on the entry the total order picks"
+    );
+}
+
+#[test]
+fn rank_entries_with_equal_games_played_still_exchange() {
+    // `order_key` is (games_played, updated_at, signature) but the summary was
+    // games_played alone, so a later entry with the same count never shipped.
+    let player = key();
+    let other = key();
+    let (cert, _) = certified_game(&player, &other, T0, 1200, 1200);
+
+    // The rating has to follow from the cited game, so both entries carry the
+    // same (correct) one and differ only in `updated_at` — a field the old
+    // summary did not carry.
+    let me = PlayerId::from(&player.verifying_key());
+    let games_played = 4u32;
+    let rating = crate::elo::apply_result(
+        1200,
+        games_played - 1,
+        cert.opponent_rating_for(me).expect("player is in the game"),
+        cert.score_for(me).expect("game has a result"),
+    );
+    let stale = RankEntry::new(
+        &player,
+        "me".to_string(),
+        rating,
+        games_played,
+        cert.clone(),
+        T0 + 1_000,
+    );
+    let fresh = RankEntry::new(
+        &player,
+        "me".to_string(),
+        rating,
+        games_played,
+        cert,
+        T0 + 9_000,
+    );
+
+    let mut peer1 = LobbyStateV1::default();
+    peer1.leaderboard.entries.insert(stale.player_id(), stale);
+    let peer2 = {
+        let mut s = LobbyStateV1::default();
+        s.leaderboard.entries.insert(fresh.player_id(), fresh);
+        s
+    };
+
+    let summary = peer1.leaderboard.summarize(&peer1, &params());
+    let delta = peer2
+        .leaderboard
+        .delta(&peer2, &params(), &summary)
+        .expect("the later entry must ship");
+    peer1
+        .leaderboard
+        .apply_delta(&peer1.clone(), &params(), &Some(delta))
+        .unwrap();
+
+    assert_eq!(peer1.leaderboard, peer2.leaderboard);
+}
+
+#[test]
+fn snapshots_at_the_same_ply_still_exchange() {
+    // The summary's "revision" was `ply + 1 + opponent.is_some()`, but
+    // `SignedSnapshot::order_key` is (ply, updated_at, signature). Two peers
+    // holding different snapshots of the same ply — both players publishing
+    // after the same move, which is the normal case — had equal revisions, so
+    // neither shipped and the two lobbies showed different clocks for ever.
+    let creator = key();
+    let challenger = key();
+    let base = matched_listing(&creator, &challenger, T0);
+    let game_id = base.game_id;
+
+    let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1".to_string();
+    let mut peer1 = lobby_with(vec![{
+        let mut e = base.clone();
+        e.snapshot = Some(SignedSnapshot::new(
+            &creator,
+            &game_id,
+            fen.clone(),
+            1,
+            GameResult::InProgress,
+            599_000,
+            600_000,
+            T0 + 2_000,
+        ));
+        e
+    }]);
+    let mut peer2 = lobby_with(vec![{
+        let mut e = base.clone();
+        e.snapshot = Some(SignedSnapshot::new(
+            &challenger,
+            &game_id,
+            fen,
+            1,
+            GameResult::InProgress,
+            598_000,
+            600_000,
+            T0 + 8_000,
+        ));
+        e
+    }]);
+    assert_ne!(peer1.games, peer2.games, "test premise: they differ");
+
+    for _ in 0..2 {
+        let s1 = peer1.games.summarize(&peer1, &params());
+        if let Some(d) = peer2.games.delta(&peer2, &params(), &s1) {
+            peer1
+                .games
+                .apply_delta(&peer1.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.games.summarize(&peer2, &params());
+        if let Some(d) = peer1.games.delta(&peer1, &params(), &s2) {
+            peer2
+                .games
+                .apply_delta(&peer2.clone(), &params(), &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.games, peer2.games);
+    // The later snapshot is the one they agree on.
+    assert_eq!(
+        peer1
+            .games
+            .games
+            .get(&game_id)
+            .and_then(|e| e.snapshot.as_ref())
+            .map(|s| s.updated_at),
+        Some(T0 + 8_000)
+    );
+}
+
+// ------------------------------------------------- summary size and bytes
+
+/// Encode with the same codec the contract's `summarize_state` uses.
+fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).expect("summary encodes");
+    buf
+}
+
+fn lobby_at_presence_cap() -> LobbyStateV1 {
+    let mut state = LobbyStateV1::default();
+    for i in 0..MAX_PRESENCE_ENTRIES {
+        let k = key();
+        let p = SignedPresence::watching_game(
+            &k,
+            format!("player{i}"),
+            PresenceStatus::Online,
+            None,
+            T0 + i as i64,
+        );
+        state.presence.players.insert(p.player_id(), p);
+    }
+    state
+}
+
+#[test]
+fn the_presence_summary_stays_delta_efficient_at_the_cap() {
+    // A summary exists so peers can detect divergence *without* shipping state,
+    // and it rides both directions on every anti-entropy round. freenet-core's
+    // own heuristic for whether that is worth it is `summary * 2 < state`.
+    // Carrying raw 64-byte signatures put this at 82KB against a 107KB state,
+    // which fails outright; a digest of the same bytes distinguishes just as
+    // much for a quarter of the size.
+    let state = lobby_at_presence_cap();
+    let summary = encoded(&state.presence.summarize(&state, &params()));
+    let full = encoded(&state.presence);
+    assert!(
+        summary.len() * 2 < full.len(),
+        "presence summary is {} bytes against a {} byte state; a summary that big \
+         is not worth sending",
+        summary.len(),
+        full.len()
+    );
+}
+
+#[test]
+fn summaries_are_byte_identical_regardless_of_insertion_order() {
+    // freenet-core decides a peer is stale by *byte-comparing* the output of
+    // `summarize_state`. A collection with non-deterministic iteration order
+    // (a `HashMap`, or an unsorted `Vec`) therefore makes two fully converged
+    // peers look permanently out of sync, and each ~5-minute heartbeat fires a
+    // pointless full-state heal. This guards every summary the lobby emits.
+    let creator = key();
+    let challenger = key();
+    let entries: Vec<LobbyEntry> = (0..12)
+        .map(|i| {
+            if i % 2 == 0 {
+                listing(&creator, T0 + i * 1000)
+            } else {
+                matched_listing(&creator, &challenger, T0 + i * 1000)
+            }
+        })
+        .collect();
+    let presences: Vec<SignedPresence> = (0..12)
+        .map(|i| {
+            SignedPresence::watching_game(
+                &key(),
+                format!("p{i}"),
+                PresenceStatus::Online,
+                None,
+                T0 + i,
+            )
+        })
+        .collect();
+
+    let build = |reversed: bool| {
+        let mut state = LobbyStateV1::default();
+        let mut entries = entries.clone();
+        let mut presences = presences.clone();
+        if reversed {
+            entries.reverse();
+            presences.reverse();
+        }
+        for e in entries {
+            state.games.games.insert(e.game_id, e);
+        }
+        for p in presences {
+            state.presence.players.insert(p.player_id(), p);
+        }
+        state
+    };
+
+    let forwards = build(false);
+    let backwards = build(true);
+    assert_eq!(forwards, backwards, "the two states must be the same state");
+    assert_eq!(
+        encoded(&forwards.summarize(&forwards, &params())),
+        encoded(&backwards.summarize(&backwards, &params())),
+        "the same logical state must summarize to the same bytes"
+    );
 }

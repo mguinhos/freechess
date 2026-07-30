@@ -7,7 +7,8 @@
 //! 2. **Convergence** — merging in any order, any number of times, reaches the
 //!    same state (the idempotent commutative monoid the platform requires).
 
-use super::conclusion::{ConclusionKind, SignedConclusion};
+use super::clocks::{self, ClockAttestation};
+use super::conclusion::{self, SignedConclusion};
 use super::moves::AuthorizedMove;
 use super::opponent::SignedJoin;
 use super::setup::{leading_zero_bits, GameSetup, TimeControl, POW_DIFFICULTY_BITS};
@@ -179,13 +180,28 @@ fn tampering_with_any_signed_setup_field_breaks_verification() {
 #[test]
 fn absurd_time_controls_are_rejected() {
     let creator = key();
-    let (mut state, params) = open_game(&creator, Color::White);
-    let mut s = state.setup.0.clone().unwrap();
-    s.setup.time_control.initial_secs = 1; // below the floor
-                                           // Re-derive and re-sign so only the bounds check can fail it.
-    let game_id = s.setup.derive_game_id(&creator.verifying_key());
-    let params = ChessGameParametersV1 { game_id, ..params };
-    state.setup = setup::GameSetupV1(Some(s.setup.clone().sign(&creator, &game_id)));
+    // Mine the absurd terms rather than patching them in afterwards: the game id
+    // covers every term, so editing one invalidates the proof-of-work and the
+    // bounds check would never be reached.
+    let setup = GameSetup::mine(
+        &creator.verifying_key(),
+        Color::White,
+        TimeControl {
+            initial_secs: 1, // below the floor
+            increment_secs: 0,
+        },
+        T0,
+        "creator".to_string(),
+    );
+    let game_id = setup.derive_game_id(&creator.verifying_key());
+    let params = ChessGameParametersV1 {
+        creator: creator.verifying_key(),
+        game_id,
+    };
+    let state = ChessGameStateV1 {
+        setup: setup::GameSetupV1(Some(setup.sign(&creator, &game_id))),
+        ..Default::default()
+    };
     let err = state.verify(&state, &params).expect_err("must reject");
     assert!(err.contains("initial time"), "unexpected error: {err}");
 }
@@ -660,7 +676,7 @@ fn resignation_hands_the_win_to_the_opponent() {
 
     // Creator plays White and resigns.
     let c = SignedConclusion::resign(&creator, &params.game_id, 1, T0 + 5000);
-    state.conclusion = conclusion::ConclusionV1(Some(c));
+    state.conclusion = conclusion::ConclusionV1::single(c);
 
     state.verify(&state, &params).expect("resignation is valid");
     assert_eq!(
@@ -677,7 +693,7 @@ fn an_outsider_cannot_resign_someone_elses_game() {
     let (mut state, params) = started_game(&creator, &opponent);
 
     let c = SignedConclusion::resign(&outsider, &params.game_id, 0, T0 + 5000);
-    state.conclusion = conclusion::ConclusionV1(Some(c));
+    state.conclusion = conclusion::ConclusionV1::single(c);
 
     let err = state.verify(&state, &params).expect_err("must reject");
     assert!(err.contains("not a player in this game"), "got: {err}");
@@ -692,25 +708,25 @@ fn a_draw_needs_both_signatures() {
 
     // Genuine agreement verifies.
     let good = SignedConclusion::draw_agreement(&creator, &opponent, &params.game_id, 0, T0 + 5000);
-    state.conclusion = conclusion::ConclusionV1(Some(good));
+    state.conclusion = conclusion::ConclusionV1::single(good);
     state.verify(&state, &params).expect("agreed draw is valid");
     assert_eq!(state.result(), GameResult::Draw(DrawReason::Agreement));
 
     // A "draw" one player signed twice is not an agreement.
     let forged =
         SignedConclusion::draw_agreement(&creator, &creator, &params.game_id, 0, T0 + 5000);
-    state.conclusion = conclusion::ConclusionV1(Some(forged));
+    state.conclusion = conclusion::ConclusionV1::single(forged);
     assert!(state.verify(&state, &params).is_err());
 
     // Nor is one countersigned by a bystander.
     let forged =
         SignedConclusion::draw_agreement(&creator, &outsider, &params.game_id, 0, T0 + 5000);
-    state.conclusion = conclusion::ConclusionV1(Some(forged));
+    state.conclusion = conclusion::ConclusionV1::single(forged);
     assert!(state.verify(&state, &params).is_err());
 }
 
 #[test]
-fn a_timeout_cannot_be_claimed_early_but_can_be_claimed_late() {
+fn a_timeout_holds_once_the_loser_attested_their_way_to_flag_fall() {
     let creator = key();
     let opponent = key();
     let (mut state, params) = started_game(&creator, &opponent);
@@ -718,21 +734,22 @@ fn a_timeout_cannot_be_claimed_early_but_can_be_claimed_late() {
     push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
 
     let budget_ms = TimeControl::default().initial_secs as i64 * 1000;
+    let flag_fall = T0 + 2000 + budget_ms;
 
-    // One second in: nowhere near flag fall.
+    // Nowhere near flag fall, and nothing corroborates the claim.
     let early = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, T0 + 3000);
-    state.conclusion = conclusion::ConclusionV1(Some(early));
-    let err = state.verify(&state, &params).expect_err("must reject");
-    assert!(err.contains("too early"), "got: {err}");
+    state.conclusion = conclusion::ConclusionV1::single(early);
+    state.verify(&state, &params).expect("authentic claim");
+    assert!(!state.result().is_over(), "an early claim must be inert");
 
-    // Well past the budget: the claim stands.
-    let late = SignedConclusion::claim_timeout(
-        &creator,
-        &params.game_id,
-        1,
-        T0 + 2000 + budget_ms + 60_000,
+    // Black keeps signing right up to the moment their clock hits zero, which
+    // is exactly the evidence that makes the flag fall provable.
+    state.clocks.attestations.insert(
+        PlayerId::from(&opponent.verifying_key()),
+        ClockAttestation::new(&opponent, &params.game_id, flag_fall),
     );
-    state.conclusion = conclusion::ConclusionV1(Some(late));
+    let claim = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, flag_fall);
+    state.conclusion = conclusion::ConclusionV1::single(claim);
     state.verify(&state, &params).expect("timeout is provable");
     assert_eq!(state.result(), GameResult::WhiteWins(WinReason::Timeout));
 }
@@ -743,13 +760,21 @@ fn a_player_cannot_claim_a_timeout_against_a_clock_that_is_not_running() {
     let opponent = key();
     let (mut state, params) = started_game(&creator, &opponent);
     // No moves yet: it is White's (the creator's) turn, so White cannot claim
-    // that Black flagged.
+    // that Black flagged, however much evidence Black has signed.
     let budget_ms = TimeControl::default().initial_secs as i64 * 1000;
+    state.clocks.attestations.insert(
+        PlayerId::from(&opponent.verifying_key()),
+        ClockAttestation::new(&opponent, &params.game_id, T0 + budget_ms + 60_000),
+    );
     let claim =
         SignedConclusion::claim_timeout(&creator, &params.game_id, 0, T0 + budget_ms + 60_000);
-    state.conclusion = conclusion::ConclusionV1(Some(claim));
-    let err = state.verify(&state, &params).expect_err("must reject");
-    assert!(err.contains("too early"), "got: {err}");
+    state.conclusion = conclusion::ConclusionV1::single(claim);
+    state.verify(&state, &params).expect("authentic claim");
+    assert!(
+        !state.result().is_over(),
+        "Black's clock is not running, so the claim cannot hold"
+    );
+    assert_eq!(state.timeout_provable_at(Color::Black, 0), None);
 }
 
 #[test]
@@ -764,26 +789,219 @@ fn concurrent_conclusions_converge() {
     let mut peer1 = base.clone();
     peer1
         .conclusion
-        .apply_delta(&base, &params, &Some(a.clone()))
+        .apply_delta(&base, &params, &Some(vec![a.clone()]))
         .unwrap();
     peer1
         .conclusion
-        .apply_delta(&base, &params, &Some(b.clone()))
+        .apply_delta(&base, &params, &Some(vec![b.clone()]))
         .unwrap();
 
     let mut peer2 = base.clone();
     peer2
         .conclusion
-        .apply_delta(&base, &params, &Some(b))
+        .apply_delta(&base, &params, &Some(vec![b]))
         .unwrap();
     peer2
         .conclusion
-        .apply_delta(&base, &params, &Some(a))
+        .apply_delta(&base, &params, &Some(vec![a]))
         .unwrap();
 
     assert_eq!(peer1.conclusion, peer2.conclusion);
     // Earliest claim wins the total order.
-    assert_eq!(peer1.conclusion.get().unwrap().at, T0 + 5000);
+    assert_eq!(peer1.conclusion.effective(&peer1).unwrap().at, T0 + 5000);
+}
+
+#[test]
+fn two_peers_holding_different_conclusions_exchange_them() {
+    // The summary used to be a bare `bool`, so both peers reported "I have a
+    // conclusion", neither shipped a delta, and the total order that settles
+    // them was unreachable — a permanent divergence on the game's result.
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let mut peer1 = base.clone();
+    peer1.conclusion = conclusion::ConclusionV1::single(SignedConclusion::resign(
+        &creator,
+        &params.game_id,
+        0,
+        T0 + 6000,
+    ));
+    let mut peer2 = base.clone();
+    peer2.conclusion = conclusion::ConclusionV1::single(SignedConclusion::resign(
+        &opponent,
+        &params.game_id,
+        0,
+        T0 + 5000,
+    ));
+
+    let summary = peer1.summarize(&peer1, &params);
+    let delta = peer2
+        .delta(&peer2, &params, &summary)
+        .expect("peer2 holds a claim peer1 does not");
+    peer1.apply_delta(&base, &params, &Some(delta)).unwrap();
+
+    // Both claims are now present and the earlier one decides the game.
+    assert_eq!(peer1.conclusion.claims.len(), 2);
+    assert_eq!(peer1.conclusion.effective(&peer1).unwrap().at, T0 + 5000);
+    assert_eq!(
+        peer1.result(),
+        GameResult::WhiteWins(WinReason::Resignation)
+    );
+}
+
+#[test]
+fn an_inert_timeout_claim_cannot_bury_a_real_resignation() {
+    // With one slot and an earliest-wins order, a bogus timeout dated at the
+    // epoch would occupy it forever and hang the game.
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
+
+    let bogus = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, 1);
+    let real = SignedConclusion::resign(&opponent, &params.game_id, 1, T0 + 5000);
+    state
+        .conclusion
+        .apply_delta(&state.clone(), &params, &Some(vec![bogus, real]))
+        .unwrap();
+
+    state.verify(&state, &params).expect("both are authentic");
+    assert_eq!(
+        state.result(),
+        GameResult::WhiteWins(WinReason::Resignation)
+    );
+}
+
+#[test]
+fn a_present_players_next_attestation_strips_a_pre_signed_absence_claim() {
+    // An absence claim can be pre-signed, so it can briefly hold against a
+    // player who is really there. Their next tick must void it permanently.
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
+
+    // Black last attested at T0+3000, so absence matures 45s later.
+    let last_tick = T0 + 3000;
+    let insert = |state: &mut ChessGameStateV1, at: i64| {
+        state.clocks.attestations.insert(
+            PlayerId::from(&opponent.verifying_key()),
+            ClockAttestation::new(&opponent, &params.game_id, at),
+        );
+    };
+    insert(&mut state, last_tick);
+
+    let deadline = last_tick + clocks::ABSENCE_FORFEIT_MS;
+    assert_eq!(state.timeout_provable_at(Color::Black, 1), Some(deadline));
+
+    let claim = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, deadline);
+    state.conclusion = conclusion::ConclusionV1::single(claim);
+    assert_eq!(state.result(), GameResult::WhiteWins(WinReason::Timeout));
+
+    // Black was at the board all along and ticks again. The deadline moves past
+    // the claim, which is now inert — and stays inert, because attested time
+    // only ever advances.
+    insert(&mut state, last_tick + clocks::CLOCK_TICK_MS);
+    state.verify(&state, &params).expect("still authentic");
+    assert!(
+        !state.result().is_over(),
+        "a live opponent's own signature must defeat the claim"
+    );
+}
+
+#[test]
+fn a_player_who_stops_attesting_forfeits_without_burning_their_whole_clock() {
+    // The common real timeout: the opponent closes the tab. Waiting out ten
+    // minutes of their clock is not required, because their signatures stopped.
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
+
+    let vanished_at = T0 + 3000;
+    state.clocks.attestations.insert(
+        PlayerId::from(&opponent.verifying_key()),
+        ClockAttestation::new(&opponent, &params.game_id, vanished_at),
+    );
+
+    let deadline = vanished_at + clocks::ABSENCE_FORFEIT_MS;
+    let claim = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, deadline);
+    state.conclusion = conclusion::ConclusionV1::single(claim);
+    state.verify(&state, &params).unwrap();
+    assert_eq!(state.result(), GameResult::WhiteWins(WinReason::Timeout));
+
+    // Well short of the ten-minute budget.
+    assert!(deadline < T0 + 2000 + 600_000);
+}
+
+#[test]
+fn a_stale_timeout_claim_is_inert() {
+    // `at` is pinned to the instant the claim matured, so a claim cannot carry
+    // an arbitrary finish time into a certificate or the archive's ordering.
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
+    state.clocks.attestations.insert(
+        PlayerId::from(&opponent.verifying_key()),
+        ClockAttestation::new(&opponent, &params.game_id, T0 + 3000),
+    );
+
+    let deadline = state.timeout_provable_at(Color::Black, 1).unwrap();
+    let stale = SignedConclusion::claim_timeout(
+        &creator,
+        &params.game_id,
+        1,
+        deadline + conclusion::TIMEOUT_CLAIM_WINDOW_MS + 1,
+    );
+    state.conclusion = conclusion::ConclusionV1::single(stale);
+    assert!(!state.result().is_over());
+}
+
+#[test]
+fn an_attestation_from_a_bystander_is_pruned_and_rejected() {
+    let creator = key();
+    let opponent = key();
+    let outsider = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+
+    state.clocks.attestations.insert(
+        PlayerId::from(&outsider.verifying_key()),
+        ClockAttestation::new(&outsider, &params.game_id, T0 + 3000),
+    );
+    let err = state.verify(&state, &params).expect_err("must reject");
+    assert!(err.contains("not a player"), "got: {err}");
+
+    state.prune(&params).unwrap();
+    assert!(state.clocks.attestations.is_empty());
+}
+
+#[test]
+fn attestations_converge_on_the_latest_regardless_of_arrival_order() {
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let early = ClockAttestation::new(&opponent, &params.game_id, T0 + 3000);
+    let late = ClockAttestation::new(&opponent, &params.game_id, T0 + 9000);
+
+    let mut peer1 = base.clone();
+    peer1
+        .clocks
+        .apply_delta(&base, &params, &Some(vec![early.clone(), late.clone()]))
+        .unwrap();
+    let mut peer2 = base.clone();
+    peer2
+        .clocks
+        .apply_delta(&base, &params, &Some(vec![late, early]))
+        .unwrap();
+
+    assert_eq!(peer1.clocks, peer2.clocks);
+    assert_eq!(
+        peer1.clocks.attested_at(&opponent.verifying_key()),
+        Some(T0 + 9000)
+    );
 }
 
 // ------------------------------------------------------------------- clocks
@@ -909,7 +1127,7 @@ fn checkmate_on_the_board_ends_the_game_without_any_signed_conclusion() {
 
     state.verify(&state, &params).unwrap();
     assert_eq!(state.result(), GameResult::BlackWins(WinReason::Checkmate));
-    assert!(state.conclusion.get().is_none());
+    assert!(state.conclusion.is_empty());
 }
 
 #[test]
@@ -940,4 +1158,550 @@ fn colors_follow_the_creators_choice() {
         Some(Color::White)
     );
     assert_eq!(state.key_for_ply(0), Some(opponent.verifying_key()));
+}
+
+#[test]
+fn a_future_dated_timeout_claim_cannot_steal_a_win() {
+    // A contract has no clock, so nothing in state contradicts a claim stamped
+    // days from now. Without corroboration from the loser's own signatures, any
+    // player can end any game at any ply by claiming their opponent flagged.
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = started_game(&creator, &opponent);
+    push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
+    push_move(&mut state, &params, &opponent, 1, "e7e5", T0 + 3000);
+
+    // White is to move and has spent one second of ten minutes.
+    assert_eq!(state.time_remaining(Color::White, T0 + 3000), 599_000);
+
+    // Black claims White flagged, dating the claim eleven days out.
+    let forged = SignedConclusion::claim_timeout(&opponent, &params.game_id, 2, T0 + 1_000_000_000);
+    state.conclusion = conclusion::ConclusionV1::single(forged);
+
+    assert!(
+        state.verify(&state, &params).is_err() || !state.result().is_over(),
+        "a claim with no corroborating evidence must not end the game; got {:?}",
+        state.result()
+    );
+}
+
+#[test]
+fn the_game_id_pins_every_term_of_the_setup() {
+    // The id is the proof-of-work digest and the contract parameter, and
+    // `apply_delta` is write-once on the strength of "a verified setup is
+    // uniquely determined by the parameters". That only holds if the id covers
+    // every signed term. When it covered just (creator, created_at, nonce), one
+    // creator could sign two valid setups disagreeing on who plays White and
+    // what the clock is, and peers kept whichever landed first — a permanent
+    // divergence on the game's terms.
+    let creator = key();
+    let ck = creator.verifying_key();
+
+    let base = GameSetup::mine(
+        &ck,
+        Color::White,
+        TimeControl::default(),
+        T0,
+        "creator".to_string(),
+    );
+    let game_id = base.derive_game_id(&ck);
+
+    // Same creator, same created_at, same nonce, different terms.
+    let swapped = GameSetup {
+        creator_plays: Color::Black,
+        ..base.clone()
+    };
+    let faster = GameSetup {
+        time_control: TimeControl {
+            initial_secs: 60,
+            increment_secs: 0,
+        },
+        ..base.clone()
+    };
+    let renamed = GameSetup {
+        creator_nickname: "someone else".to_string(),
+        ..base.clone()
+    };
+    let invited = GameSetup {
+        challenged: Some(key().verifying_key()),
+        ..base.clone()
+    };
+
+    for (what, other) in [
+        ("colors", swapped),
+        ("time control", faster),
+        ("nickname", renamed),
+        ("challenge", invited),
+    ] {
+        assert_ne!(
+            other.derive_game_id(&ck),
+            game_id,
+            "{what} must change the game id"
+        );
+
+        // And so the alternative cannot verify under the original parameters.
+        let params = ChessGameParametersV1 {
+            creator: ck,
+            game_id,
+        };
+        let state = ChessGameStateV1 {
+            setup: setup::GameSetupV1(Some(other.clone().sign(&creator, &game_id))),
+            ..Default::default()
+        };
+        assert!(
+            state.verify(&state, &params).is_err(),
+            "a setup differing in {what} must not verify under the original game id"
+        );
+    }
+}
+
+#[test]
+fn two_joins_from_one_key_still_exchange() {
+    // `race_key` is (joined_at, player) but the summary was the player key
+    // alone. One challenger signing two joins at different times therefore left
+    // two peers with matching summaries and different `joined_at` — and
+    // `joined_at` starts the clocks, so the two disagreed about the time
+    // remaining for the rest of the game.
+    let creator = key();
+    let challenger = key();
+    let (base, params) = open_game(&creator, Color::White);
+
+    let early = SignedJoin::new(&challenger, &params.game_id, T0 + 1_000, "c".to_string());
+    let late = SignedJoin::new(&challenger, &params.game_id, T0 + 9_000, "c".to_string());
+
+    let mut peer1 = base.clone();
+    peer1.opponent = opponent::OpponentSlotV1(Some(late));
+    let mut peer2 = base.clone();
+    peer2.opponent = opponent::OpponentSlotV1(Some(early.clone()));
+
+    for _ in 0..2 {
+        let s1 = peer1.opponent.summarize(&peer1, &params);
+        if let Some(d) = peer2.opponent.delta(&peer2, &params, &s1) {
+            peer1
+                .opponent
+                .apply_delta(&peer1.clone(), &params, &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.opponent.summarize(&peer2, &params);
+        if let Some(d) = peer1.opponent.delta(&peer1, &params, &s2) {
+            peer2
+                .opponent
+                .apply_delta(&peer2.clone(), &params, &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.opponent, peer2.opponent);
+    // The earliest join wins the race, so both peers run the same clock.
+    assert_eq!(peer1.opponent.get(), Some(&early));
+}
+
+#[test]
+fn the_merged_state_always_survives_validation() {
+    // The node calls `validate_state` on whatever `update_state` returns and
+    // discards the update if it fails, so `verify` must accept everything the
+    // merge path can produce. This is why a timeout claim's corroboration lives
+    // in `is_effective` and not in `verify`: corroboration depends on the
+    // loser's attestations, which keep arriving, so a claim that was provable
+    // when stored can stop being provable later. Checking that in `verify` would
+    // mean a later, entirely honest attestation delta could no longer be
+    // persisted by any peer holding the earlier claim.
+    let creator = key();
+    let opponent = key();
+    let (state, params) = started_game(&creator, &opponent);
+
+    let mut merged = state.clone();
+    let apply = |merged: &mut ChessGameStateV1, delta: ChessGameStateV1Delta| {
+        let snapshot = merged.clone();
+        merged
+            .apply_delta(&snapshot, &params, &Some(delta))
+            .expect("delta applies");
+        // `post_apply_delta = "prune"` runs here in the generated code.
+        merged.verify(&*merged, &params).expect(
+            "every state the merge path can produce must pass validation, \
+             or the node discards the update and nothing persists",
+        );
+    };
+
+    // A move, then an attestation from each player.
+    apply(
+        &mut merged,
+        ChessGameStateV1Delta {
+            moves: Some(vec![AuthorizedMove::new(
+                &creator,
+                &params.game_id,
+                0,
+                Move::from_uci("e2e4").unwrap(),
+                T0 + 2_000,
+            )]),
+            ..Default::default()
+        },
+    );
+    for k in [&creator, &opponent] {
+        apply(
+            &mut merged,
+            ChessGameStateV1Delta {
+                clocks: Some(vec![ClockAttestation::new(k, &params.game_id, T0 + 3_000)]),
+                ..Default::default()
+            },
+        );
+    }
+
+    // A timeout claim that no evidence supports. It is stored and inert.
+    apply(
+        &mut merged,
+        ChessGameStateV1Delta {
+            conclusion: Some(vec![SignedConclusion::claim_timeout(
+                &creator,
+                &params.game_id,
+                1,
+                T0 + 4_000,
+            )]),
+            ..Default::default()
+        },
+    );
+    assert!(!merged.result().is_over(), "the claim must be inert");
+
+    // Now the loser keeps attesting, which is what strips such a claim. The
+    // state must still validate — this is the case that would break if
+    // corroboration were enforced in `verify`.
+    for tick in 1..=6 {
+        apply(
+            &mut merged,
+            ChessGameStateV1Delta {
+                clocks: Some(vec![ClockAttestation::new(
+                    &opponent,
+                    &params.game_id,
+                    T0 + 3_000 + tick * clocks::CLOCK_TICK_MS,
+                )]),
+                ..Default::default()
+            },
+        );
+    }
+
+    // And a resignation still decides the game despite the inert claim sitting
+    // in the set alongside it.
+    apply(
+        &mut merged,
+        ChessGameStateV1Delta {
+            conclusion: Some(vec![SignedConclusion::resign(
+                &opponent,
+                &params.game_id,
+                1,
+                T0 + 9_000,
+            )]),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        merged.result(),
+        GameResult::WhiteWins(WinReason::Resignation)
+    );
+}
+
+#[test]
+fn two_moves_signed_for_one_ply_still_exchange() {
+    // `absorb` settles a double-signed ply by signature bytes, but the summary
+    // was the ply list alone. Two peers each holding a different move for the
+    // same ply reported identical summaries, neither shipped, and the boards
+    // diverged permanently.
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let one = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("e2e4").unwrap(),
+        T0 + 2_000,
+    );
+    let two = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("d2d4").unwrap(),
+        T0 + 2_000,
+    );
+    let winner = if one.signature.to_bytes() < two.signature.to_bytes() {
+        one.clone()
+    } else {
+        two.clone()
+    };
+
+    let mut peer1 = base.clone();
+    peer1.moves.moves.insert(0, one);
+    let mut peer2 = base.clone();
+    peer2.moves.moves.insert(0, two);
+
+    for _ in 0..2 {
+        let s1 = peer1.moves.summarize(&peer1, &params);
+        if let Some(d) = peer2.moves.delta(&peer2, &params, &s1) {
+            peer1
+                .moves
+                .apply_delta(&peer1.clone(), &params, &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.moves.summarize(&peer2, &params);
+        if let Some(d) = peer1.moves.delta(&peer1, &params, &s2) {
+            peer2
+                .moves
+                .apply_delta(&peer2.clone(), &params, &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.moves, peer2.moves, "both peers must reach one board");
+    assert_eq!(peer1.moves.moves.get(&0), Some(&winner));
+}
+
+// --------------------------------------------------- convergence harness
+
+/// Drives `freenet_scaffold`'s convergence framework over the whole game state.
+///
+/// The platform's requirement on a contract is algebraic: the merge must be
+/// commutative, associative and idempotent, and the whitepaper is explicit that
+/// it "cannot statically verify the algebraic properties; a contract that
+/// violates them will fail to converge". The hand-written tests above each pin
+/// one specific way that could break. This pins the general property, over
+/// permuted orderings of a mixed operation stream, across every field at once —
+/// which is what actually catches an interaction nobody thought to write a test
+/// for.
+#[derive(Clone)]
+struct GameHarness {
+    white: SigningKey,
+    black: SigningKey,
+    state: ChessGameStateV1,
+    params: ChessGameParametersV1,
+    /// A fixed legal line, so ply *n* always carries the same move whatever
+    /// order the operations arrive in.
+    line: Vec<&'static str>,
+    /// Whether to generate move operations. See
+    /// [`the_game_state_merge_is_commutative`] for why the strict commutativity
+    /// run leaves them out.
+    include_moves: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Op {
+    /// Play the move at this ply from the fixed line.
+    PlayPly(usize),
+    /// Attest a clock reading. `who` is 0 for White, 1 for Black.
+    Attest { who: usize, tick: i64 },
+    /// Resign, which is always decisive and so always changes the result.
+    Resign { who: usize, at: i64 },
+}
+
+impl GameHarness {
+    fn new() -> GameHarness {
+        let white = key();
+        let black = key();
+        let (state, params) = started_game(&white, &black);
+        GameHarness {
+            white,
+            black,
+            state,
+            params,
+            line: vec![
+                "e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "d2d3", "d7d6",
+            ],
+            include_moves: true,
+        }
+    }
+
+    fn without_moves() -> GameHarness {
+        GameHarness {
+            include_moves: false,
+            ..GameHarness::new()
+        }
+    }
+
+    fn signer(&self, who: usize) -> &SigningKey {
+        if who == 0 {
+            &self.white
+        } else {
+            &self.black
+        }
+    }
+}
+
+impl freenet_scaffold::convergence::ConvergenceTestHarness for GameHarness {
+    type State = ChessGameStateV1;
+    type Delta = ChessGameStateV1Delta;
+    type Parameters = ChessGameParametersV1;
+    type Operation = Op;
+
+    fn initial_state(&self) -> (Self::State, Self::Parameters) {
+        (self.state.clone(), self.params.clone())
+    }
+
+    fn generate_operation<R: freenet_scaffold::convergence::Rng>(&mut self, rng: &mut R) -> Op {
+        match rng.gen_range(0..10) {
+            0..=4 if self.include_moves => Op::PlayPly(rng.gen_range(0..self.line.len())),
+            0..=4 => Op::Attest {
+                who: rng.gen_range(0..2),
+                tick: rng.gen_range(1..20) as i64,
+            },
+            5..=8 => Op::Attest {
+                who: rng.gen_range(0..2),
+                tick: rng.gen_range(1..20) as i64,
+            },
+            _ => Op::Resign {
+                who: rng.gen_range(0..2),
+                at: T0 + rng.gen_range(1..20) as i64 * 1000,
+            },
+        }
+    }
+
+    fn operation_to_delta(&mut self, _state: &Self::State, op: &Op) -> Self::Delta {
+        match op {
+            Op::PlayPly(ply) => {
+                let signer = self.signer(ply % 2);
+                let mv = Move::from_uci(self.line[*ply]).expect("fixture line is valid uci");
+                ChessGameStateV1Delta {
+                    moves: Some(vec![AuthorizedMove::new(
+                        signer,
+                        &self.params.game_id,
+                        *ply as u32,
+                        mv,
+                        T0 + 2_000 + *ply as i64 * 1_000,
+                    )]),
+                    ..Default::default()
+                }
+            }
+            Op::Attest { who, tick } => ChessGameStateV1Delta {
+                clocks: Some(vec![ClockAttestation::new(
+                    self.signer(*who),
+                    &self.params.game_id,
+                    T0 + tick * 1_000,
+                )]),
+                ..Default::default()
+            },
+            Op::Resign { who, at } => ChessGameStateV1Delta {
+                conclusion: Some(vec![SignedConclusion::resign(
+                    self.signer(*who),
+                    &self.params.game_id,
+                    0,
+                    *at,
+                )]),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[test]
+fn the_game_state_merge_is_commutative() {
+    // Moves are excluded here, and the exclusion is a real finding rather than a
+    // convenience: `MovesV1::prune` *clears* the list when a move arrives before
+    // its predecessor, so applying plies out of order destroys them and the raw
+    // delta merge is not commutative. See
+    // `a_move_arriving_before_its_predecessor_is_dropped_but_heals` for the
+    // behaviour and why it is survivable.
+    let result = freenet_scaffold::convergence::test_operation_commutativity(
+        GameHarness::without_moves(),
+        12,
+        25,
+        0xC0FFEE,
+    );
+    assert!(result.passed, "{result:?}");
+}
+
+#[test]
+fn the_game_state_merge_is_idempotent() {
+    let result = freenet_scaffold::convergence::test_idempotency(GameHarness::new(), 20, 0xC0FFEE);
+    assert!(result.passed, "{result:?}");
+}
+
+#[test]
+fn a_move_arriving_before_its_predecessor_is_dropped_but_heals() {
+    // Pins the known limitation the convergence harness surfaced.
+    //
+    // `prune` keeps the longest legal prefix from ply 0 and discards the rest,
+    // so a move that arrives before the one it follows is destroyed outright.
+    // The platform explicitly "tolerates arbitrary loss, reordering, and
+    // duplication", so this ordering is not hypothetical.
+    //
+    // It is survivable because the summary carries the plies actually held: the
+    // peer that dropped ply 1 no longer lists it, so the next anti-entropy round
+    // sends it again, and this time it lands on top of ply 0 and sticks. The
+    // cost is a wasted round, not a lost move — but note the merge is therefore
+    // convergent only *through* the sync protocol, not per-delta.
+    let creator = key();
+    let opponent = key();
+    let (base, params) = started_game(&creator, &opponent);
+
+    let ply0 = AuthorizedMove::new(
+        &creator,
+        &params.game_id,
+        0,
+        Move::from_uci("e2e4").unwrap(),
+        T0 + 2_000,
+    );
+    let ply1 = AuthorizedMove::new(
+        &opponent,
+        &params.game_id,
+        1,
+        Move::from_uci("e7e5").unwrap(),
+        T0 + 3_000,
+    );
+
+    // Out of order: ply 1 first.
+    let mut late = base.clone();
+    for mv in [ply1.clone(), ply0.clone()] {
+        let snapshot = late.clone();
+        late.apply_delta(
+            &snapshot,
+            &params,
+            &Some(ChessGameStateV1Delta {
+                moves: Some(vec![mv]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    }
+    assert_eq!(late.moves.len(), 1, "ply 1 was dropped, as prune specifies");
+
+    // A peer that saw them in order holds both, and anti-entropy closes the gap.
+    let mut ordered = base.clone();
+    let snapshot = ordered.clone();
+    ordered
+        .apply_delta(
+            &snapshot,
+            &params,
+            &Some(ChessGameStateV1Delta {
+                moves: Some(vec![ply0, ply1]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(ordered.moves.len(), 2);
+
+    let summary = late.summarize(&late, &params);
+    let delta = ordered
+        .delta(&ordered, &params, &summary)
+        .expect("the missing ply must be offered again");
+    let snapshot = late.clone();
+    late.apply_delta(&snapshot, &params, &Some(delta)).unwrap();
+
+    assert_eq!(
+        late.moves, ordered.moves,
+        "the gap closes on the next round"
+    );
+}
+
+#[test]
+fn two_peers_seeing_different_operations_converge() {
+    // This one goes through `ComposableState::merge`, so it exercises
+    // summarize -> delta -> apply_delta rather than apply_delta alone: it is the
+    // property that a summary too coarse for its merge order would break.
+    for overlap in [0.0, 0.3, 0.7] {
+        let result = freenet_scaffold::convergence::test_merge_convergence(
+            GameHarness::new(),
+            14,
+            overlap,
+            0xBEEF,
+        );
+        assert!(result.passed, "overlap {overlap}: {result:?}");
+    }
 }

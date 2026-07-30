@@ -19,6 +19,11 @@ node_modules/
 /.freenet-test
 /e2e/.nodes
 
+# Local review notes
+/codebase-report.md
+/pr-mtrav.md
+/address.md
+
 # Editors
 .vscode/
 .idea/

@@ -81,6 +81,47 @@ impl fmt::Display for GameId {
     }
 }
 
+/// Compact fingerprint of a merge key, for use in a `ComposableState::Summary`.
+///
+/// # Why summaries carry a digest rather than the key itself
+///
+/// A summary has one job: let two peers discover they disagree, cheaply. It has
+/// to distinguish at least as much as the merge order does — a summary coarser
+/// than the order means two peers holding different values report the same thing,
+/// neither ships a delta, and the tiebreak that would have settled them is never
+/// reached. But it also has to stay *small*: freenet-core's own efficiency
+/// heuristic is `summary_size * 2 < state_size`, and the summary is on the wire
+/// in both directions on every anti-entropy round.
+///
+/// Carrying the raw 64-byte signature satisfies the first and fails the second
+/// (it put the presence summary at 82 KB against a 107 KB state). Eight bytes of
+/// BLAKE3 over the same bytes satisfies both.
+///
+/// # The consequence for `delta`
+///
+/// Digest order is **not** signature order, so a `delta` that ships "when ours
+/// wins the merge order" is wrong here: the true winner may compare lower by
+/// digest and never be sent. Every `delta` in this crate therefore ships on
+/// *difference* — the summary detects disagreement, and `absorb` remains the sole
+/// authority on which value survives. Both peers send, both absorb, and the total
+/// order picks the same winner on each.
+pub fn summary_digest(bytes: &[u8]) -> u64 {
+    let hash = blake3::hash(bytes);
+    u64::from_le_bytes(
+        hash.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 produces 32 bytes"),
+    )
+}
+
+/// [`summary_digest`] of a signature, which is what identifies a signed record.
+///
+/// A signature covers every field of the record it signs, so two records with
+/// the same signature are the same record.
+pub fn signature_digest(signature: &Signature) -> u64 {
+    summary_digest(&signature.to_bytes())
+}
+
 /// Verify `signature` over `message` for `key`, with a uniform error string.
 pub fn verify_sig(
     key: &VerifyingKey,

@@ -29,7 +29,7 @@
 
 use super::{ChessGameParametersV1, ChessGameStateV1, SIG_DOMAIN};
 use crate::chess::{Game, Move};
-use crate::identity::{verify_sig, GameId};
+use crate::identity::{signature_digest, verify_sig, GameId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,12 @@ impl MovesV1 {
 
 impl ComposableState for MovesV1 {
     type ParentState = ChessGameStateV1;
-    type Summary = Vec<u32>;
+    /// Per ply, a fingerprint of the move held there. The ply list alone was
+    /// coarser than the merge order, which settles a double-signed ply by
+    /// signature bytes — so two peers each holding a different move for the same
+    /// ply reported identical summaries, neither shipped, and their boards
+    /// diverged permanently.
+    type Summary = Vec<(u32, u64)>;
     type Delta = Vec<AuthorizedMove>;
     type Parameters = ChessGameParametersV1;
 
@@ -263,7 +268,10 @@ impl ComposableState for MovesV1 {
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
         // Ordered by construction (`BTreeMap`), so the encoded summary bytes
         // are deterministic for a given set of plies.
-        self.moves.keys().copied().collect()
+        self.moves
+            .iter()
+            .map(|(ply, am)| (*ply, signature_digest(&am.signature)))
+            .collect()
     }
 
     fn delta(
@@ -272,11 +280,11 @@ impl ComposableState for MovesV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeSet<u32> = old_summary.iter().copied().collect();
+        let theirs: BTreeMap<u32, u64> = old_summary.iter().copied().collect();
         let missing: Vec<AuthorizedMove> = self
             .moves
             .iter()
-            .filter(|(ply, _)| !theirs.contains(ply))
+            .filter(|(ply, am)| theirs.get(ply) != Some(&signature_digest(&am.signature)))
             .map(|(_, am)| am.clone())
             .collect();
         if missing.is_empty() {

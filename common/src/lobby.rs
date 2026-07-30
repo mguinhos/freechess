@@ -48,7 +48,7 @@ use crate::chess::Color;
 use crate::game::opponent::SignedJoin;
 use crate::game::setup::{SignedGameSetup, TimeControl, MAX_NICKNAME_LEN};
 use crate::game::{GameResult, SIG_DOMAIN};
-use crate::identity::{verify_sig, GameId, PlayerId};
+use crate::identity::{summary_digest, verify_sig, GameId, PlayerId};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -323,6 +323,35 @@ impl LobbyEntry {
     /// Merge another view of the same game into this one. Each component takes
     /// the winner of a total order, so the result is independent of order and
     /// stable under repetition.
+    /// Fingerprint of everything [`absorb`](Self::absorb) merges on.
+    ///
+    /// An entry is two independent lattices — the opponent slot settled by the
+    /// earliest join, the snapshot by the newest position — so both go in. One
+    /// combined digest is enough because the delta ships on *difference*: a peer
+    /// that is ahead on either part differs, and both parts travel together in
+    /// the entry anyway.
+    fn merge_digest(&self) -> u64 {
+        let mut buf = Vec::with_capacity(128);
+        match &self.opponent {
+            Some(join) => {
+                buf.push(1);
+                buf.extend_from_slice(&join.joined_at.to_le_bytes());
+                buf.extend_from_slice(join.player.as_bytes());
+            }
+            None => buf.push(0),
+        }
+        match &self.snapshot {
+            Some(snapshot) => {
+                buf.push(1);
+                buf.extend_from_slice(&snapshot.ply.to_le_bytes());
+                buf.extend_from_slice(&snapshot.updated_at.to_le_bytes());
+                buf.extend_from_slice(&snapshot.signature.to_bytes());
+            }
+            None => buf.push(0),
+        }
+        summary_digest(&buf)
+    }
+
     fn absorb(&mut self, other: LobbyEntry) {
         if self.opponent.is_none() {
             self.opponent = other.opponent;
@@ -569,7 +598,14 @@ impl LobbyGamesV1 {
 
 impl ComposableState for LobbyGamesV1 {
     type ParentState = LobbyStateV1;
-    type Summary = Vec<(GameId, u32)>;
+    /// Per game, a fingerprint of everything the entry merges on.
+    ///
+    /// A single "revision" number (it used to be `ply + 1 + opponent.is_some()`)
+    /// is coarser than the orders [`LobbyEntry::absorb`] applies. Two peers
+    /// holding different snapshots of the same ply — both players publishing
+    /// after one move, the normal case — had equal revisions, so neither shipped
+    /// and the two lobbies showed different clocks indefinitely.
+    type Summary = Vec<(GameId, u64)>;
     type Delta = Vec<LobbyEntry>;
     type Parameters = LobbyParametersV1;
 
@@ -618,15 +654,9 @@ impl ComposableState for LobbyGamesV1 {
     }
 
     fn summarize(&self, _parent: &Self::ParentState, _params: &Self::Parameters) -> Self::Summary {
-        // (id, revision) where revision advances as a game progresses, so a
-        // peer can tell "same game, newer position" without shipping state.
         self.games
             .iter()
-            .map(|(id, e)| {
-                let rev = e.snapshot.as_ref().map(|s| s.ply + 1).unwrap_or(0)
-                    + u32::from(e.opponent.is_some());
-                (*id, rev)
-            })
+            .map(|(id, e)| (*id, e.merge_digest()))
             .collect()
     }
 
@@ -636,18 +666,11 @@ impl ComposableState for LobbyGamesV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let theirs: BTreeMap<GameId, u32> = old_summary.iter().copied().collect();
+        let theirs: BTreeMap<GameId, u64> = old_summary.iter().copied().collect();
         let changed: Vec<LobbyEntry> = self
             .games
             .iter()
-            .filter(|(id, e)| {
-                let rev = e.snapshot.as_ref().map(|s| s.ply + 1).unwrap_or(0)
-                    + u32::from(e.opponent.is_some());
-                theirs
-                    .get(id)
-                    .map(|their_rev| *their_rev < rev)
-                    .unwrap_or(true)
-            })
+            .filter(|(id, e)| theirs.get(id) != Some(&e.merge_digest()))
             .map(|(_, e)| e.clone())
             .collect();
         if changed.is_empty() {

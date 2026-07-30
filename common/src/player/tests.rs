@@ -244,3 +244,105 @@ fn a_new_player_starts_at_the_starting_rating() {
     );
     assert_eq!(state.games_played(), 0);
 }
+
+// ------------------------------------------------- summaries vs merge order
+
+#[test]
+fn profiles_stamped_the_same_millisecond_still_exchange() {
+    // `absorb` breaks a tie on `updated_at` by signature bytes, but the summary
+    // was `Option<i64>` and `delta` returned nothing when the peer's timestamp
+    // was `>=` ours. Two nicknames stamped the same millisecond therefore never
+    // reconciled.
+    let me = key();
+    let params = params_for(&me);
+
+    let a = SignedProfile::new(&me, "one".to_string(), T0);
+    let b = SignedProfile::new(&me, "two".to_string(), T0);
+    assert_ne!(a.signature, b.signature, "test premise: distinct profiles");
+
+    let mut peer1 = PlayerStateV1::default();
+    peer1.profile = ProfileV1(Some(a));
+    let mut peer2 = PlayerStateV1::default();
+    peer2.profile = ProfileV1(Some(b));
+
+    let s1 = peer1.profile.summarize(&peer1, &params);
+    if let Some(d) = peer2.profile.delta(&peer2, &params, &s1) {
+        peer1
+            .profile
+            .apply_delta(&peer1.clone(), &params, &Some(d))
+            .unwrap();
+    }
+    let s2 = peer2.profile.summarize(&peer2, &params);
+    if let Some(d) = peer1.profile.delta(&peer1, &params, &s2) {
+        peer2
+            .profile
+            .apply_delta(&peer2.clone(), &params, &Some(d))
+            .unwrap();
+    }
+
+    assert_eq!(
+        peer1.profile, peer2.profile,
+        "both peers must land on the same profile"
+    );
+}
+
+#[test]
+fn equivocating_history_certificates_are_exchanged() {
+    // Same defect as the archive: the summary was a set of game ids, so a rival
+    // certificate for a game already present never shipped and the signature
+    // tiebreak never ran.
+    let me = key();
+    let other = key();
+    let params = params_for(&me);
+    let (first, game_id) = certified_game(&me, &other, T0, 1200, 1200);
+
+    let draft = crate::certificate::CertificateDraft {
+        game_id: first.game_id,
+        white: first.white,
+        black: first.black,
+        white_nickname: first.white_nickname.clone(),
+        black_nickname: first.black_nickname.clone(),
+        result: first.result,
+        moves: first.moves.clone(),
+        time_control: first.time_control,
+        started_at: first.started_at,
+        finished_at: first.finished_at + 5_000,
+        white_rating_before: first.white_rating_before,
+        black_rating_before: first.black_rating_before,
+    };
+    let second = draft.clone().assemble(draft.sign(&me), draft.sign(&other));
+    second.verify().expect("the rival certificate is valid too");
+
+    // Which of the two wins depends on random signature bytes, so sync both
+    // directions and assert the property that matters: they end up agreeing.
+    let winner = if first.white_signature.to_bytes() < second.white_signature.to_bytes() {
+        first.clone()
+    } else {
+        second.clone()
+    };
+
+    let mut peer1 = PlayerStateV1::default();
+    peer1.history.games.insert(game_id, first);
+    let mut peer2 = PlayerStateV1::default();
+    peer2.history.games.insert(game_id, second);
+
+    for _ in 0..2 {
+        let s1 = peer1.history.summarize(&peer1, &params);
+        if let Some(d) = peer2.history.delta(&peer2, &params, &s1) {
+            peer1
+                .history
+                .apply_delta(&peer1.clone(), &params, &Some(d))
+                .unwrap();
+        }
+        let s2 = peer2.history.summarize(&peer2, &params);
+        if let Some(d) = peer1.history.delta(&peer1, &params, &s2) {
+            peer2
+                .history
+                .apply_delta(&peer2.clone(), &params, &Some(d))
+                .unwrap();
+        }
+    }
+
+    assert_eq!(peer1.history, peer2.history);
+    assert_eq!(peer1.history.games.get(&game_id), Some(&winner));
+}
