@@ -94,12 +94,23 @@ Three independent layers, all verifiable from state alone:
 
 1. **Proof-of-work per game.** A game's `game_id` must be a hash of the
    creator's key and a nonce with 16 leading zero bits. Since `game_id` is a
-   contract *parameter*, the work is bound to the contract key itself. Fresh
-   keypairs buy an attacker nothing, which matters because Freenet deliberately
-   leaves Sybil resistance to the application layer.
+   contract *parameter*, the work is bound to the contract key itself, so work
+   done for one game cannot be reused for another.
 2. **A quota per creator:** at most 3 games waiting for an opponent and 20
    listings total.
-3. **A global cap** on lobby entries.
+3. **A global cap** on lobby entries, shared out across creators rather than
+   granted to whoever is most recently active.
+
+Layer 2 counts per *creator*, and keypairs are free, so it does not on its own
+bound how much of the lobby one party holds — about 25 fresh keys cover all 500
+slots. Layer 3 is what bounds them: sharing slots across creators makes crowding
+the lobby cost distinct *identities* rather than a flat number of listings, and
+stops a flooder whose listings are merely newer from evicting real players.
+
+What is still unpriced is an identity itself. Freenet deliberately leaves Sybil
+resistance to the application layer, and raising the difficulty does not close
+it — a phone creating one game pays the same per listing as a script with far
+more compute. That needs a scarce identity rather than a bigger puzzle.
 
 ### Verifiable Elo
 
