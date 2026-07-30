@@ -82,25 +82,22 @@ impl Instance {
     }
 }
 
-/// The lobby's instance id.
-///
-/// The lobby is a singleton published once by the deployer, so the client only
-/// GETs, SUBSCRIBEs and UPDATEs it — none of which need the module, just the
-/// key.
-pub fn lobby_id() -> Result<ContractInstanceId, String> {
+/// The lobby's WASM, embedded so a client can PUT it. See `build.rs`.
+pub const LOBBY_WASM: &[u8] =
+    include_bytes!(concat!(env!("CHESS_WASM_DIR"), "/lobby_contract.wasm"));
+
+/// The lobby instance, carrying its code so the client can publish it.
+pub fn lobby_instance() -> Result<Instance, String> {
     let params = encode(&LobbyParametersV1::default())?;
-    Ok(instance_id_from_hash(&LOBBY_CONTRACT_CODE_HASH, &params))
+    Ok(Instance::build(LOBBY_WASM, params))
 }
 
-/// The lobby's full contract key, for UPDATE requests.
-///
-/// Built from the instance id and the code hash directly, which is the same
-/// key `from_params_and_code` would produce — without needing the module.
+pub fn lobby_id() -> Result<ContractInstanceId, String> {
+    Ok(lobby_instance()?.id())
+}
+
 pub fn lobby_key() -> Result<ContractKey, String> {
-    Ok(ContractKey::from_id_and_code(
-        lobby_id()?,
-        CodeHash::new(LOBBY_CONTRACT_CODE_HASH),
-    ))
+    Ok(lobby_instance()?.key())
 }
 
 /// One game's instance.

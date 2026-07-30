@@ -27,7 +27,7 @@ const flag = (n, d) => {
 const PORT = flag("port", "7513");
 const NICK = flag("nick", "claude");
 const CMDFILE = flag("cmdfile", "/tmp/freechess-cmds");
-const CONTRACT = "8zhB9j44jKgqJNrVhCZwUKM3mrZVkNujNCfevX39k1TS";
+const CONTRACT = "9d5RfZUjBtVjE81yyRTVUctQdgfAvoD59QukeVFLSark";
 const APP = `http://127.0.0.1:${PORT}/v1/contract/web/${CONTRACT}/`;
 
 let page, app, myColor = "white";

@@ -312,18 +312,25 @@ enum Subject {
     Profile(PlayerId),
 }
 
-/// Subscribe to the lobby.
+/// Publish the lobby if needed, then follow it.
 ///
-/// The client does not publish it: the lobby is a singleton the deployer
-/// publishes once (`cargo make publish-lobby`). That is what lets the bundle
-/// omit the lobby's WASM, which matters because the whole UI ships as one
-/// contract state and a smaller state transfers far more reliably.
+/// The PUT is what makes this robust for a newcomer: a node refuses to UPDATE
+/// or SUBSCRIBE to a contract whose code it does not hold, and a fresh node
+/// holds nothing. PUTting the lobby primes the local store with the module,
+/// and because the state supplied is empty — and the merge of an empty state
+/// changes nothing — it is harmless when the lobby already exists.
 async fn ensure_lobby(
     api: &mut WebApi,
     instances: &mut HashMap<ContractInstanceId, Subject>,
 ) -> Result<(), String> {
-    let id = freenet::lobby_id()?;
+    let lobby = freenet::lobby_instance()?;
+    let id = lobby.id();
     instances.insert(id, Subject::Lobby);
+
+    let empty = freenet::encode(&LobbyStateV1::default())?;
+    api.send(freenet::put_request(&lobby, empty, true))
+        .await
+        .map_err(|e| format!("could not publish the lobby: {e}"))?;
 
     // GET with subscribe=true, and nothing else: a separate SUBSCRIBE sent
     // straight after would arrive before this GET has primed the local store,
