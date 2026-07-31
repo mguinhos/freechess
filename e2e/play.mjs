@@ -231,6 +231,54 @@ async function main() {
     return;
   }
 
+  if (cmd === "stay") {
+    // Hold a session open so this player keeps showing as online.
+    //
+    // Presence is a heartbeat: a client republishes it every
+    // HEARTBEAT_INTERVAL_MS and a player is shown online for 90s after their
+    // last one. Every other command here opens a browser for a few seconds and
+    // closes it, so this account appeared for a moment and then vanished —
+    // which is why nobody could find it in the players list to challenge.
+    const minutes = Number(flag("minutes", "60"));
+    const { browser, app } = await open();
+    console.log(
+      `staying online as ${(await app.locator("#account-button").innerText()).trim()} ` +
+        `for ${minutes} minutes`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, minutes * 60000));
+    await browser.close();
+    return;
+  }
+
+  if (cmd === "challenge") {
+    // A direct challenge, addressed to one player: only they can take the seat.
+    const target = flag("player");
+    if (!target) throw new Error("--player <nickname> is required");
+    const time = flag("time", "10+0");
+    const color = flag("color", "black");
+    const { browser, app } = await open();
+
+    // Scope to the players panel: the same name shows up in the ranking and on
+    // every game that player created, and those rows have no Challenge button.
+    const row = app
+      .locator("#players-panel .list-item", { hasText: target })
+      .first();
+    await row.waitFor({ timeout: 60000 });
+    await row.getByRole("button", { name: "Challenge" }).click();
+
+    const modal = app.locator(".modal");
+    await modal.waitFor({ timeout: 60000 });
+    await modal.getByRole("button", { name: time, exact: true }).click();
+    await modal
+      .getByRole("button", { name: color === "white" ? "White" : "Black", exact: true })
+      .click();
+    await modal.getByRole("button", { name: "Send challenge" }).click();
+    await app.locator(".board").waitFor({ timeout: 60000 });
+    console.log("challenged:", (await app.locator("#share-link").innerText()).trim());
+    await browser.close();
+    return;
+  }
+
   if (cmd === "whoami") {
     const { browser, page, app } = await open();
     page.on("console", (m) => {
