@@ -214,6 +214,23 @@ async function main() {
     return;
   }
 
+  if (cmd === "export") {
+    // The account seed lives in the node's delegate; this is the only way to
+    // get it out. Whoever holds the string IS this player, so treat it as a
+    // secret — never commit it, and never publish it anywhere the repo reaches.
+    const { browser, app } = await open();
+    await app.locator("#account-button").click();
+    const modal = app.locator(".modal");
+    await modal.waitFor({ timeout: 60000 });
+    await modal.getByRole("button", { name: "Reveal key" }).click();
+    const key = (await modal.locator("code.key").innerText()).trim();
+    const id = (await modal.locator(".mono").first().innerText()).trim();
+    console.log("player_id  ", id);
+    console.log("account_key", key);
+    await browser.close();
+    return;
+  }
+
   if (cmd === "whoami") {
     const { browser, page, app } = await open();
     page.on("console", (m) => {
