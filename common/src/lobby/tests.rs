@@ -990,3 +990,84 @@ fn the_migration_lock_is_independent_of_arrival_order() {
     assert_eq!(peer1.games.games, peer2.games.games, "must converge");
     assert!(peer1.games.games.is_empty());
 }
+
+// ------------------------------------------------------- challenge expiry
+
+#[test]
+fn a_challenge_stops_being_offered_after_an_hour() {
+    let creator = key();
+    let entry = listing(&creator, T0);
+
+    assert!(!entry.is_expired(T0), "premise: fresh");
+    assert!(
+        !entry.is_expired(T0 + CHALLENGE_TTL_MS),
+        "still on offer at exactly the deadline"
+    );
+    assert!(
+        entry.is_expired(T0 + CHALLENGE_TTL_MS + 1),
+        "an unanswered challenge must lapse"
+    );
+}
+
+/// Once someone is seated the game is real, and how long it took to start is
+/// nobody's business — it must never lapse out from under the players.
+#[test]
+fn a_game_with_an_opponent_never_expires() {
+    let creator = key();
+    let challenger = key();
+    let entry = matched_listing(&creator, &challenger, T0);
+    assert!(!entry.is_expired(T0 + CHALLENGE_TTL_MS * 1000));
+}
+
+#[test]
+fn expired_challenges_disappear_from_every_list_a_person_sees() {
+    let creator = key();
+    let target = key();
+    let mut games = LobbyGamesV1::default();
+
+    let stale = listing(&creator, T0);
+    let fresh = listing(&creator, T0 + CHALLENGE_TTL_MS);
+    let fresh_id = fresh.game_id;
+    games.absorb(stale);
+    games.absorb(fresh);
+
+    let now = T0 + CHALLENGE_TTL_MS + 1;
+    let open = games.open_games_at(now);
+    assert_eq!(open.len(), 1, "the stale one must be gone");
+    assert_eq!(open[0].game_id, fresh_id);
+    assert_eq!(games.public_open_games(now).len(), 1);
+
+    // And the eviction rules still see both: they have no clock, and are what
+    // keep the lobby bounded rather than what keeps it tidy.
+    assert_eq!(games.open_games().len(), 2);
+
+    let _ = target;
+}
+
+#[test]
+fn an_expired_direct_challenge_stops_notifying_its_target() {
+    let creator = key();
+    let target = key();
+    // A direct challenge: the invited key is part of what the creator signs.
+    let setup = crate::game::setup::GameSetup::mine_challenge(
+        &creator.verifying_key(),
+        crate::chess::Color::White,
+        crate::game::setup::TimeControl::default(),
+        T0,
+        "creator".to_string(),
+        Some(target.verifying_key()),
+    );
+    let game_id = setup.derive_game_id(&creator.verifying_key());
+    let entry = LobbyEntry::new(game_id, setup.sign(&creator, &game_id));
+
+    let me = PlayerId::from(&target.verifying_key());
+    let mut games = LobbyGamesV1::default();
+    games.absorb(entry);
+
+    assert_eq!(games.challenges_for(me, T0 + 1).len(), 1);
+    assert_eq!(
+        games.challenges_for(me, T0 + CHALLENGE_TTL_MS + 1).len(),
+        0,
+        "a lapsed challenge must stop appearing in the notification count"
+    );
+}

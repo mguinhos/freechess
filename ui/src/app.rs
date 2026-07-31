@@ -160,6 +160,9 @@ pub enum Cmd {
     /// game. Only meaningful on the creator's own client: the acceptance is
     /// checked against the creator key in the contract parameters.
     SeatChallenger(GameId),
+    /// Refuse a direct challenge, so the challenger stops waiting on an answer
+    /// that is never coming.
+    DeclineChallenge(GameId),
     /// Subscribe to a game's own contract (playing or spectating).
     WatchGame(GameId),
     /// Play a move in a game.
@@ -178,6 +181,14 @@ pub enum Cmd {
     AttestClock(GameId),
     /// Claim the opponent's clock ran out.
     ClaimTimeout(GameId),
+    /// Take our part in certifying a finished game, and file it once both
+    /// halves are in.
+    ///
+    /// Driven by *observing* that a game is over, not by having played the
+    /// last move. The player who delivers mate signs as a side effect of
+    /// moving; their opponent never moves again, so without this they would
+    /// never sign at all and no game would ever be rated.
+    CertifyGame(GameId),
     /// Publish my nickname to my profile contract and the ranking.
     SetNickname(String),
     /// Heartbeat, optionally announcing the game being watched.
@@ -388,7 +399,7 @@ async fn handle_cmd(
     instances: &mut HashMap<ContractInstanceId, Subject>,
     cmd: Cmd,
 ) -> Result<(), String> {
-    let (account, my_rating) = state.with(|s| (s.account.clone(), s.my_rating()));
+    let account = state.with(|s| s.account.clone());
     let key = &account.key;
     let now = now_ms();
 
@@ -494,6 +505,35 @@ async fn handle_cmd(
             Ok(())
         }
 
+        Cmd::DeclineChallenge(game_id) => {
+            let creator = lookup_creator(state, game_id)
+                .ok_or_else(|| "that game is not in the lobby".to_string())?;
+            let decline = chess_core::game::opponent::SignedDecline::new(key, &game_id, now);
+
+            // Publish to the game first: that is the authoritative record, and
+            // it is what the challenger's own client reads.
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                opponent: Some(OpponentDelta::decline(decline.clone())),
+                ..Default::default()
+            };
+            api.send(freenet::update_request(
+                instance.key(),
+                freenet::encode(&delta)?,
+            ))
+            .await
+            .map_err(|e| format!("could not decline the challenge: {e}"))?;
+
+            // Mirror into the lobby so the listing stops being offered to
+            // anyone, including us — otherwise the challenge would keep showing
+            // until someone happened to open the game itself.
+            if let Some(mut entry) = state.with(|s| s.lobby.games.get(&game_id).cloned()) {
+                entry.declined = Some(decline);
+                push_lobby_entry(api, entry).await?;
+            }
+            Ok(())
+        }
+
         Cmd::SeatChallenger(game_id) => {
             let (creator, game) = state
                 .with(|s| {
@@ -592,7 +632,7 @@ async fn handle_cmd(
                 s.games.insert(game_id, updated.clone());
             });
             if finished {
-                certify_and_file(api, state, key, game_id, &updated, my_rating, now).await?;
+                certify_and_file(api, state, key, game_id, &updated, now).await?;
             }
             Ok(())
         }
@@ -627,7 +667,7 @@ async fn handle_cmd(
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
-            certify_and_file(api, state, key, game_id, &updated, my_rating, now).await
+            certify_and_file(api, state, key, game_id, &updated, now).await
         }
 
         Cmd::AttestClock(game_id) => {
@@ -711,7 +751,18 @@ async fn handle_cmd(
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
-            certify_and_file(api, state, key, game_id, &updated, my_rating, provable).await
+            certify_and_file(api, state, key, game_id, &updated, provable).await
+        }
+
+        Cmd::CertifyGame(game_id) => {
+            let game = match state.with(|s| s.games.get(&game_id).cloned()) {
+                Some(g) => g,
+                None => return Ok(()),
+            };
+            if !game.result().is_over() {
+                return Ok(());
+            }
+            certify_and_file(api, state, key, game_id, &game, now).await
         }
 
         Cmd::SetNickname(nickname) => {
@@ -929,63 +980,198 @@ async fn publish_snapshot(
         game_id,
         setup,
         opponent: game.opponent.accepted().cloned(),
+        declined: game.opponent.declined.clone(),
         snapshot: Some(snapshot),
     };
     push_lobby_entry(api, entry).await
 }
 
-/// Once a game is decided, co-sign a certificate and file it into the shared
-/// archive, the player's profile and the ranking.
+/// Once a game is decided, take this player's part in certifying it, and file
+/// the result the moment both halves are present.
 ///
-/// Only the side that can produce both signatures completes this; in practice
-/// each client signs its own half and the certificate lands once both have.
-/// A game whose opponent never signs stays replayable from its own contract.
+/// Two steps, and which one runs depends only on what is already in state:
+///
+/// 1. **Agree on the record.** A rating is trustworthy because both players
+///    signed the same one, and they cannot derive it independently — the finish
+///    time is a wall clock and the pre-game ratings come from the lobby. So the
+///    draft is published, and both sides converge on whichever wins a total
+///    order. See [`chess_core::game::certification`].
+/// 2. **File it.** Once both signatures are over identical bytes, anyone can
+///    assemble the certificate; this client files its own ranking entry from
+///    it. Filing is per player and self-signed, so neither side depends on the
+///    other doing their part.
+///
+/// A game whose opponent never signs simply stays unrated, and remains
+/// replayable from its own contract regardless.
 async fn certify_and_file(
     api: &mut WebApi,
     state: &mut Signal<AppState>,
     key: &ed25519_dalek::SigningKey,
     game_id: GameId,
     game: &ChessGameStateV1,
-    my_rating: i32,
     now: i64,
 ) -> Result<(), String> {
     let (white, black) = match game.player_keys() {
         Some(pair) => pair,
         None => return Ok(()),
     };
-    let opponent_rating = state.with(|s| {
-        let me = s.me();
-        let other = if PlayerId::from(&white) == me {
-            black
-        } else {
-            white
-        };
-        s.lobby.leaderboard.rating_of(PlayerId::from(&other))
-    });
-    let (white_rating, black_rating) =
-        if PlayerId::from(&white) == PlayerId::from(&key.verifying_key()) {
-            (my_rating, opponent_rating)
-        } else {
-            (opponent_rating, my_rating)
-        };
+    let me = key.verifying_key();
+    if me != white && me != black {
+        return Ok(()); // spectating: nothing to sign
+    }
+    let creator = match lookup_creator(state, game_id) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let instance = freenet::game_instance(creator, game_id)?;
 
-    let draft = match CertificateDraft::from_game(game, game_id, now, white_rating, black_rating) {
-        Some(draft) => draft,
+    // Step 2 first: if the two halves already agree, there is nothing left to
+    // negotiate and the only thing to do is file.
+    if let Some(certificate) = game.certification.certificate(game) {
+        return file_certificate(api, state, key, certificate).await;
+    }
+
+    // Step 1. Prefer the draft already on the table over inventing another:
+    // two drafts never assemble, and every extra one is another round trip.
+    let mine = game.certification.proposal_by(&me);
+    let candidate = match game.certification.winning_draft() {
+        Some(draft) if acceptable(state, draft) => Some(draft.clone()),
+        // Their draft says something we disagree with — most likely a rating
+        // neither of us has converged on yet. Refuse it and offer our own; if
+        // they hold to theirs the game stays unrated, which is the right way
+        // to fail. Signing a rating we believe to be wrong is not.
+        Some(_) => CertificateDraft::from_game(
+            game,
+            game_id,
+            now,
+            observed_rating(state, white),
+            observed_rating(state, black),
+        ),
+        None => CertificateDraft::from_game(
+            game,
+            game_id,
+            now,
+            observed_rating(state, white),
+            observed_rating(state, black),
+        ),
+    };
+    let Some(draft) = candidate else {
+        return Ok(());
+    };
+    // Already signed exactly this: re-publishing would be a no-op on every
+    // peer, so stop rather than chatter every time a game view refreshes.
+    if mine.map(|p| p.draft == draft).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let proposal = chess_core::game::certification::SignedCertificateProposal::new(key, draft);
+    let delta = chess_core::game::ChessGameStateV1Delta {
+        certification: Some(vec![proposal]),
+        ..Default::default()
+    };
+    api.send(freenet::update_request(
+        instance.key(),
+        freenet::encode(&delta)?,
+    ))
+    .await
+    .map_err(|e| format!("could not publish the certificate signature: {e}"))?;
+
+    state.with_mut(|s| {
+        s.games.insert(game_id, game.clone());
+    });
+    Ok(())
+}
+
+/// The rating this client currently sees for `player`.
+fn observed_rating(state: &Signal<AppState>, player: VerifyingKey) -> i32 {
+    state.with(|s| s.lobby.leaderboard.rating_of(PlayerId::from(&player)))
+}
+
+/// Whether we are willing to put our name to someone else's draft.
+///
+/// Everything else about the draft is already checked by the contract against
+/// the game's own state. The ratings are not, and cannot be: they live in the
+/// lobby, and a contract cannot read another contract. They rest entirely on
+/// this check — a player who signs a draft claiming their opponent was rated
+/// 3000 has handed them a win worth far more than it should be.
+fn acceptable(state: &Signal<AppState>, draft: &CertificateDraft) -> bool {
+    draft.white_rating_before == observed_rating(state, draft.white)
+        && draft.black_rating_before == observed_rating(state, draft.black)
+}
+
+/// File a finished certificate into the ranking.
+///
+/// The entry is signed by this player and covers only this player, so both
+/// sides file independently and neither waits on the other. Re-filing is
+/// harmless: the leaderboard keeps the entry with the higher game count and
+/// settles ties by a total order, so a repeat merges to a no-op.
+async fn file_certificate(
+    api: &mut WebApi,
+    state: &mut Signal<AppState>,
+    key: &ed25519_dalek::SigningKey,
+    certificate: chess_core::certificate::GameCertificate,
+) -> Result<(), String> {
+    // Never file something that does not stand up on its own — a malformed
+    // entry is rejected by every peer, and finding out here is cheaper.
+    certificate.verify()?;
+
+    let me = PlayerId::from(&key.verifying_key());
+    let Some(score) = certificate.score_for(me) else {
+        return Ok(());
+    };
+    let (rating_before, opponent_rating) = match certificate.color_of(me) {
+        Some(chess_core::chess::Color::White) => (
+            certificate.white_rating_before,
+            certificate.black_rating_before,
+        ),
+        Some(chess_core::chess::Color::Black) => (
+            certificate.black_rating_before,
+            certificate.white_rating_before,
+        ),
         None => return Ok(()),
     };
 
-    // We can only sign our own half. Filing needs both, so this completes only
-    // when the local player happens to hold both keys (never in a real game) —
-    // in practice each side publishes its half through the game contract and a
-    // future pass assembles them. Publishing our signature is the useful part.
-    let my_signature = draft.sign(key);
-    let _ = my_signature;
-
-    state.with_mut(|s| {
-        s.message = Some("game finished".to_string());
-        s.games.insert(game_id, game.clone());
+    let (nickname, games_played, already) = state.with(|s| {
+        let existing = s.lobby.leaderboard.get(me);
+        (
+            s.account.nickname.clone(),
+            existing.map(|e| e.games_played).unwrap_or(0) + 1,
+            existing
+                .map(|e| e.last_game.game_id == certificate.game_id)
+                .unwrap_or(false),
+        )
     });
-    let _ = api;
+    if already {
+        return Ok(()); // this game is already the one our entry cites
+    }
+
+    let rating = chess_core::elo::apply_result(
+        rating_before,
+        games_played.saturating_sub(1),
+        opponent_rating,
+        score,
+    );
+    let entry = chess_core::leaderboard::RankEntry::new(
+        key,
+        nickname,
+        rating,
+        games_played,
+        certificate,
+        now_ms(),
+    );
+    let delta = chess_core::lobby::LobbyStateV1Delta {
+        leaderboard: Some(vec![entry]),
+        ..Default::default()
+    };
+    let instance = freenet::lobby_instance()?;
+    api.send(freenet::update_request(
+        instance.key(),
+        freenet::encode(&delta)?,
+    ))
+    .await
+    .map_err(|e| format!("could not file the ranking entry: {e}"))?;
+
+    state.with_mut(|s| s.message = Some(format!("game rated: {rating}")));
     Ok(())
 }
 

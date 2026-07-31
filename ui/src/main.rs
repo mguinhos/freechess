@@ -149,6 +149,71 @@ fn App() -> Element {
         }
     });
 
+    // Resume certifying games from earlier sessions.
+    //
+    // The certification loop below only sees games this client has loaded, and
+    // a reload starts with none — so a player who closed the tab the moment
+    // their game ended would never sign, and the game would stay unrated for
+    // ever even though both of them came back. Subscribe to our own finished
+    // games so the loop can pick them up.
+    //
+    // Only ones that are not already rated, so this settles rather than
+    // re-subscribing to a lifetime of history on every load.
+    use_future(move || async move {
+        loop {
+            let pending: Vec<GameId> = state.with(|s| {
+                let me = s.me();
+                let rated = s
+                    .lobby
+                    .leaderboard
+                    .get(me)
+                    .map(|e| e.last_game.game_id)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                s.lobby
+                    .games
+                    .all()
+                    .into_iter()
+                    .filter(|e| e.is_finished_game_of(me))
+                    .filter(|e| !rated.contains(&e.game_id))
+                    .filter(|e| !s.games.contains_key(&e.game_id))
+                    .map(|e| e.game_id)
+                    .take(5)
+                    .collect()
+            });
+            for id in pending {
+                sync.send(app::Cmd::WatchGame(id));
+            }
+            gloo_sleep(15000).await;
+        }
+    });
+
+    // Certification. A game becomes rated only when BOTH players have signed
+    // the same record of it, and the loser's client has no other reason to act:
+    // they do not move again, so nothing else would ever prompt them to sign.
+    // Driving it from the observation that a game is over — rather than from
+    // making the last move — is what makes a rating land at all.
+    //
+    // Cheap and self-healing: the command returns immediately unless there is
+    // something to publish, and it is idempotent, so a half that gets lost is
+    // simply re-sent on the next pass.
+    use_future(move || async move {
+        loop {
+            let finished: Vec<GameId> = state.with(|s| {
+                let me = s.account.key.verifying_key();
+                s.games
+                    .iter()
+                    .filter(|(_, g)| g.result().is_over() && g.color_of(&me).is_some())
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+            for id in finished {
+                sync.send(app::Cmd::CertifyGame(id));
+            }
+            gloo_sleep(3000).await;
+        }
+    });
+
     // Clock attestation. Unlike the heartbeat above (which is presence, in the
     // lobby) this goes into the game's own contract, because a contract cannot
     // read another one. It is what makes a timeout provable: the only evidence

@@ -142,10 +142,18 @@ pub fn result_tag(result: GameResult) -> u8 {
 }
 
 /// An unsigned certificate, ready for both players to sign.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because it travels: the two signatures must be over *identical*
+/// bytes, and the players cannot derive those bytes independently — the finish
+/// time is a wall clock and the pre-game ratings come from the lobby, which both
+/// vary. So one player publishes the draft and the other signs what they were
+/// given, after checking it against what they can see themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertificateDraft {
     pub game_id: GameId,
+    #[serde(with = "crate::identity::verifying_key_serde")]
     pub white: VerifyingKey,
+    #[serde(with = "crate::identity::verifying_key_serde")]
     pub black: VerifyingKey,
     pub white_nickname: String,
     pub black_nickname: String,
@@ -197,7 +205,12 @@ impl CertificateDraft {
         })
     }
 
-    fn signing_bytes(&self) -> Vec<u8> {
+    /// The exact bytes both players sign.
+    ///
+    /// Public because the two halves must be over *identical* bytes, and the
+    /// only way to guarantee that is for the second player to sign the bytes
+    /// the first one published rather than bytes they derived themselves.
+    pub fn signing_bytes(&self) -> Vec<u8> {
         certificate_signing_bytes(
             &self.game_id,
             &self.white,

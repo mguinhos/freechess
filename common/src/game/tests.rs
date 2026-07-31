@@ -10,7 +10,7 @@
 use super::clocks::{self, ClockAttestation};
 use super::conclusion::{self, SignedConclusion};
 use super::moves::AuthorizedMove;
-use super::opponent::{OpponentDelta, SignedAcceptance, SignedJoin};
+use super::opponent::{OpponentDelta, SignedAcceptance, SignedDecline, SignedJoin};
 use super::setup::{leading_zero_bits, GameSetup, TimeControl, POW_DIFFICULTY_BITS};
 use super::*;
 use crate::chess::{Color, Move};
@@ -89,6 +89,7 @@ fn seat(
     opponent::OpponentSlotV1 {
         offers: Default::default(),
         seated: Some(SignedAcceptance::new(creator, &params.game_id, join)),
+        declined: None,
     }
 }
 
@@ -446,6 +447,140 @@ fn a_backdated_join_cannot_hijack_a_game_in_progress() {
             &Some(OpponentDelta::seat(self_seated))
         )
         .is_err());
+}
+
+// ---------------------------------------------------------- declining
+
+#[test]
+fn the_invited_player_can_decline_and_the_seat_closes() {
+    let creator = key();
+    let invited = key();
+    let (mut state, params) = challenge_game(&creator, &invited);
+    let base = state.clone();
+
+    // Someone offers first — a declined challenge must clear that too, since
+    // nobody is ever going to be seated.
+    state
+        .opponent
+        .apply_delta(
+            &base,
+            &params,
+            &Some(OpponentDelta::offer(SignedJoin::new(
+                &invited,
+                &params.game_id,
+                T0 + 500,
+                "invited".to_string(),
+            ))),
+        )
+        .unwrap();
+
+    let decline = SignedDecline::new(&invited, &params.game_id, T0 + 1000);
+    state
+        .opponent
+        .apply_delta(&base, &params, &Some(OpponentDelta::decline(decline)))
+        .unwrap();
+    state.prune(&params).unwrap();
+
+    assert!(state.opponent.is_declined());
+    assert!(state.opponent.get().is_none(), "nobody may be seated");
+    assert!(state.opponent.pending_offers().is_empty());
+    state.verify(&state, &params).expect("state must validate");
+}
+
+#[test]
+fn only_the_challenged_player_may_decline() {
+    let creator = key();
+    let invited = key();
+    let stranger = key();
+    let (state, params) = challenge_game(&creator, &invited);
+
+    for (who, label) in [(&stranger, "a stranger"), (&creator, "the creator")] {
+        let forged = SignedDecline::new(who, &params.game_id, T0 + 1000);
+        let err = forged
+            .verify(&params, Some(invited.verifying_key()))
+            .unwrap_err();
+        assert!(err.contains("only the challenged player"), "{label}: {err}");
+
+        let mut merged = state.clone();
+        merged
+            .opponent
+            .apply_delta(&state, &params, &Some(OpponentDelta::decline(forged)))
+            .expect_err("the merge path must refuse it too");
+    }
+}
+
+/// An open game has nobody in particular to refuse it, so there is nothing a
+/// decline could mean.
+#[test]
+fn an_open_game_cannot_be_declined() {
+    let creator = key();
+    let passer_by = key();
+    let (_state, params) = open_game(&creator, Color::White);
+
+    let decline = SignedDecline::new(&passer_by, &params.game_id, T0 + 1000);
+    let err = decline.verify(&params, None).unwrap_err();
+    assert!(err.contains("only a direct challenge"), "got: {err}");
+}
+
+/// If the creator managed to seat someone, the game is on — a decline arriving
+/// afterwards must not leave the state implying otherwise.
+#[test]
+fn a_filled_seat_outranks_a_late_decline() {
+    let creator = key();
+    let invited = key();
+    let (mut state, params) = challenge_game(&creator, &invited);
+    let base = state.clone();
+
+    state.opponent = seat(&creator, &invited, &params, T0 + 500, "invited");
+    state
+        .opponent
+        .apply_delta(
+            &base,
+            &params,
+            &Some(OpponentDelta::decline(SignedDecline::new(
+                &invited,
+                &params.game_id,
+                T0 + 900,
+            ))),
+        )
+        .unwrap();
+    state.prune(&params).unwrap();
+
+    assert!(!state.opponent.is_declined());
+    assert_eq!(
+        state.opponent.get().unwrap().player,
+        invited.verifying_key(),
+        "a seated game must stay seated"
+    );
+}
+
+#[test]
+fn declining_converges_regardless_of_order() {
+    let creator = key();
+    let invited = key();
+    let (base, params) = challenge_game(&creator, &invited);
+
+    let offer = OpponentDelta::offer(SignedJoin::new(
+        &invited,
+        &params.game_id,
+        T0 + 500,
+        "invited".to_string(),
+    ));
+    let decline = OpponentDelta::decline(SignedDecline::new(&invited, &params.game_id, T0 + 1000));
+
+    let mut peer1 = base.clone();
+    let mut peer2 = base.clone();
+    for (peer, order) in [
+        (&mut peer1, [offer.clone(), decline.clone()]),
+        (&mut peer2, [decline, offer]),
+    ] {
+        for d in order {
+            peer.opponent.apply_delta(&base, &params, &Some(d)).unwrap();
+        }
+        peer.prune(&params).unwrap();
+    }
+    assert_eq!(peer1.opponent, peer2.opponent, "must converge");
+    assert!(peer1.opponent.is_declined());
 }
 
 // ---------------------------------------------------- direct challenges
@@ -1877,4 +2012,233 @@ fn two_peers_seeing_different_operations_converge() {
         );
         assert!(result.passed, "overlap {overlap}: {result:?}");
     }
+}
+
+// -------------------------------------------------------- certification
+
+use super::certification::{CertificationV1, SignedCertificateProposal};
+use crate::certificate::CertificateDraft;
+
+/// A finished game: creator plays White and resigns, so Black wins.
+fn finished_game(
+    creator: &SigningKey,
+    opponent: &SigningKey,
+) -> (ChessGameStateV1, ChessGameParametersV1) {
+    let (mut state, params) = started_game(creator, opponent);
+    push_move(&mut state, &params, creator, 0, "e2e4", T0 + 2000);
+    let c = SignedConclusion::resign(creator, &params.game_id, 1, T0 + 5000);
+    state.conclusion = conclusion::ConclusionV1::single(c);
+    state.prune(&params).unwrap();
+    (state, params)
+}
+
+fn draft_for(
+    state: &ChessGameStateV1,
+    params: &ChessGameParametersV1,
+    white_rating: i32,
+    black_rating: i32,
+    finished_at: i64,
+) -> CertificateDraft {
+    CertificateDraft::from_game(
+        state,
+        params.game_id,
+        finished_at,
+        white_rating,
+        black_rating,
+    )
+    .expect("the game is over")
+}
+
+#[test]
+fn one_signature_is_never_enough_to_certify() {
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = finished_game(&creator, &opponent);
+
+    let draft = draft_for(&state, &params, 1200, 1200, T0 + 6000);
+    let mine = SignedCertificateProposal::new(&creator, draft);
+    state
+        .certification
+        .apply_delta(&state.clone(), &params, &Some(vec![mine]))
+        .unwrap();
+
+    assert!(
+        state.certification.certificate(&state).is_none(),
+        "a single player signed themselves a rated result"
+    );
+    state.verify(&state, &params).expect("state is valid");
+}
+
+#[test]
+fn two_signatures_over_the_same_record_produce_a_certificate() {
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = finished_game(&creator, &opponent);
+
+    let draft = draft_for(&state, &params, 1200, 1300, T0 + 6000);
+    for signer in [&creator, &opponent] {
+        let p = SignedCertificateProposal::new(signer, draft.clone());
+        state
+            .certification
+            .apply_delta(&state.clone(), &params, &Some(vec![p]))
+            .unwrap();
+    }
+
+    let cert = state
+        .certification
+        .certificate(&state)
+        .expect("both halves are present");
+    cert.verify()
+        .expect("the assembled certificate must verify");
+    assert_eq!(cert.game_id, params.game_id);
+    assert_eq!(cert.white_rating_before, 1200);
+    assert_eq!(cert.black_rating_before, 1300);
+}
+
+/// The reason the exchange exists: two clients cannot derive the same bytes,
+/// so signing independently yields nothing until one adopts the other's draft.
+#[test]
+fn differing_drafts_certify_nothing_until_one_side_adopts_the_other() {
+    let creator = key();
+    let opponent = key();
+    let (mut state, params) = finished_game(&creator, &opponent);
+
+    // Same game, different wall clocks — exactly what happens in practice.
+    let mine =
+        SignedCertificateProposal::new(&creator, draft_for(&state, &params, 1200, 1200, T0 + 6000));
+    let theirs = SignedCertificateProposal::new(
+        &opponent,
+        draft_for(&state, &params, 1200, 1200, T0 + 6001),
+    );
+    for p in [mine, theirs] {
+        state
+            .certification
+            .apply_delta(&state.clone(), &params, &Some(vec![p]))
+            .unwrap();
+    }
+    assert!(
+        state.certification.certificate(&state).is_none(),
+        "drafts that differ must not assemble"
+    );
+
+    // Both peers pick the same winner from the same set, and each re-signs
+    // those exact bytes. Whichever player was already on it re-signs the same
+    // record, which merges to a no-op — so neither client needs to work out
+    // whose draft won, only that it is signing the winner.
+    let winner = state.certification.winning_draft().unwrap().clone();
+    for signer in [&creator, &opponent] {
+        let adopted = SignedCertificateProposal::new(signer, winner.clone());
+        state
+            .certification
+            .apply_delta(&state.clone(), &params, &Some(vec![adopted]))
+            .unwrap();
+    }
+
+    let cert = state
+        .certification
+        .certificate(&state)
+        .expect("adopting the winning draft completes it");
+    cert.verify().unwrap();
+    assert_eq!(cert.finished_at, winner.finished_at);
+}
+
+#[test]
+fn a_stranger_cannot_certify_a_game_they_did_not_play() {
+    let creator = key();
+    let opponent = key();
+    let outsider = key();
+    let (state, params) = finished_game(&creator, &opponent);
+
+    let forged = SignedCertificateProposal::new(
+        &outsider,
+        draft_for(&state, &params, 1200, 1200, T0 + 6000),
+    );
+    let err = forged
+        .verify(&state, &params)
+        .expect_err("an outsider must be refused");
+    assert!(err.contains("only the two players"), "got: {err}");
+
+    // And the merge path skips it rather than storing it.
+    let mut merged = state.clone();
+    merged
+        .certification
+        .apply_delta(&state, &params, &Some(vec![forged]))
+        .unwrap();
+    assert!(merged.certification.is_empty());
+}
+
+#[test]
+fn a_draft_that_misreports_the_game_is_refused() {
+    let creator = key();
+    let opponent = key();
+    let (state, params) = finished_game(&creator, &opponent);
+
+    // Claim the other result. This is the lie a certificate exists to stop.
+    let mut lying = draft_for(&state, &params, 1200, 1200, T0 + 6000);
+    lying.result = GameResult::WhiteWins(WinReason::Resignation);
+    let p = SignedCertificateProposal::new(&creator, lying);
+    let err = p.verify(&state, &params).expect_err("must reject");
+    assert!(err.contains("different result"), "got: {err}");
+
+    // Same for an invented move list, which would forge the replay.
+    let mut padded = draft_for(&state, &params, 1200, 1200, T0 + 6000);
+    padded.moves.push(Move::from_uci("e7e5").unwrap());
+    let p = SignedCertificateProposal::new(&creator, padded);
+    let err = p.verify(&state, &params).expect_err("must reject");
+    assert!(err.contains("different move list"), "got: {err}");
+}
+
+#[test]
+fn a_game_still_in_progress_cannot_be_certified() {
+    let creator = key();
+    let opponent = key();
+    let (mut finished, params) = finished_game(&creator, &opponent);
+    let draft = draft_for(&finished, &params, 1200, 1200, T0 + 6000);
+    for signer in [&creator, &opponent] {
+        let p = SignedCertificateProposal::new(signer, draft.clone());
+        finished
+            .certification
+            .apply_delta(&finished.clone(), &params, &Some(vec![p]))
+            .unwrap();
+    }
+    assert!(finished.certification.certificate(&finished).is_some());
+
+    // Carry those proposals onto a game that is still running: prune drops
+    // them, because a certificate for an undecided game means nothing.
+    let (mut running, params2) = started_game(&creator, &opponent);
+    running.certification = finished.certification.clone();
+    running.prune(&params2).unwrap();
+    assert!(running.certification.is_empty());
+}
+
+#[test]
+fn certification_converges_regardless_of_order() {
+    let creator = key();
+    let opponent = key();
+    let (base, params) = finished_game(&creator, &opponent);
+
+    let draft = draft_for(&base, &params, 1200, 1200, T0 + 6000);
+    let a = SignedCertificateProposal::new(&creator, draft.clone());
+    let b = SignedCertificateProposal::new(&opponent, draft);
+
+    let mut peer1 = base.clone();
+    let mut peer2 = base.clone();
+    for (peer, order) in [(&mut peer1, [a.clone(), b.clone()]), (&mut peer2, [b, a])] {
+        for p in order {
+            peer.certification
+                .apply_delta(&base, &params, &Some(vec![p]))
+                .unwrap();
+        }
+    }
+    assert_eq!(peer1.certification, peer2.certification, "must converge");
+    assert!(peer1.certification.certificate(&peer1).is_some());
+
+    // And re-merging changes nothing.
+    let before = peer1.certification.clone();
+    let existing: Vec<_> = before.proposals.values().cloned().collect();
+    peer1
+        .certification
+        .apply_delta(&base, &params, &Some(existing))
+        .unwrap();
+    assert_eq!(before, peer1.certification, "merge must be idempotent");
 }

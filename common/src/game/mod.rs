@@ -35,6 +35,7 @@
 //! contract's ring location. Spectators need no permission: they subscribe to
 //! the same contract the players use.
 
+pub mod certification;
 pub mod clocks;
 pub mod conclusion;
 pub mod moves;
@@ -46,6 +47,7 @@ mod tests;
 
 use crate::chess::{Color, Game, GameStatus};
 use crate::identity::{GameId, PlayerId};
+use certification::CertificationV1;
 use clocks::ClocksV1;
 use conclusion::ConclusionV1;
 use ed25519_dalek::VerifyingKey;
@@ -106,6 +108,12 @@ pub struct ChessGameStateV1 {
     /// Resignation, agreed draw, or a timeout claim. Empty while the game is
     /// decided purely on the board.
     pub conclusion: ConclusionV1,
+
+    /// Where the two players exchange the signatures that make the game rated.
+    /// Last, because it can only be judged once the result is known — which
+    /// depends on every field above it.
+    #[serde(default)]
+    pub certification: CertificationV1,
 }
 
 /// How a game finished, combining the on-board result with the off-board ones.
@@ -181,6 +189,9 @@ impl ChessGameStateV1 {
         let keys = self.player_keys();
         self.moves.prune(&params.game_id, keys);
         self.clocks.prune(keys);
+        // After the moves, because whether the game is over is derived from
+        // them: a certificate for a game still in progress is meaningless.
+        self.certification.prune(keys, self.result().is_over());
         Ok(())
     }
 

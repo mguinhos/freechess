@@ -96,9 +96,25 @@ export async function openApp(
   await expect(frame.locator(".topbar")).toBeVisible();
   // Wait for the node connection before doing anything that needs the network.
   await expect(frame.locator(".conn .dot.online")).toBeVisible();
+  await waitForAccount(frame);
 
   if (nickname) await setNickname(frame, nickname);
   return { context, page, app: frame, errors };
+}
+
+/**
+ * Wait until identity has come back from the delegate.
+ *
+ * Not optional, and not cosmetic. For the first seconds after a load the app is
+ * running on a session key it generated itself; anything signed in that window
+ * belongs to a player who ceases to exist as soon as the stored account
+ * arrives. That is what made adminship flaky — a claim made too early was made
+ * by a stranger, and the next page load was not an admin.
+ */
+export async function waitForAccount(frame: FrameLocator) {
+  await expect(
+    frame.locator('#account-button[data-settled="true"]'),
+  ).toBeVisible();
 }
 
 /** Reload the app in place, returning the fresh frame. */
@@ -111,6 +127,7 @@ export async function reopen(
   const frame = app(page);
   await expect(frame.locator(".topbar")).toBeVisible();
   await expect(frame.locator(".conn .dot.online")).toBeVisible();
+  await waitForAccount(frame);
   return frame;
 }
 

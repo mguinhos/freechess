@@ -55,6 +55,7 @@ pub fn seated_slot(
     OpponentSlotV1 {
         offers: Default::default(),
         seated: Some(SignedAcceptance::new(creator, &params.game_id, join)),
+        declined: None,
     }
 }
 

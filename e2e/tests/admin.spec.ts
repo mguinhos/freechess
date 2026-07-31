@@ -23,7 +23,13 @@ test("adminship is claimable by anyone while unclaimed, and only once", async ({
   // is a race, and hiding it would just mean whoever reads the source wins.
   const adminButton = alice.app.locator("#admin-button");
   await expect(adminButton).toBeVisible();
-  await adminButton.click();
+  // `force` because the header is live by design — a clock ticks, the online
+  // count changes, and Dioxus re-creates nodes as it diffs. Playwright refuses
+  // to click anything it has seen move or be detached, and waiting for a
+  // header that updates every second to hold perfectly still is waiting for
+  // something that will not happen. Visibility is asserted just above, so this
+  // gives up stability, not correctness.
+  await adminButton.click({ force: true });
 
   // The test network is not wiped between runs, and the account now persists in
   // the delegate — so on a second run this node is the SAME player, who has
@@ -54,7 +60,7 @@ test("adminship is claimable by anyone while unclaimed, and only once", async ({
   // than on the state under test. A wait must not have side effects.
   const entry = bobHome.locator("#admin-button");
   if (await entry.count()) {
-    await entry.click();
+    await entry.click({ force: true });
     // Retries until Bob's node has merged Alice's claim.
     await expect(bobHome.locator("#claim-admin")).toHaveCount(0);
   }
@@ -69,7 +75,7 @@ test("an admin announcement reaches a player on the other node", async ({
   const alice = await openApp(browser, GATEWAY_PORT, "alice");
   const bob = await openApp(browser, PEER_PORT, "bob");
 
-  await alice.app.locator("#admin-button").click();
+  await alice.app.locator("#admin-button").click({ force: true });
   // Alice claimed in the previous test; if this runs standalone, claim now.
   if (await alice.app.locator("#claim-admin").count()) {
     await alice.app.locator("#claim-admin").click();
@@ -109,7 +115,7 @@ test("marking the service unavailable shows a notice everywhere", async ({
   const alice = await openApp(browser, GATEWAY_PORT, "alice");
   const bob = await openApp(browser, PEER_PORT, "bob");
 
-  await alice.app.locator("#admin-button").click();
+  await alice.app.locator("#admin-button").click({ force: true });
   if (await alice.app.locator("#claim-admin").count()) {
     await alice.app.locator("#claim-admin").click();
   }
@@ -133,7 +139,7 @@ test("marking the service unavailable shows a notice everywhere", async ({
   // appears once the change has come back from the network, so wait for it
   // rather than assuming it is already there.
   const aliceHome = await reopen(alice.page, GATEWAY_PORT);
-  await aliceHome.locator("#admin-button").click();
+  await aliceHome.locator("#admin-button").click({ force: true });
   const markAvailable = aliceHome.locator("#mark-available");
   await expect(markAvailable).toBeVisible();
   await markAvailable.click();
@@ -157,7 +163,7 @@ test("an admin takedown removes a game from the listings", async ({ browser }) =
     aliceHome.locator(".list-item", { hasText: "bob" }).first(),
   ).toBeVisible();
 
-  await aliceHome.locator("#admin-button").click();
+  await aliceHome.locator("#admin-button").click({ force: true });
   if (await aliceHome.locator("#claim-admin").count()) {
     await aliceHome.locator("#claim-admin").click();
   }

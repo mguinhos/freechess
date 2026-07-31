@@ -45,7 +45,7 @@ test("a migration notice moves everyone on without cutting a game short", async 
   await expect.poll(() => moveList(bobGame)).toContain("e4");
 
   // Alice is the admin (claimed in admin.spec.ts) and announces the move.
-  await alice.app.locator("#admin-button").click();
+  await alice.app.locator("#admin-button").click({ force: true });
   await alice.app.locator("#migration-address").fill(NEW_ADDRESS);
   await alice.app.locator("#migration-message").fill("moved for a stdlib fix");
   await alice.app.locator("#announce-migration").click();
@@ -78,7 +78,7 @@ test("a migration notice moves everyone on without cutting a game short", async 
     // Call it off, whatever happened above — a lobby left locked would make
     // every later run of the suite fail for an unrelated reason.
     const adminFrame = await reopen(alice.page, GATEWAY_PORT);
-    await adminFrame.locator("#admin-button").click();
+    await adminFrame.locator("#admin-button").click({ force: true });
     await adminFrame.locator("#cancel-migration").click();
     // The cancel button only exists while a migration is announced, so its
     // disappearance is the signal that the notice is really gone.

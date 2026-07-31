@@ -185,6 +185,72 @@ impl SignedJoin {
     }
 }
 
+/// The invited player's refusal of a direct challenge.
+///
+/// A challenge that can only be accepted leaves the challenger waiting on
+/// someone who has already decided not to play, with no way to tell that from
+/// someone who simply has not looked yet. Declining is published rather than
+/// kept on the device that clicked it, for exactly that reason: the useful part
+/// is that the *other* person finds out.
+///
+/// Only the invited player may decline, so this exists only for direct
+/// challenges — an open game has nobody in particular to refuse it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedDecline {
+    #[serde(with = "crate::identity::verifying_key_serde")]
+    pub player: VerifyingKey,
+    pub at: i64,
+    #[serde(with = "crate::identity::signature_serde")]
+    pub signature: Signature,
+}
+
+fn decline_signing_bytes(game_id: &GameId, player: &VerifyingKey, at: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(80);
+    buf.extend_from_slice(SIG_DOMAIN);
+    buf.extend_from_slice(b"decline:");
+    buf.extend_from_slice(&game_id.0);
+    buf.extend_from_slice(player.as_bytes());
+    buf.extend_from_slice(&at.to_le_bytes());
+    buf
+}
+
+impl SignedDecline {
+    pub fn new(key: &SigningKey, game_id: &GameId, at: i64) -> SignedDecline {
+        let player = key.verifying_key();
+        SignedDecline {
+            player,
+            at,
+            signature: key.sign(&decline_signing_bytes(game_id, &player, at)),
+        }
+    }
+
+    pub fn player_id(&self) -> PlayerId {
+        PlayerId::from(&self.player)
+    }
+
+    pub fn verify(
+        &self,
+        params: &ChessGameParametersV1,
+        challenged: Option<VerifyingKey>,
+    ) -> Result<(), String> {
+        let Some(invited) = challenged else {
+            return Err("only a direct challenge can be declined".to_string());
+        };
+        if self.player != invited {
+            return Err("only the challenged player may decline".to_string());
+        }
+        if self.at <= 0 {
+            return Err("decline timestamp must be positive".to_string());
+        }
+        verify_sig(
+            &self.player,
+            &decline_signing_bytes(&params.game_id, &self.player, self.at),
+            &self.signature,
+            "decline",
+        )
+    }
+}
+
 /// The creator's countersignature seating one challenger.
 ///
 /// This is the whole authorization story for the second seat. The creator's key
@@ -253,6 +319,9 @@ pub struct OpponentSlotV1 {
     /// The seat, once countersigned. Immutable afterwards.
     #[serde(default)]
     pub seated: Option<SignedAcceptance>,
+    /// The invited player's refusal, for a direct challenge they do not want.
+    #[serde(default)]
+    pub declined: Option<SignedDecline>,
 }
 
 impl OpponentSlotV1 {
@@ -260,6 +329,11 @@ impl OpponentSlotV1 {
     /// `None` here has no second player and therefore no legal move.
     pub fn get(&self) -> Option<&SignedJoin> {
         self.seated.as_ref().map(|a| &a.join)
+    }
+
+    /// Whether the invited player has refused this challenge.
+    pub fn is_declined(&self) -> bool {
+        self.declined.is_some()
     }
 
     pub fn accepted(&self) -> Option<&SignedAcceptance> {
@@ -287,6 +361,16 @@ impl OpponentSlotV1 {
         }
     }
 
+    fn absorb_decline(&mut self, incoming: SignedDecline) {
+        // Only one key can ever produce a valid decline, so this settles the
+        // one case left: that key signing twice. Lowest signature bytes wins,
+        // deterministically, on every peer.
+        match &self.declined {
+            Some(current) if current.signature.to_bytes() <= incoming.signature.to_bytes() => {}
+            _ => self.declined = Some(incoming),
+        }
+    }
+
     fn absorb_seat(&mut self, incoming: SignedAcceptance) {
         match &self.seated {
             None => self.seated = Some(incoming),
@@ -304,6 +388,16 @@ impl OpponentSlotV1 {
     /// every peer.
     pub(super) fn prune(&mut self) {
         if self.seated.is_some() {
+            self.offers.clear();
+            // A seat that got filled outranks a refusal: if the creator
+            // countersigned somebody, the game is on, and a stale decline must
+            // not be left implying otherwise.
+            self.declined = None;
+            return;
+        }
+        if self.declined.is_some() {
+            // Refused: nobody is going to take this seat, so the offers are
+            // dead weight.
             self.offers.clear();
             return;
         }
@@ -329,7 +423,7 @@ impl ComposableState for OpponentSlotV1 {
     /// summaries, so neither ships, and the creator then sees a different offer
     /// depending on which peer it asks — meaning which one it can countersign
     /// turns on where it happens to be looking.
-    type Summary = (Vec<([u8; 32], u64)>, Option<u64>);
+    type Summary = (Vec<([u8; 32], u64)>, Option<u64>, Option<u64>);
     type Delta = OpponentDelta;
     type Parameters = ChessGameParametersV1;
 
@@ -342,6 +436,9 @@ impl ComposableState for OpponentSlotV1 {
             seat.verify(params)?;
             seat.join.check_invitation(parent)?;
         }
+        if let Some(decline) = &self.declined {
+            decline.verify(params, parent.setup.get().and_then(|s| s.setup.challenged))?;
+        }
         Ok(())
     }
 
@@ -352,6 +449,9 @@ impl ComposableState for OpponentSlotV1 {
                 .map(|(key, join)| (*key, signature_digest(&join.signature)))
                 .collect(),
             self.seated.as_ref().map(|a| signature_digest(&a.signature)),
+            self.declined
+                .as_ref()
+                .map(|d| signature_digest(&d.signature)),
         )
     }
 
@@ -361,7 +461,7 @@ impl ComposableState for OpponentSlotV1 {
         _params: &Self::Parameters,
         old_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let (their_offers, their_seat) = old_summary;
+        let (their_offers, their_seat, their_decline) = old_summary;
         let theirs: BTreeMap<[u8; 32], u64> = their_offers.iter().copied().collect();
         let offers: Vec<SignedJoin> = self
             .offers
@@ -375,10 +475,18 @@ impl ComposableState for OpponentSlotV1 {
             (Some(mine), Some(theirs)) if signature_digest(&mine.signature) == *theirs => None,
             (mine, _) => mine.clone(),
         };
-        if offers.is_empty() && seated.is_none() {
+        let declined = match (&self.declined, their_decline) {
+            (Some(mine), Some(theirs)) if signature_digest(&mine.signature) == *theirs => None,
+            (mine, _) => mine.clone(),
+        };
+        if offers.is_empty() && seated.is_none() && declined.is_none() {
             None
         } else {
-            Some(OpponentDelta { offers, seated })
+            Some(OpponentDelta {
+                offers,
+                seated,
+                declined,
+            })
         }
     }
 
@@ -399,6 +507,10 @@ impl ComposableState for OpponentSlotV1 {
             seat.join.check_invitation(parent)?;
             self.absorb_seat(seat.clone());
         }
+        if let Some(decline) = &delta.declined {
+            decline.verify(params, parent.setup.get().and_then(|s| s.setup.challenged))?;
+            self.absorb_decline(decline.clone());
+        }
         Ok(())
     }
 }
@@ -410,6 +522,8 @@ pub struct OpponentDelta {
     pub offers: Vec<SignedJoin>,
     #[serde(default)]
     pub seated: Option<SignedAcceptance>,
+    #[serde(default)]
+    pub declined: Option<SignedDecline>,
 }
 
 impl OpponentDelta {
@@ -418,6 +532,7 @@ impl OpponentDelta {
         OpponentDelta {
             offers: vec![join],
             seated: None,
+            declined: None,
         }
     }
 
@@ -426,6 +541,16 @@ impl OpponentDelta {
         OpponentDelta {
             offers: Vec::new(),
             seated: Some(acceptance),
+            declined: None,
+        }
+    }
+
+    /// A delta refusing a direct challenge.
+    pub fn decline(decline: SignedDecline) -> OpponentDelta {
+        OpponentDelta {
+            offers: Vec::new(),
+            seated: None,
+            declined: Some(decline),
         }
     }
 }

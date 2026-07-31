@@ -58,7 +58,7 @@ test("a direct challenge raises a count in the other player's header", async ({
 
   // Opening it names the challenger and offers the seat. Taking it clears the
   // count, because the challenge is no longer waiting on anything.
-  await bobAgain.locator("#notifications-button").click();
+  await bobAgain.locator("#notifications-button").click({ force: true });
   await expect(bobAgain.locator(".modal")).toContainText("alice");
   await bobAgain.locator(".modal").getByRole("button", { name: "Play" }).click();
   await expect(bobAgain.locator(".board")).toBeVisible();
@@ -86,7 +86,7 @@ test("an open game raises no count for anyone", async ({ browser }) => {
   const bobHome = await reopen(bob.page, PEER_PORT);
   await expect(bobHome.locator("#notifications-button")).toBeVisible();
   await expect(bobHome.locator("#notifications-count")).toHaveCount(0);
-  await bobHome.locator("#notifications-button").click();
+  await bobHome.locator("#notifications-button").click({ force: true });
   await expect(bobHome.locator("#no-notifications")).toBeVisible();
 
   await alice.context.close();

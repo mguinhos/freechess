@@ -23,6 +23,7 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     let rating = s.my_rating();
     let online = s.lobby.presence.online_count(now_ms());
     let is_admin = s.is_admin();
+    let account_settled = s.account_settled;
     // Direct challenges waiting on an answer. The count is of things still to
     // act on, not of things not yet read: a challenge someone accepted or
     // withdrew stops counting on its own, which needs no record of what this
@@ -30,7 +31,7 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     let challenges: Vec<_> = s
         .lobby
         .games
-        .challenges_for(s.me())
+        .challenges_for(s.me(), now_ms())
         .into_iter()
         .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
         .cloned()
@@ -95,6 +96,16 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
             button {
                 class: "ghost",
                 id: "account-button",
+                // Whether identity has come back from the delegate yet.
+                //
+                // Until it has, the app is running on a session key it just
+                // generated, and anything signed in that window is signed by
+                // somebody who will not exist a moment later. There is no other
+                // way to observe that from outside, and guessing at it with
+                // timers is what made the browser tests flaky: a claim made too
+                // early belonged to a player the next page load had never heard
+                // of.
+                "data-settled": "{account_settled}",
                 onclick: move |_| show_account.set(true),
                 "{nickname} ({rating})"
             }
@@ -133,7 +144,7 @@ pub fn NotificationsModal(
     let challenges: Vec<_> = s
         .lobby
         .games
-        .challenges_for(me)
+        .challenges_for(me, now_ms())
         .into_iter()
         .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
         .cloned()
@@ -181,6 +192,12 @@ pub fn NotificationsModal(
                                             on_close.call(());
                                         },
                                         "Play"
+                                    }
+                                    button {
+                                        class: "ghost small",
+                                        id: "decline-notification-{id}",
+                                        onclick: move |_| sync.send(Cmd::DeclineChallenge(id)),
+                                        "Decline"
                                     }
                                 }
                             }
@@ -413,7 +430,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     let open: Vec<_> = s
         .lobby
         .games
-        .public_open_games()
+        .public_open_games(now)
         .into_iter()
         .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
         .cloned()
@@ -421,7 +438,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     let invites: Vec<_> = s
         .lobby
         .games
-        .challenges_for(me)
+        .challenges_for(me, now_ms())
         .into_iter()
         .cloned()
         .collect();
@@ -480,6 +497,20 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                                                 move |_| sync.send(Cmd::JoinGame(id))
                                             },
                                             "Accept"
+                                        }
+                                        // Declining is published, not hidden
+                                        // locally: the point is that the
+                                        // challenger finds out, instead of
+                                        // waiting on an answer that is never
+                                        // coming.
+                                        button {
+                                            class: "ghost",
+                                            id: "decline-{entry.game_id}",
+                                            onclick: {
+                                                let id = entry.game_id;
+                                                move |_| sync.send(Cmd::DeclineChallenge(id))
+                                            },
+                                            "Decline"
                                         }
                                     }
                                 }
@@ -606,14 +637,17 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                 }
 
                 div {
-                    div { class: "panel",
+                    // Identified for the same reason as the players panel:
+                    // a nickname appears in several lists, so a test that
+                    // matches on one alone reads an arbitrary row.
+                    div { class: "panel", id: "ranking-panel",
                         h2 { "Ranking" }
                         if ranked.is_empty() {
                             div { class: "empty", "No rated games yet." }
                         } else {
                             div { class: "list",
                                 for (i, entry) in ranked.iter().take(20).enumerate() {
-                                    div { key: "{entry.player_id()}", class: "list-item",
+                                    div { key: "{entry.player_id()}", id: "rank-{entry.player_id()}", class: "list-item",
                                         span { class: "rank", "{i + 1}" }
                                         span { class: "grow", "{entry.nickname}" }
                                         span { class: "elo", "{entry.rating}" }

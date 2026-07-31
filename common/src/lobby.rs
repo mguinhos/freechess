@@ -45,7 +45,7 @@
 //! requires; an order-sensitive cap would silently diverge peers.
 
 use crate::chess::Color;
-use crate::game::opponent::SignedAcceptance;
+use crate::game::opponent::{SignedAcceptance, SignedDecline};
 use crate::game::setup::{SignedGameSetup, TimeControl, MAX_NICKNAME_LEN};
 use crate::game::{GameResult, SIG_DOMAIN};
 use crate::identity::{summary_digest, verify_sig, GameId, PlayerId};
@@ -65,6 +65,24 @@ pub const MAX_LISTINGS_PER_CREATOR: usize = 20;
 
 /// Listings the lobby holds in total.
 pub const MAX_LOBBY_ENTRIES: usize = 500;
+
+/// How long an unanswered challenge stays on offer.
+///
+/// A challenge nobody answers used to sit there for ever, because the only
+/// thing that removed one was a quota. That leaves the lobby advertising games
+/// whose creator walked away hours ago, and leaves the invited player with a
+/// notification for something long dead.
+///
+/// This is applied by *readers*, not by the contract's eviction. A contract has
+/// no clock, and every synthetic one available here is forgeable: `created_at`
+/// is the creator's own claim, so taking the newest timestamp in the lobby as
+/// "now" would let a single entry dated in the next century expire everything
+/// else in one merge. Eviction stays on the quotas, which are a pure function
+/// of the set and cannot be steered that way; expiry lives where a real clock
+/// exists, which is the client. The cost is that an expired listing still
+/// occupies one of its creator's open slots until a quota reclaims it — and
+/// since creating a fourth open game evicts their oldest, that heals itself.
+pub const CHALLENGE_TTL_MS: i64 = 60 * 60 * 1000;
 
 /// Longest FEN string accepted in a snapshot; a valid FEN is comfortably under
 /// this, and the bound stops a peer inflating state with a huge string.
@@ -207,6 +225,10 @@ pub struct LobbyEntry {
     /// wins" is won by whoever lies hardest.
     #[serde(default)]
     pub opponent: Option<SignedAcceptance>,
+    /// The invited player's refusal, mirrored from the game so the challenge
+    /// stops being offered anywhere a client looks.
+    #[serde(default)]
+    pub declined: Option<SignedDecline>,
     #[serde(default)]
     pub snapshot: Option<SignedSnapshot>,
 }
@@ -217,6 +239,7 @@ impl LobbyEntry {
             game_id,
             setup,
             opponent: None,
+            declined: None,
             snapshot: None,
         }
     }
@@ -238,8 +261,25 @@ impl LobbyEntry {
     }
 
     /// Still waiting for a challenger.
+    ///
+    /// A refused challenge is not open: nobody is coming, so it should stop
+    /// occupying a listing, stop counting against the creator's quota, and
+    /// stop appearing in the invited player's notifications.
     pub fn is_open(&self) -> bool {
-        self.opponent.is_none()
+        self.opponent.is_none() && self.declined.is_none()
+    }
+
+    /// Whether the invited player has refused this challenge.
+    pub fn is_declined(&self) -> bool {
+        self.declined.is_some()
+    }
+
+    /// Whether an unanswered challenge has been on offer too long.
+    ///
+    /// Only open games expire: once someone is seated the game is real, and how
+    /// long it took to start is nobody's business.
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.is_open() && self.created_at().saturating_add(CHALLENGE_TTL_MS) < now
     }
 
     /// Being played right now — what the home page shows as "live".
@@ -262,6 +302,19 @@ impl LobbyEntry {
             keys.push(seat.join.player);
         }
         keys
+    }
+
+    /// Whether `player` is one of the two who played this game.
+    pub fn involves(&self, player: PlayerId) -> bool {
+        self.player_keys()
+            .iter()
+            .any(|k| PlayerId::from(k) == player)
+    }
+
+    /// A finished game this player took part in — the set that still owes a
+    /// certificate if it was never rated.
+    pub fn is_finished_game_of(&self, player: PlayerId) -> bool {
+        self.result().is_over() && self.involves(player)
     }
 
     /// Nicknames as `(white, black)`.
@@ -320,6 +373,9 @@ impl LobbyEntry {
                 }
             }
         }
+        if let Some(decline) = &self.declined {
+            decline.verify(&params, self.setup.setup.challenged)?;
+        }
         if let Some(snapshot) = &self.snapshot {
             snapshot.verify(&self.game_id, &self.player_keys())?;
         }
@@ -348,6 +404,13 @@ impl LobbyEntry {
             }
             None => buf.push(0),
         }
+        match &self.declined {
+            Some(decline) => {
+                buf.push(1);
+                buf.extend_from_slice(&decline.signature.to_bytes());
+            }
+            None => buf.push(0),
+        }
         match &self.snapshot {
             Some(snapshot) => {
                 buf.push(1);
@@ -370,6 +433,18 @@ impl LobbyEntry {
             if theirs.signature.to_bytes() < mine.signature.to_bytes() {
                 self.opponent = other.opponent;
             }
+        }
+
+        match (&self.declined, &other.declined) {
+            (None, Some(_)) => self.declined = other.declined.clone(),
+            // Only the invited player can produce one, so this settles the sole
+            // remaining case: that player signing twice.
+            (Some(mine), Some(theirs))
+                if theirs.signature.to_bytes() < mine.signature.to_bytes() =>
+            {
+                self.declined = other.declined.clone()
+            }
+            _ => {}
         }
 
         match (&self.snapshot, &other.snapshot) {
@@ -402,6 +477,11 @@ impl LobbyGamesV1 {
         self.games.get(id)
     }
 
+    /// Every listing, in no particular order.
+    pub fn all(&self) -> Vec<&LobbyEntry> {
+        self.games.values().collect()
+    }
+
     fn absorb(&mut self, incoming: LobbyEntry) {
         match self.games.get_mut(&incoming.game_id) {
             Some(existing) => existing.absorb(incoming),
@@ -427,10 +507,22 @@ impl LobbyGamesV1 {
     }
 
     /// Games waiting for a challenger, newest first.
+    /// Open games, including ones that have been waiting too long.
+    ///
+    /// Prefer [`open_games_at`](Self::open_games_at) anywhere a person will see
+    /// the result; this exists for the eviction rules, which have no clock.
     pub fn open_games(&self) -> Vec<&LobbyEntry> {
         let mut out: Vec<&LobbyEntry> = self.games.values().filter(|e| e.is_open()).collect();
         out.sort_by_key(|e| (std::cmp::Reverse(e.created_at()), e.game_id.0));
         out
+    }
+
+    /// Open games still worth offering, given the caller's clock.
+    pub fn open_games_at(&self, now: i64) -> Vec<&LobbyEntry> {
+        self.open_games()
+            .into_iter()
+            .filter(|e| !e.is_expired(now))
+            .collect()
     }
 
     /// Games being played right now, most recently active first. This is the
@@ -443,8 +535,8 @@ impl LobbyGamesV1 {
 
     /// Open games anyone may join — direct challenges are excluded, since only
     /// their invitee can accept.
-    pub fn public_open_games(&self) -> Vec<&LobbyEntry> {
-        self.open_games()
+    pub fn public_open_games(&self, now: i64) -> Vec<&LobbyEntry> {
+        self.open_games_at(now)
             .into_iter()
             .filter(|e| e.setup.setup.challenged.is_none())
             .collect()
@@ -452,8 +544,8 @@ impl LobbyGamesV1 {
 
     /// Pending challenges addressed to `player`, newest first. This is the
     /// player's "you have been invited" list.
-    pub fn challenges_for(&self, player: PlayerId) -> Vec<&LobbyEntry> {
-        self.open_games()
+    pub fn challenges_for(&self, player: PlayerId, now: i64) -> Vec<&LobbyEntry> {
+        self.open_games_at(now)
             .into_iter()
             .filter(|e| {
                 e.setup
