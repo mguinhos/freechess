@@ -27,8 +27,8 @@
 //!   that signer holds the key, so there is no incentive to forge one and no way
 //!   to forge someone else's.
 //! * A player whose attestations stop advancing is, from state's point of view,
-//!   gone. After [`absence_forfeit_ms`] of no new evidence — a window scaled to
-//!   the time control — their opponent can claim the game.
+//!   gone. After [`ABSENCE_FORFEIT_MS`] of no new evidence their opponent can
+//!   claim the game.
 //!
 //! That gives two provable ways to lose on time, and
 //! [`ChessGameStateV1::timeout_provable_at`](super::ChessGameStateV1::timeout_provable_at)
@@ -38,7 +38,7 @@
 //!    hits zero. They were present and they ran out of time. Unforgeable: the
 //!    claim cannot mature until the loser themselves signs their way up to it.
 //! 2. **Absence.** The loser's attestations stopped while they still had time on
-//!    the clock. The claim matures [`absence_forfeit_ms`] after their last
+//!    the clock. The claim matures [`ABSENCE_FORFEIT_MS`] after their last
 //!    signature.
 //!
 //! # What this does and does not guarantee
@@ -80,37 +80,12 @@ use std::collections::BTreeMap;
 /// against a player who is really there, since their next tick invalidates it.
 pub const CLOCK_TICK_MS: i64 = 10_000;
 
-/// Floor and ceiling on how long a player's attestations may go stale before
-/// their opponent can claim the game.
+/// How long a player's attestations may go stale before their opponent can
+/// claim the game.
 ///
-/// The floor keeps a bullet game claimable in something like its own timescale;
-/// the ceiling keeps a correspondence game from being unreclaimable for hours.
-pub const MIN_ABSENCE_FORFEIT_MS: i64 = 30_000;
-pub const MAX_ABSENCE_FORFEIT_MS: i64 = 5 * 60_000;
-
-/// How long `tc`'s players may go silent before absence can be claimed.
-///
-/// This used to be a flat 45 seconds, and that is unfair in a way worth being
-/// precise about. Away from the board in real chess, your clock runs and you
-/// lose when it reaches zero — you do not lose *for being away*. A fixed window
-/// short-circuits that: a player with twenty minutes in hand could lose a game
-/// they were winning because a backgrounded tab had its timers throttled past
-/// three quarters of a minute.
-///
-/// It cannot be removed altogether. A contract has no clock, so the only
-/// evidence that time has passed is a signature from the player it counts
-/// against; when those stop at T, nothing in state can show that more than T
-/// has elapsed. The window is therefore a policy, not a proof — but it can at
-/// least be scaled to the game being played, so the cost of a disconnection is
-/// proportional to what is at stake.
-///
-/// A tenth of the game's estimated length, using the same
-/// `initial + 40 × increment` estimate the lobby already categorises games by,
-/// so the two never disagree about how long a game is meant to take.
-pub fn absence_forfeit_ms(tc: &super::setup::TimeControl) -> i64 {
-    let estimated_secs = tc.initial_secs as i64 + 40 * tc.increment_secs as i64;
-    (estimated_secs * 1000 / 10).clamp(MIN_ABSENCE_FORFEIT_MS, MAX_ABSENCE_FORFEIT_MS)
-}
+/// Four missed ticks, so an ordinary network hiccup or a browser throttling a
+/// backgrounded tab does not cost anybody a game.
+pub const ABSENCE_FORFEIT_MS: i64 = 45_000;
 
 /// A player's signed statement that they are present and what time they see.
 ///

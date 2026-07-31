@@ -300,10 +300,6 @@ impl ChessGameStateV1 {
             return None;
         }
 
-        // The time control decides how long silence is tolerated before absence
-        // can be claimed: a long game gives more rope than a bullet one.
-        let tc = self.setup.get()?.setup.time_control;
-
         let since = if plies == 0 {
             self.game_start_time()?
         } else {
@@ -333,7 +329,7 @@ impl ChessGameStateV1 {
             flag_fall
         } else {
             // Their signatures stopped while they still had time on the clock.
-            attested.saturating_add(clocks::absence_forfeit_ms(&tc))
+            attested.saturating_add(clocks::ABSENCE_FORFEIT_MS)
         })
     }
 

@@ -11,10 +11,7 @@ use super::clocks::{self, ClockAttestation};
 use super::conclusion::{self, SignedConclusion};
 use super::moves::AuthorizedMove;
 use super::opponent::{OpponentDelta, SignedAcceptance, SignedDecline, SignedJoin};
-use super::setup::{
-    leading_zero_bits, GameSetup, TimeControl, MAX_INCREMENT_SECS, MAX_INITIAL_SECS,
-    MIN_INITIAL_SECS, POW_DIFFICULTY_BITS,
-};
+use super::setup::{leading_zero_bits, GameSetup, TimeControl, POW_DIFFICULTY_BITS};
 use super::*;
 use crate::chess::{Color, Move};
 use ed25519_dalek::SigningKey;
@@ -1175,7 +1172,7 @@ fn a_present_players_next_attestation_strips_a_pre_signed_absence_claim() {
     };
     insert(&mut state, last_tick);
 
-    let deadline = last_tick + clocks::absence_forfeit_ms(&TimeControl::default());
+    let deadline = last_tick + clocks::ABSENCE_FORFEIT_MS;
     assert_eq!(state.timeout_provable_at(Color::Black, 1), Some(deadline));
 
     let claim = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, deadline);
@@ -1208,7 +1205,7 @@ fn a_player_who_stops_attesting_forfeits_without_burning_their_whole_clock() {
         ClockAttestation::new(&opponent, &params.game_id, vanished_at),
     );
 
-    let deadline = vanished_at + clocks::absence_forfeit_ms(&TimeControl::default());
+    let deadline = vanished_at + clocks::ABSENCE_FORFEIT_MS;
     let claim = SignedConclusion::claim_timeout(&creator, &params.game_id, 1, deadline);
     state.conclusion = conclusion::ConclusionV1::single(claim);
     state.verify(&state, &params).unwrap();
@@ -2244,144 +2241,4 @@ fn certification_converges_regardless_of_order() {
         .apply_delta(&base, &params, &Some(existing))
         .unwrap();
     assert_eq!(before, peer1.certification, "merge must be idempotent");
-}
-
-// -------------------------------------------------- absence, proportionally
-
-/// The window before an absent player forfeits scales with the game, instead of
-/// being a flat 45 seconds for every format.
-///
-/// The unfairness that motivated this is worth restating: away from the board in
-/// real chess your clock runs and you lose when it reaches zero — you do not
-/// lose *for being away*. A fixed window short-circuits that, and a player with
-/// twenty minutes in hand could lose a won game because a backgrounded tab had
-/// its timers throttled for a minute.
-#[test]
-fn the_absence_window_scales_with_the_time_control() {
-    let bullet = TimeControl {
-        initial_secs: 60,
-        increment_secs: 0,
-    };
-    let blitz = TimeControl {
-        initial_secs: 300,
-        increment_secs: 0,
-    };
-    let rapid = TimeControl {
-        initial_secs: 1800,
-        increment_secs: 0,
-    };
-
-    let (b, z, r) = (
-        clocks::absence_forfeit_ms(&bullet),
-        clocks::absence_forfeit_ms(&blitz),
-        clocks::absence_forfeit_ms(&rapid),
-    );
-
-    assert!(b <= z && z < r, "longer games give more rope: {b} {z} {r}");
-    // Short formats land on the floor together, and that is the floor doing its
-    // job rather than the scaling failing: a tenth of five minutes is exactly
-    // the minimum, so bullet and blitz share it.
-    assert_eq!(
-        b,
-        clocks::MIN_ABSENCE_FORFEIT_MS,
-        "bullet sits on the floor"
-    );
-    assert_eq!(
-        z,
-        clocks::MIN_ABSENCE_FORFEIT_MS,
-        "so does a five-minute game"
-    );
-    assert_eq!(r, 180_000, "a 30-minute game gives three minutes");
-
-    // The increment counts towards the estimate, so a game that will genuinely
-    // run long is treated as one.
-    let with_increment = TimeControl {
-        initial_secs: 300,
-        increment_secs: 10,
-    };
-    assert!(
-        clocks::absence_forfeit_ms(&with_increment) > z,
-        "increment lengthens the game, so it lengthens the window"
-    );
-}
-
-#[test]
-fn the_absence_window_is_bounded_at_both_ends() {
-    // Nothing may claim a game faster than the floor, however short the format.
-    let instant = TimeControl {
-        initial_secs: MIN_INITIAL_SECS,
-        increment_secs: 0,
-    };
-    assert_eq!(
-        clocks::absence_forfeit_ms(&instant),
-        clocks::MIN_ABSENCE_FORFEIT_MS
-    );
-
-    // And a correspondence game does not become unreclaimable for hours.
-    let correspondence = TimeControl {
-        initial_secs: MAX_INITIAL_SECS,
-        increment_secs: MAX_INCREMENT_SECS,
-    };
-    assert_eq!(
-        clocks::absence_forfeit_ms(&correspondence),
-        clocks::MAX_ABSENCE_FORFEIT_MS
-    );
-}
-
-/// The scaling has to reach the rule itself, not just the helper.
-#[test]
-fn a_longer_game_postpones_the_absence_deadline() {
-    let creator = key();
-    let opponent = key();
-
-    let deadline_for = |initial_secs: u32| -> i64 {
-        let setup = GameSetup::mine(
-            &creator.verifying_key(),
-            Color::White,
-            TimeControl {
-                initial_secs,
-                increment_secs: 0,
-            },
-            T0,
-            "creator".to_string(),
-        );
-        let game_id = setup.derive_game_id(&creator.verifying_key());
-        let params = ChessGameParametersV1 {
-            creator: creator.verifying_key(),
-            game_id,
-        };
-        let mut state = ChessGameStateV1 {
-            setup: setup::GameSetupV1(Some(setup.sign(&creator, &game_id))),
-            ..Default::default()
-        };
-        state.opponent = seat(&creator, &opponent, &params, T0 + 1000, "opponent");
-        push_move(&mut state, &params, &creator, 0, "e2e4", T0 + 2000);
-        state.prune(&params).unwrap();
-
-        // Black is to move and stops attesting well before their flag falls.
-        let vanished_at = T0 + 5000;
-        state
-            .clocks
-            .apply_delta(
-                &state.clone(),
-                &params,
-                &Some(vec![ClockAttestation::new(
-                    &opponent,
-                    &params.game_id,
-                    vanished_at,
-                )]),
-            )
-            .unwrap();
-        state
-            .timeout_provable_at(Color::Black, 1)
-            .expect("absence is provable eventually")
-    };
-
-    let short = deadline_for(60);
-    let long = deadline_for(1800);
-    assert!(
-        long > short,
-        "the same absence should be forgiven longer in a longer game: {short} vs {long}"
-    );
-    assert_eq!(long - short, 180_000 - clocks::MIN_ABSENCE_FORFEIT_MS);
 }
