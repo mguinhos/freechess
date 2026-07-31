@@ -23,6 +23,15 @@
 
 * { box-sizing: border-box; }
 
+/* Dioxus's mount point carries the column as well, or the footer inside it is
+   laid out in ordinary block flow and simply follows the content. */
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 body {
   margin: 0;
   /* Sticky footer: the column fills the viewport and the footer is pushed to

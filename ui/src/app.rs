@@ -1216,18 +1216,30 @@ async fn file_certificate(
         None => return Ok(()),
     };
 
-    let (nickname, games_played, already) = state.with(|s| {
+    // Only file a game *newer* than the one our entry already cites.
+    //
+    // The guard used to be "is this the game our entry names?", which is only
+    // correct while there is one finished game. With two, each takes it in
+    // turns to find the other named and re-file itself — and every re-filing
+    // increments `games_played`, which changes the K factor, which changes the
+    // rating. The leaderboard keeps whichever entry has the higher count, so
+    // the two ratings visibly oscillated forever.
+    //
+    // Comparing finish times is durable across reloads (it needs no memory of
+    // what this device has done) and settles: each game is filed exactly once,
+    // and `games_played` advances by exactly one per game.
+    let (nickname, games_played, already_counted) = state.with(|s| {
         let existing = s.lobby.leaderboard.get(me);
         (
             s.account.nickname.clone(),
             existing.map(|e| e.games_played).unwrap_or(0) + 1,
             existing
-                .map(|e| e.last_game.game_id == certificate.game_id)
+                .map(|e| certificate.finished_at <= e.last_game.finished_at)
                 .unwrap_or(false),
         )
     });
-    if already {
-        return Ok(()); // this game is already the one our entry cites
+    if already_counted {
+        return Ok(());
     }
 
     let rating = chess_core::elo::apply_result(
