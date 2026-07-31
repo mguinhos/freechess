@@ -97,6 +97,9 @@ pub struct AppState {
     /// before the delegate exists is dropped with no error. So the ask is
     /// retried until an answer comes back.
     pub account_settled: bool,
+    /// Whether the retired delegates have already been asked this session, so
+    /// a second empty answer does not restart the probe in a loop.
+    pub legacy_probed: bool,
 }
 
 impl AppState {
@@ -112,6 +115,7 @@ impl AppState {
             pending_join: None,
             nickname_unset: true,
             account_settled: false,
+            legacy_probed: false,
         }
     }
 
@@ -182,6 +186,13 @@ pub enum Cmd {
     },
     /// Ask the delegate for the stored account, storing ours if it has none.
     LoadAccount,
+    /// Ask every retired delegate whether it still holds an account seed.
+    ///
+    /// Sent only when the current delegate has none, which is the one moment
+    /// recovery is both possible and safe: adopting an old seed when the
+    /// current delegate already has one would overwrite a live identity with an
+    /// abandoned one.
+    ProbeLegacyDelegates,
     /// Hand this session's account to the delegate for safekeeping.
     StoreAccount,
     /// Ask the delegate for the stored nickname.
@@ -208,6 +219,16 @@ pub enum Cmd {
     /// Mark the service available or not. Advisory in the same way.
     SetService {
         available: bool,
+        message: String,
+    },
+    /// Announce that the app has moved to a new contract address.
+    ///
+    /// Unlike the notices above this one is *enforced* where it can be: the
+    /// lobby stops accepting new listings. Games already under way are
+    /// untouched, and live in their own contracts regardless. An empty
+    /// `new_address` calls the migration off.
+    AnnounceMigration {
+        new_address: String,
         message: String,
     },
 }
@@ -746,6 +767,22 @@ async fn handle_cmd(
                 .map_err(|e| format!("could not ask the delegate for the account: {e}"))
         }
 
+        Cmd::ProbeLegacyDelegates => {
+            let payload = chess_core::delegate_api::ChessDelegateRequest::GetAccount
+                .to_bytes()
+                .map_err(|e| format!("could not encode the delegate request: {e}"))?;
+            for code_hash in chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES {
+                let key = freenet::legacy_delegate_key(code_hash);
+                // A node that never ran this delegate simply does not answer.
+                // That is not an error worth surfacing — it is the normal case
+                // for anyone who joined after the delegate changed.
+                let _ = api
+                    .send(freenet::delegate_request_to(key, payload.clone()))
+                    .await;
+            }
+            Ok(())
+        }
+
         Cmd::StoreAccount => {
             let payload = chess_core::delegate_api::ChessDelegateRequest::StoreAccount {
                 seed: key.to_bytes(),
@@ -780,6 +817,26 @@ async fn handle_cmd(
         Cmd::SetService { available, message } => {
             let s = chess_core::admin::ServiceState::new(key, available, message, now);
             push_admin(api, vec![chess_core::admin::AdminAction::Service(s)]).await
+        }
+
+        Cmd::AnnounceMigration {
+            new_address,
+            message,
+        } => {
+            let trimmed = new_address.trim().to_string();
+            let m = if trimmed.is_empty() {
+                chess_core::admin::Migration::cancel(key, now)
+            } else {
+                // Reject a malformed address here rather than publishing a
+                // notice every peer will silently drop: the contract requires a
+                // real 32-byte contract id, which is what lets clients render
+                // it as a link.
+                if chess_core::identity::GameId::from_base58(&trimmed).is_none() {
+                    return Err("that is not a valid contract address".to_string());
+                }
+                chess_core::admin::Migration::announce(key, trimmed, message, now)
+            };
+            push_admin(api, vec![chess_core::admin::AdminAction::Migrate(m)]).await
         }
 
         Cmd::Heartbeat { watching } => {
@@ -1138,11 +1195,29 @@ fn handle_delegate_response(
                     }
                 });
                 crate::identity::save_local(&ed25519_dalek::SigningKey::from_bytes(&seed));
-                return None;
+                // Write it back unconditionally. When the seed came from a
+                // retired delegate this is the whole point — it moves the
+                // account onto the current one, so the recovery happens once
+                // rather than on every load. When it came from the current
+                // delegate it is a harmless no-op.
+                return Some(Cmd::StoreAccount);
             }
             ChessDelegateResponse::Account { seed: None } => {
-                // First run on this device: hand the delegate the account this
-                // session generated, so the next load finds it.
+                // Nobody home. Before claiming this device as fresh, ask the
+                // delegates we have retired — the seed may be filed under one
+                // of their keys, and adopting a session-generated account now
+                // would strand it for good.
+                let should_probe = state.with_mut(|s| {
+                    let first = !s.legacy_probed;
+                    s.legacy_probed = true;
+                    first && !chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES.is_empty()
+                });
+                if should_probe {
+                    // Not settled yet: `main.rs` stores this session's account
+                    // if no legacy answers in time.
+                    return Some(Cmd::ProbeLegacyDelegates);
+                }
+                // Either there is nothing retired to ask, or we already asked.
                 state.with_mut(|s| s.account_settled = true);
                 return Some(Cmd::StoreAccount);
             }

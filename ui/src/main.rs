@@ -87,6 +87,25 @@ fn App() -> Element {
         }
     });
 
+    // Backstop for account recovery. When the current delegate is empty the
+    // client asks the retired ones first, and a node that never held them
+    // simply never answers — so without this the account would stay unsaved
+    // forever. After the grace period, claim the session's own account.
+    //
+    // The wait only happens when there is something to wait for: with no
+    // retired delegates the empty answer settles immediately, so a first-ever
+    // load is not delayed at all.
+    use_future(move || async move {
+        if chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES.is_empty() {
+            return;
+        }
+        gloo_sleep(8000).await;
+        if !state.read().account_settled {
+            state.with_mut(|s| s.account_settled = true);
+            sync.send(app::Cmd::StoreAccount);
+        }
+    });
+
     // Heartbeat. Announcing the game being watched is what lets a spectator
     // list appear, and therefore what makes "invite that spectator" possible.
     use_future(move || async move {

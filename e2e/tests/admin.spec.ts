@@ -77,7 +77,7 @@ test("an admin announcement reaches a player on the other node", async ({
 
   const text = `maintenance window ${Date.now()}`;
   await alice.app.locator("#announcement-text").fill(text);
-  await alice.app.getByRole("button", { name: "Announce" }).click();
+  await alice.app.locator("#publish-announcement").click();
 
   // The notice is lobby state, so it replicates to the other node.
   const bobHome = await reopen(bob.page, PEER_PORT);
@@ -90,12 +90,16 @@ test("an admin announcement reaches a player on the other node", async ({
 test("a non-admin cannot announce", async ({ browser }) => {
   // A node that has never claimed, so this is a genuine non-admin.
   const bob = await openApp(browser, PEER2_PORT, "carol");
-  const btn = bob.app.locator("#admin-button");
-  // With adminship claimed, Bob either has no entry point or sees no controls.
-  if (await btn.count()) {
-    await btn.click();
-    await expect(bob.app.locator("#announcement-text")).toHaveCount(0);
-  }
+
+  // Assert the end state and let it retry, rather than checking and then
+  // acting. `count()` does not retry, so it saw the entry point during the
+  // moment before the lobby had loaded — adminship looks unclaimed while the
+  // state is still empty, and the button is deliberately shown then. By the
+  // time the click ran, the claim had merged and the button was gone, so the
+  // click waited out the whole action timeout.
+  //
+  // The rule under test is simply that a non-admin is offered no way in.
+  await expect(bob.app.locator("#admin-button")).toHaveCount(0);
   await bob.context.close();
 });
 

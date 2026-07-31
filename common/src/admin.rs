@@ -488,6 +488,130 @@ impl ServiceState {
     }
 }
 
+/// An announced move of the app to a new contract address.
+///
+/// # Why this exists at all
+///
+/// The app's address is `BLAKE3(BLAKE3(container wasm) ‖ params)`, so certain
+/// changes — a dependency bump reaching the container, a security fix in
+/// `freenet-stdlib` — mint a new address and every saved link keeps pointing at
+/// the old one. Nothing in the protocol redirects. Without a notice the old
+/// address simply goes quiet: the page still loads, the lobby it looks for no
+/// longer exists, and the user sees an app that is subtly broken with no
+/// explanation. That silence is the failure mode this prevents.
+///
+/// # What it does, and deliberately does not, do
+///
+/// While a migration is announced the lobby stops accepting *new* open
+/// listings — see [`crate::lobby::LobbyGamesV1::drop_listings_after`]. Games
+/// that already have an opponent seated are never touched, because a migration
+/// is not a reason to abandon a game somebody is in the middle of. Those games
+/// live in their own contracts anyway, which this cannot reach.
+///
+/// The lock is enforceable here precisely because the listing lives in the
+/// lobby's own state. It is not absolute: two players who already know a game
+/// id can still play, and a creator can back-date `created_at` to slip a
+/// listing past. Neither matters — the point is to stop the flow of new
+/// activity onto an address that is being retired, not to be adversarially
+/// airtight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Migration {
+    /// False cancels a previously announced migration.
+    pub moving: bool,
+    /// Base58 contract id the app has moved to. Validated as a real 32-byte id
+    /// so a client can build a URL from it without sanitising free text.
+    pub new_address: String,
+    pub message: String,
+    pub at: i64,
+    #[serde(with = "crate::identity::verifying_key_serde")]
+    pub author: VerifyingKey,
+    #[serde(with = "crate::identity::signature_serde")]
+    pub signature: Signature,
+}
+
+fn migration_signing_bytes(moving: bool, new_address: &str, message: &str, at: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(96 + new_address.len() + message.len());
+    buf.extend_from_slice(SIG_DOMAIN);
+    buf.extend_from_slice(b"migration:");
+    buf.push(u8::from(moving));
+    // Length-prefixed, so no value can be shifted into the adjacent field to
+    // forge a different notice under the same signature.
+    buf.extend_from_slice(&(new_address.len() as u32).to_le_bytes());
+    buf.extend_from_slice(new_address.as_bytes());
+    buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    buf.extend_from_slice(message.as_bytes());
+    buf.extend_from_slice(&at.to_le_bytes());
+    buf
+}
+
+impl Migration {
+    pub fn announce(
+        admin: &SigningKey,
+        new_address: String,
+        message: String,
+        at: i64,
+    ) -> Migration {
+        Migration {
+            moving: true,
+            new_address: new_address.clone(),
+            message: message.clone(),
+            at,
+            author: admin.verifying_key(),
+            signature: admin.sign(&migration_signing_bytes(true, &new_address, &message, at)),
+        }
+    }
+
+    /// Call off an announced migration — the move was cancelled, or the notice
+    /// was a mistake.
+    pub fn cancel(admin: &SigningKey, at: i64) -> Migration {
+        Migration {
+            moving: false,
+            new_address: String::new(),
+            message: String::new(),
+            at,
+            author: admin.verifying_key(),
+            signature: admin.sign(&migration_signing_bytes(false, "", "", at)),
+        }
+    }
+
+    pub fn author_id(&self) -> PlayerId {
+        PlayerId::from(&self.author)
+    }
+
+    pub fn verify(&self, admins: &AdminsV1) -> Result<(), String> {
+        if self.message.len() > MAX_ANNOUNCEMENT_LEN {
+            return Err("migration message too long".to_string());
+        }
+        if self.at <= 0 {
+            return Err("migration timestamp must be positive".to_string());
+        }
+        if self.moving && GameId::from_base58(&self.new_address).is_none() {
+            // Same shape as a contract id: 32 bytes, base58. Rejecting anything
+            // else here is what lets the UI render it as a link rather than as
+            // untrusted text.
+            return Err("migration address is not a valid contract id".to_string());
+        }
+        if !self.moving && !self.new_address.is_empty() {
+            return Err("a cancelled migration must carry no address".to_string());
+        }
+        if !admins.is_admin(self.author_id()) {
+            return Err("only an admin may announce a migration".to_string());
+        }
+        verify_sig(
+            &self.author,
+            &migration_signing_bytes(self.moving, &self.new_address, &self.message, self.at),
+            &self.signature,
+            "migration notice",
+        )
+    }
+
+    /// Newest statement wins, with a deterministic tiebreak — the same rule as
+    /// [`ServiceState`], so two admins announcing at once still converge.
+    fn order(&self) -> (i64, [u8; 64]) {
+        (self.at, self.signature.to_bytes())
+    }
+}
+
 /// All administration state, carried by the lobby.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdministrationV1 {
@@ -495,6 +619,9 @@ pub struct AdministrationV1 {
     pub announcements: BTreeMap<[u8; 16], Announcement>,
     pub takedowns: BTreeMap<GameId, Takedown>,
     pub service: Option<ServiceState>,
+    /// An announced move to a new app address, if any.
+    #[serde(default)]
+    pub migration: Option<Migration>,
 }
 
 impl AdministrationV1 {
@@ -525,6 +652,17 @@ impl AdministrationV1 {
             .map(|s| s.message.clone())
     }
 
+    /// The active migration notice, if the app is moving.
+    pub fn migration(&self) -> Option<&Migration> {
+        self.migration.as_ref().filter(|m| m.moving)
+    }
+
+    /// Whether new games may still be listed. A migration closes the lobby to
+    /// new activity without disturbing games already under way.
+    pub fn accepting_new_games(&self) -> bool {
+        self.migration().is_none()
+    }
+
     pub(crate) fn absorb_grant(&mut self, grant: AdminGrant) {
         self.admins.absorb(grant);
     }
@@ -542,6 +680,17 @@ impl AdministrationV1 {
                 // Earliest takedown wins; a total order keeps peers in step.
                 if (t.at, t.signature.to_bytes()) < (current.at, current.signature.to_bytes()) {
                     self.takedowns.insert(t.game_id, t);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn absorb_migration(&mut self, m: Migration) {
+        match &self.migration {
+            None => self.migration = Some(m),
+            Some(current) => {
+                if m.order() > current.order() {
+                    self.migration = Some(m);
                 }
             }
         }
@@ -572,6 +721,11 @@ impl AdministrationV1 {
         if let Some(service) = &self.service {
             if !self.admins.is_admin(service.author_id()) {
                 self.service = None;
+            }
+        }
+        if let Some(migration) = &self.migration {
+            if !self.admins.is_admin(migration.author_id()) {
+                self.migration = None;
             }
         }
 
@@ -627,6 +781,10 @@ impl AdministrationV1 {
         if let Some(service) = &self.service {
             hasher.update(&service.signature.to_bytes());
         }
+        hasher.update(b"migration:");
+        if let Some(migration) = &self.migration {
+            hasher.update(&migration.signature.to_bytes());
+        }
         *hasher.finalize().as_bytes()
     }
 
@@ -648,6 +806,9 @@ impl AdministrationV1 {
         if let Some(service) = &self.service {
             service.verify(&self.admins)?;
         }
+        if let Some(migration) = &self.migration {
+            migration.verify(&self.admins)?;
+        }
         Ok(())
     }
 }
@@ -659,6 +820,7 @@ pub enum AdminAction {
     Announce(Announcement),
     TakeDown(Takedown),
     Service(ServiceState),
+    Migrate(Migration),
 }
 
 impl freenet_scaffold::ComposableState for AdministrationV1 {
@@ -712,6 +874,9 @@ impl freenet_scaffold::ComposableState for AdministrationV1 {
         if let Some(s) = &self.service {
             actions.push(AdminAction::Service(s.clone()));
         }
+        if let Some(m) = &self.migration {
+            actions.push(AdminAction::Migrate(m.clone()));
+        }
         if actions.is_empty() {
             None
         } else {
@@ -760,6 +925,11 @@ impl freenet_scaffold::ComposableState for AdministrationV1 {
                 AdminAction::Service(s) => {
                     if s.verify(&self.admins).is_ok() {
                         self.absorb_service(s.clone());
+                    }
+                }
+                AdminAction::Migrate(m) => {
+                    if m.verify(&self.admins).is_ok() {
+                        self.absorb_migration(m.clone());
                     }
                 }
             }

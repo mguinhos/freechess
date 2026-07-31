@@ -269,6 +269,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     let now = now_ms();
     let search = query();
     let searching = !search.trim().is_empty();
+    let accepting_new_games = s.lobby.administration.accepting_new_games();
 
     let mut live: Vec<_> = if searching {
         s.lobby.games.search(&search).into_iter().cloned().collect()
@@ -325,9 +326,16 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                             value: "{query}",
                             oninput: move |e| query.set(e.value()),
                         }
+                        // Disabled while the app is migrating. The lobby also
+                        // refuses the listing, so this is the honest signal
+                        // rather than the enforcement — a button that appears
+                        // to work and then silently drops the game would be
+                        // worse than one that says why it is off.
                         button {
                             class: "primary",
                             style: "white-space:nowrap",
+                            disabled: !accepting_new_games,
+                            title: if accepting_new_games { "" } else { "FreeChess has moved — new games are closed at this address" },
                             onclick: move |_| show_new.set(true),
                             "New game"
                         }
@@ -1003,6 +1011,7 @@ pub fn NoticeBanners(state: Signal<AppState>) -> Element {
     let s = state.read();
     let unavailable = !s.lobby.administration.available();
     let service_message = s.lobby.administration.service_message();
+    let migration = s.lobby.administration.migration().cloned();
     let announcements: Vec<_> = s
         .lobby
         .administration
@@ -1013,12 +1022,38 @@ pub fn NoticeBanners(state: Signal<AppState>) -> Element {
         .collect();
     drop(s);
 
-    if !unavailable && announcements.is_empty() {
+    if !unavailable && announcements.is_empty() && migration.is_none() {
         return rsx! {};
     }
 
+    // The new address is a contract id, and the contract validated it as one —
+    // 32 bytes of base58 — so building a URL from it cannot inject anything.
+    // The origin comes from the page rather than being hardcoded, because the
+    // app is served BY the node, on whatever port that node listens on.
+    let new_url = migration.as_ref().map(|m| {
+        let origin = web_sys::window()
+            .and_then(|w| w.location().origin().ok())
+            .unwrap_or_default();
+        format!("{origin}/v1/contract/web/{}/", m.new_address)
+    });
+
     rsx! {
         div { class: "page", style: "padding-bottom:0",
+            if let (Some(m), Some(url)) = (migration.clone(), new_url) {
+                div { class: "banner warn", id: "migration-notice",
+                    b { "FreeChess has moved to a new address." }
+                    div { class: "small", style: "margin-top:4px",
+                        "New games are closed here. Games already in progress keep running, "
+                        "and you can finish them on this page."
+                    }
+                    if !m.message.trim().is_empty() {
+                        div { class: "small", style: "margin-top:4px", "{m.message}" }
+                    }
+                    div { class: "small mono", id: "migration-new-address", style: "margin-top:6px;word-break:break-all",
+                        "{url}"
+                    }
+                }
+            }
             if unavailable {
                 div { class: "banner err", id: "service-notice",
                     b { "FreeChess is marked unavailable." }
@@ -1045,6 +1080,8 @@ pub fn NoticeBanners(state: Signal<AppState>) -> Element {
 pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()>) -> Element {
     let mut announcement = use_signal(String::new);
     let mut service_message = use_signal(String::new);
+    let mut migration_address = use_signal(String::new);
+    let mut migration_message = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
 
     let s = state.read();
@@ -1052,6 +1089,7 @@ pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()
     let is_admin = s.is_admin();
     let unclaimed = s.admin_unclaimed();
     let available = s.lobby.administration.available();
+    let current_migration = s.lobby.administration.migration().cloned();
     let admins: Vec<_> = s
         .lobby
         .administration
@@ -1175,6 +1213,7 @@ pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()
                             div { class: "actions", style: "margin-top:8px",
                                 button {
                                     class: "primary",
+                                    id: "publish-announcement",
                                     onclick: move |_| {
                                         let text = announcement();
                                         if text.trim().is_empty() {
@@ -1186,6 +1225,76 @@ pub fn AdminModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()
                                         }
                                     },
                                     "Announce"
+                                }
+                            }
+                        }
+
+                        div {
+                            label { "Announce a move to a new address" }
+                            div { class: "small muted", style: "margin-bottom:6px",
+                                "Use this when the app has been republished at a different contract "
+                                "address. Everyone still on this address is told where to go, and "
+                                "the lobby stops accepting new games. Games already in progress are "
+                                "left alone and can be finished here."
+                            }
+                            if let Some(m) = current_migration.clone() {
+                                div { class: "small mono", style: "margin-bottom:6px;word-break:break-all",
+                                    "Currently announced: {m.new_address}"
+                                }
+                            }
+                            input {
+                                id: "migration-address",
+                                value: "{migration_address}",
+                                placeholder: "New contract address (base58)\u{2026}",
+                                oninput: move |e| migration_address.set(e.value()),
+                            }
+                            input {
+                                id: "migration-message",
+                                style: "margin-top:6px",
+                                value: "{migration_message}",
+                                placeholder: "Optional note\u{2026}",
+                                maxlength: 500,
+                                oninput: move |e| migration_message.set(e.value()),
+                            }
+                            div { class: "actions", style: "margin-top:8px",
+                                button {
+                                    class: "danger",
+                                    id: "announce-migration",
+                                    onclick: move |_| {
+                                        let addr = migration_address().trim().to_string();
+                                        if addr.is_empty() {
+                                            error.set(Some("enter the new contract address".to_string()));
+                                        } else if chess_core::identity::GameId::from_base58(&addr).is_none() {
+                                            // Caught here as well as in the
+                                            // command, so the admin gets the
+                                            // reason instead of a notice that
+                                            // every peer quietly discards.
+                                            error.set(Some("that is not a valid contract address".to_string()));
+                                        } else {
+                                            sync.send(Cmd::AnnounceMigration {
+                                                new_address: addr,
+                                                message: migration_message(),
+                                            });
+                                            migration_address.set(String::new());
+                                            migration_message.set(String::new());
+                                            error.set(None);
+                                        }
+                                    },
+                                    "Announce the move"
+                                }
+                                if current_migration.is_some() {
+                                    button {
+                                        class: "ghost",
+                                        id: "cancel-migration",
+                                        onclick: move |_| {
+                                            sync.send(Cmd::AnnounceMigration {
+                                                new_address: String::new(),
+                                                message: String::new(),
+                                            });
+                                            error.set(None);
+                                        },
+                                        "Call it off"
+                                    }
                                 }
                             }
                         }

@@ -1,0 +1,9 @@
+[package]
+name = "delegate-key"
+version.workspace = true
+edition.workspace = true
+description = "Prints a delegate's code hash and key, for recording a migration entry"
+
+[dependencies]
+blake3.workspace = true
+bs58.workspace = true

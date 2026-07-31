@@ -487,6 +487,27 @@ impl LobbyGamesV1 {
 
     /// Apply every quota by deterministic eviction over the merged set.
     ///
+    /// Drop open listings created after `at` — the lobby's half of an announced
+    /// migration.
+    ///
+    /// Only *open* listings go. A game with an opponent already seated is left
+    /// alone however late it was created, because a migration is not a reason
+    /// to abandon a game somebody is in the middle of; and those games live in
+    /// their own contracts, which this cannot reach anyway. Removing the
+    /// listing is enough to stop new activity, since an unlisted game is
+    /// undiscoverable.
+    ///
+    /// Pure in the merged contents — it compares each entry's own signed
+    /// `created_at` against a signed notice timestamp — so it is idempotent and
+    /// identical on every peer, regardless of arrival order. `created_at` is
+    /// the creator's own claim, so a determined creator can back-date past
+    /// this; the consequence is one extra listing on an address that is being
+    /// retired, which does not merit a stricter rule.
+    pub fn drop_listings_after(&mut self, at: i64) {
+        self.games
+            .retain(|_, entry| !entry.is_open() || entry.created_at() <= at);
+    }
+
     /// Pure and idempotent: sorting by a total order and truncating gives the
     /// same survivors on every peer, no matter what order entries arrived in or
     /// how many times this runs.
@@ -767,10 +788,16 @@ impl LobbyStateV1 {
     /// Apply the anti-spam quotas and the ranking/presence caps after every
     /// merge.
     pub fn prune(&mut self, _params: &LobbyParametersV1) -> Result<(), String> {
+        // Administration settles first: whether the lobby is still accepting
+        // new games is decided by an admin-signed notice, and the answer has to
+        // be known before the listings are filtered against it.
+        self.administration.prune();
+        if let Some(migration) = self.administration.migration() {
+            self.games.drop_listings_after(migration.at);
+        }
         self.games.enforce_quotas();
         self.leaderboard.prune();
         self.presence.prune();
-        self.administration.prune();
         Ok(())
     }
 }

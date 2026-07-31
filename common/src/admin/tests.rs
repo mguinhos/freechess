@@ -582,3 +582,176 @@ fn peers_holding_different_announcements_exchange_them() {
     assert_eq!(peer1.announcements.len(), 2);
     assert_eq!(peer1.announcements, peer2.announcements);
 }
+
+// ------------------------------------------------------------- migration
+
+/// A plausible-looking contract id: 32 bytes, base58. The notice refuses
+/// anything else so a client can render it as a link without sanitising.
+fn an_address() -> String {
+    GameId([7u8; 32]).to_base58()
+}
+
+#[test]
+fn only_an_admin_may_announce_a_migration() {
+    let root = key();
+    let stranger = key();
+    let mut admin = AdministrationV1::default();
+    apply(
+        &mut admin,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &root,
+            "root".to_string(),
+            T0,
+        ))],
+    )
+    .unwrap();
+
+    let forged = Migration::announce(&stranger, an_address(), "moved".to_string(), T0 + 1000);
+    let err = forged.verify(&admin.admins).expect_err("must reject");
+    assert!(err.contains("only an admin"), "got: {err}");
+
+    // And the merge path skips it rather than accepting it.
+    apply(&mut admin, vec![AdminAction::Migrate(forged)]).unwrap();
+    assert!(admin.migration().is_none(), "a stranger seated a migration");
+    assert!(admin.accepting_new_games());
+}
+
+#[test]
+fn a_migration_address_must_be_a_real_contract_id() {
+    let root = key();
+    let mut admin = AdministrationV1::default();
+    apply(
+        &mut admin,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &root,
+            "root".to_string(),
+            T0,
+        ))],
+    )
+    .unwrap();
+
+    let junk = Migration::announce(
+        &root,
+        "javascript:alert(1)".to_string(),
+        "moved".to_string(),
+        T0 + 1000,
+    );
+    let err = junk.verify(&admin.admins).expect_err("must reject");
+    assert!(err.contains("valid contract id"), "got: {err}");
+}
+
+#[test]
+fn a_migration_can_be_announced_and_called_off() {
+    let root = key();
+    let mut admin = AdministrationV1::default();
+    apply(
+        &mut admin,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &root,
+            "root".to_string(),
+            T0,
+        ))],
+    )
+    .unwrap();
+    assert!(admin.accepting_new_games());
+
+    let notice = Migration::announce(&root, an_address(), "we moved".to_string(), T0 + 1000);
+    apply(&mut admin, vec![AdminAction::Migrate(notice)]).unwrap();
+    assert_eq!(admin.migration().unwrap().new_address, an_address());
+    assert!(!admin.accepting_new_games(), "new games must be locked");
+
+    // A later cancellation reopens the lobby.
+    let cancel = Migration::cancel(&root, T0 + 2000);
+    apply(&mut admin, vec![AdminAction::Migrate(cancel)]).unwrap();
+    assert!(admin.migration().is_none());
+    assert!(admin.accepting_new_games());
+}
+
+/// Two admins announcing at once must not split the network.
+#[test]
+fn competing_migration_notices_converge() {
+    let root = key();
+    let second = key();
+    let mut base = AdministrationV1::default();
+    apply(
+        &mut base,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &root,
+            "root".to_string(),
+            T0,
+        ))],
+    )
+    .unwrap();
+    apply(
+        &mut base,
+        vec![AdminAction::Grant(AdminGrant::grant(
+            &root,
+            second.verifying_key(),
+            "second".to_string(),
+            T0 + 100,
+        ))],
+    )
+    .unwrap();
+
+    let a = AdminAction::Migrate(Migration::announce(
+        &root,
+        an_address(),
+        "a".to_string(),
+        T0 + 1000,
+    ));
+    let b = AdminAction::Migrate(Migration::announce(
+        &second,
+        GameId([9u8; 32]).to_base58(),
+        "b".to_string(),
+        T0 + 1000,
+    ));
+
+    let mut peer1 = base.clone();
+    apply(&mut peer1, vec![a.clone()]).unwrap();
+    apply(&mut peer1, vec![b.clone()]).unwrap();
+
+    let mut peer2 = base;
+    apply(&mut peer2, vec![b]).unwrap();
+    apply(&mut peer2, vec![a]).unwrap();
+
+    assert_eq!(peer1.migration, peer2.migration, "must converge");
+    assert!(peer1.migration().is_some());
+}
+
+/// A migration published by an admin whose grant later loses the root race
+/// goes with it, like every other action that admin took.
+#[test]
+fn a_revoked_admins_migration_is_dropped() {
+    let alice = key();
+    let bob = key();
+    let mut admin = AdministrationV1::default();
+
+    // Bob claims later, so his branch loses once Alice's claim is merged.
+    apply(
+        &mut admin,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &bob,
+            "bob".to_string(),
+            T0 + 5000,
+        ))],
+    )
+    .unwrap();
+    let notice = Migration::announce(&bob, an_address(), "moved".to_string(), T0 + 6000);
+    apply(&mut admin, vec![AdminAction::Migrate(notice)]).unwrap();
+    assert!(admin.migration().is_some(), "premise: bob's notice is live");
+
+    apply(
+        &mut admin,
+        vec![AdminAction::Grant(AdminGrant::claim(
+            &alice,
+            "alice".to_string(),
+            T0,
+        ))],
+    )
+    .unwrap();
+    assert!(
+        admin.migration().is_none(),
+        "the notice outlived the admin who signed it"
+    );
+    assert!(admin.accepting_new_games());
+}

@@ -32,7 +32,14 @@ export default defineConfig({
     // appears hangs until the test cap and is reported as a bare "test
     // timeout" naming nothing — the single most misleading failure mode in
     // this suite. Bound them so the report says which action was stuck.
-    actionTimeout: 60_000,
+    //
+    // Generously, though. This was 60s first, and that broke a path that was
+    // slow but correct: the admin entry point only appears once the delegate
+    // has returned the stored account, which on a cold node took 31s. The
+    // point of the bound is to name the stuck action, not to police latency —
+    // so keep it above the per-assertion timeout, and let the test cap be what
+    // ends a genuinely hung run.
+    actionTimeout: 120_000,
     navigationTimeout: 90_000,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",

@@ -23,3 +23,8 @@ freenet-scaffold-macro.workspace = true
 [dev-dependencies]
 rand = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
+# Test-only, so it never reaches the contract or delegate WASM. It is here so
+# `delegate_key_for` can be pinned against the derivation freenet-stdlib really
+# uses — if the two drift, account recovery silently probes keys that never
+# existed.
+freenet-stdlib = { workspace = true }

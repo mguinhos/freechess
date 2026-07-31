@@ -149,6 +149,7 @@ dependencies = [
     "test",
     "check-contract-keys",
     "check-published-contract",
+    "check-delegate-migration",
 ]
 
 [tasks.check-contract-keys]
@@ -169,6 +170,41 @@ if [ -n "$duplicates" ]; then
 fi
 echo "contract WASMs are distinct:"
 sha256sum game_contract.wasm lobby_contract.wasm archive_contract.wasm player_contract.wasm
+'''
+
+[tasks.check-delegate-migration]
+description = "Fail if the delegate was re-keyed without recording a migration"
+dependencies = ["build-delegate"]
+script_runner = "@shell"
+script = '''
+# The player's account seed lives in the delegate's secret store, filed under
+# BLAKE3(BLAKE3(wasm)). Change the WASM and every account becomes unreachable —
+# and unlike a moved contract address, republishing cannot undo it.
+#
+# So this compares the built delegate against the hash recorded in
+# CURRENT_DELEGATE_CODE_HASH and fails when they part company. The point is to
+# make an accidental re-key impossible to ship quietly; a deliberate one just
+# means recording the outgoing hash first.
+BUILT=$(cargo run --quiet -p delegate-key -- "${WASM_DIR}/chess_delegate.wasm" \
+  | awk '/code_hash_hex/ {print $2}')
+RECORDED=$(grep -A3 'pub const CURRENT_DELEGATE_CODE_HASH' common/src/delegate_api.rs \
+  | grep -oE '0x[0-9a-f]{2}' | sed 's/0x//' | tr -d '\n')
+
+if [ "$BUILT" = "$RECORDED" ]; then
+  echo "delegate key unchanged ($BUILT)"
+  exit 0
+fi
+
+echo "ERROR: the delegate WASM changed, so its key changed with it." >&2
+echo "  built:    $BUILT" >&2
+echo "  recorded: $RECORDED" >&2
+echo >&2
+echo "Every player's account seed is stored under the OLD key. Before shipping:" >&2
+echo "  1. Add the recorded hash above to LEGACY_DELEGATE_CODE_HASHES in" >&2
+echo "     common/src/delegate_api.rs, so clients know where to look." >&2
+echo "  2. Set CURRENT_DELEGATE_CODE_HASH to the built hash." >&2
+echo "  3. Commit both in the same change." >&2
+exit 1
 '''
 
 [tasks.check-no-wasm-bindgen]

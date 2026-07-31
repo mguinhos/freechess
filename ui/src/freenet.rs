@@ -229,8 +229,30 @@ pub fn register_delegate_request() -> ClientRequest<'static> {
 
 /// Send an application message to the delegate.
 pub fn delegate_request(payload: Vec<u8>) -> ClientRequest<'static> {
+    delegate_request_to(delegate_key(), payload)
+}
+
+/// The key a retired delegate had, rebuilt from its recorded code hash.
+///
+/// We keep only the code hash, because the key follows from it — see
+/// [`chess_core::delegate_api::delegate_key_for`]. The old WASM itself is not
+/// needed: the node either still holds that delegate from an earlier session,
+/// in which case it answers, or it does not and there was nothing to recover.
+pub fn legacy_delegate_key(code_hash: &[u8; 32]) -> DelegateKey {
+    DelegateKey::new(
+        chess_core::delegate_api::delegate_key_for(code_hash),
+        CodeHash::new(*code_hash),
+    )
+}
+
+/// Send an application message to a specific delegate.
+///
+/// Addressing one explicitly is what makes account recovery possible: after the
+/// delegate WASM changes, the seed is filed under the *old* key, and the only
+/// way to reach it is to ask that key directly.
+pub fn delegate_request_to(key: DelegateKey, payload: Vec<u8>) -> ClientRequest<'static> {
     DelegateRequest::ApplicationMessages {
-        key: delegate_key(),
+        key,
         params: Parameters::from(vec![]),
         inbound: vec![InboundDelegateMsg::ApplicationMessage(
             ApplicationMessage::new(payload),

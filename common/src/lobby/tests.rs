@@ -866,3 +866,127 @@ fn summaries_are_byte_identical_regardless_of_insertion_order() {
         "the same logical state must summarize to the same bytes"
     );
 }
+
+// ------------------------------------------------- migration locks the lobby
+
+/// The whole point of the migration lock: it stops the flow of *new* games
+/// without disturbing anything already being played.
+#[test]
+fn a_migration_locks_new_listings_but_leaves_games_in_progress_alone() {
+    let root = key();
+    let creator = key();
+    let challenger = key();
+
+    let mut lobby = LobbyStateV1::default();
+    let claim = crate::admin::AdminGrant::claim(&root, "root".to_string(), T0);
+    lobby
+        .administration
+        .apply_delta(
+            &LobbyStateV1::default(),
+            &params(),
+            &Some(vec![crate::admin::AdminAction::Grant(claim)]),
+        )
+        .unwrap();
+
+    // Three listings, all created AFTER the notice will be dated: one open,
+    // one with an opponent seated, one finished.
+    let notice_at = T0 + 1_000;
+    lobby.games.absorb(listing(&creator, notice_at + 5_000));
+    let live = matched_listing(&creator, &challenger, notice_at + 6_000);
+    let live_id = live.game_id;
+    lobby.games.absorb(live);
+
+    // And one open listing from BEFORE the notice, which must survive.
+    let earlier = listing(&creator, notice_at - 5_000);
+    let earlier_id = earlier.game_id;
+    lobby.games.absorb(earlier);
+
+    assert_eq!(lobby.games.games.len(), 3, "premise");
+
+    let notice = crate::admin::Migration::announce(
+        &root,
+        GameId([7u8; 32]).to_base58(),
+        "we have moved".to_string(),
+        notice_at,
+    );
+    lobby
+        .administration
+        .apply_delta(
+            &LobbyStateV1::default(),
+            &params(),
+            &Some(vec![crate::admin::AdminAction::Migrate(notice)]),
+        )
+        .unwrap();
+    lobby.prune(&params()).unwrap();
+
+    assert!(
+        lobby.games.games.contains_key(&live_id),
+        "a game with an opponent seated was evicted by the migration"
+    );
+    assert!(
+        lobby.games.games.contains_key(&earlier_id),
+        "a listing older than the notice was evicted"
+    );
+    assert_eq!(
+        lobby.games.games.len(),
+        2,
+        "the open listing created after the notice should be gone"
+    );
+    assert!(!lobby.administration.accepting_new_games());
+
+    // Idempotent: pruning again changes nothing.
+    let before = lobby.games.games.clone();
+    lobby.prune(&params()).unwrap();
+    assert_eq!(before, lobby.games.games);
+}
+
+/// The lock must not depend on the order the notice and the listing arrive in —
+/// peers see different orders and must still agree.
+#[test]
+fn the_migration_lock_is_independent_of_arrival_order() {
+    let root = key();
+    let creator = key();
+    let notice_at = T0 + 1_000;
+
+    let claim = crate::admin::AdminAction::Grant(crate::admin::AdminGrant::claim(
+        &root,
+        "root".to_string(),
+        T0,
+    ));
+    let notice = crate::admin::AdminAction::Migrate(crate::admin::Migration::announce(
+        &root,
+        GameId([7u8; 32]).to_base58(),
+        "moved".to_string(),
+        notice_at,
+    ));
+    let late = listing(&creator, notice_at + 5_000);
+
+    // Peer 1: listing first, then the notice.
+    let mut peer1 = LobbyStateV1::default();
+    peer1.games.absorb(late.clone());
+    peer1
+        .administration
+        .apply_delta(
+            &LobbyStateV1::default(),
+            &params(),
+            &Some(vec![claim.clone(), notice.clone()]),
+        )
+        .unwrap();
+    peer1.prune(&params()).unwrap();
+
+    // Peer 2: the notice first, then the listing.
+    let mut peer2 = LobbyStateV1::default();
+    peer2
+        .administration
+        .apply_delta(
+            &LobbyStateV1::default(),
+            &params(),
+            &Some(vec![claim, notice]),
+        )
+        .unwrap();
+    peer2.games.absorb(late);
+    peer2.prune(&params()).unwrap();
+
+    assert_eq!(peer1.games.games, peer2.games.games, "must converge");
+    assert!(peer1.games.games.is_empty());
+}

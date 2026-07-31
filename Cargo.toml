@@ -10,6 +10,7 @@ members = [
     "tools/webapp-packager",
     "tools/bootstrap-contracts",
     "tools/gen-account",
+    "tools/delegate-key",
     "delegates/chess-delegate",
     "ui",
 ]
