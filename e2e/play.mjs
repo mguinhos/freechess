@@ -16,6 +16,7 @@
 // --port selects the node (default 7513, the public one).
 
 import { chromium } from "@playwright/test";
+import { readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -26,7 +27,13 @@ function flag(name, fallback = undefined) {
 }
 
 const PORT = flag("port", "7513");
-const CONTRACT = "GV3WZEAWC82nrXJcvgwYaXNLLd71AVtDuu5Pc7TnRR92";
+// Read the address from the committed artifact rather than hardcoding it. A
+// hardcoded id goes stale the moment the app is re-keyed, and this file sat
+// pointing at a long-dead contract for exactly that reason.
+const CONTRACT = readFileSync(
+  new URL("../published-contract/contract-id.txt", import.meta.url),
+  "utf8",
+).trim();
 const APP = `http://127.0.0.1:${PORT}/v1/contract/web/${CONTRACT}/`;
 
 // A fixed account, so this player keeps their identity across invocations.
@@ -53,7 +60,42 @@ async function open(query = "") {
   const app = page.frameLocator("#app");
   await app.locator(".topbar").waitFor({ timeout: 60000 });
   await app.locator(".conn .dot.online").waitFor({ timeout: 60000 });
+  await waitForAccount(app);
   return { browser, page, app };
+}
+
+/**
+ * Wait until the account has come back from the delegate.
+ *
+ * This is not optional. Identity lives in the node's delegate, and fetching it
+ * is a round trip: for the first seconds after load the app is running on a
+ * freshly generated session key instead. Acting in that window makes every
+ * invocation a *different* player — moves signed by a stranger, which the
+ * contract correctly refuses — and it is why an earlier run created a game as
+ * `player-HAebfp` and came back as `player-UW2AbB`.
+ *
+ * There is no "settled" flag in the DOM, so watch the label the app shows and
+ * wait for it to CHANGE — the change *is* the adoption. Waiting for it to hold
+ * still does not work, and was the first thing I tried: the label sits on the
+ * session key perfectly still until the answer arrives, so two equal readings
+ * are satisfied instantly and prove nothing.
+ *
+ * On a node whose delegate has never held an account there is nothing to adopt
+ * and nothing to change, so fall back to the timeout — from then on the seed is
+ * stored and later runs adopt it.
+ */
+async function waitForAccount(app) {
+  const initial = (await app.locator("#account-button").innerText()).trim();
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const id = (await app.locator("#account-button").innerText()).trim();
+    if (id !== initial) return id;
+  }
+  console.error(
+    `note: the account never changed from ${initial} — assuming this node's ` +
+      `delegate had nothing stored, and this session's key is now it`,
+  );
+  return initial;
 }
 
 /** Click a square by algebraic name, given the board orientation. */
@@ -106,6 +148,36 @@ async function main() {
     const link = await app.locator("#share-link").innerText();
     console.log("created:", link.trim());
     await report(app);
+    await browser.close();
+    return;
+  }
+
+  if (cmd === "nick") {
+    // The account lives in the node's delegate, not in localStorage — the
+    // gateway sandboxes the app without allow-same-origin, so localStorage
+    // throws. So the nickname has to be set through the UI, once, and it then
+    // sticks for this node.
+    const name = flag("name", NICKNAME);
+    const { browser, app } = await open();
+    await app.locator("#account-button").click();
+    const modal = app.locator(".modal");
+    await modal.waitFor({ timeout: 60000 });
+    await modal.locator("input").first().fill(name);
+    await modal.getByRole("button", { name: "Save" }).click();
+    await modal.waitFor({ state: "hidden", timeout: 60000 });
+    console.log("nickname set to:", name);
+    await browser.close();
+    return;
+  }
+
+  if (cmd === "whoami") {
+    const { browser, page, app } = await open();
+    page.on("console", (m) => {
+      if (m.type() === "error") console.error("console:", m.text());
+    });
+    console.log("topbar:", (await app.locator("#account-button").innerText()).trim());
+    const msg = app.locator("#app-message");
+    if (await msg.count()) console.log("app message:", (await msg.innerText()).trim());
     await browser.close();
     return;
   }
