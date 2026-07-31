@@ -319,6 +319,24 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .badge.classical { background: #2b4d7a; color: #c4dcff; }
 .badge.live { background: #7a2b2b; color: #ffd0d0; }
 
+/* The notification count sits ON the bell rather than beside it, so the header
+   keeps its width whether or not anything is waiting. A control that shoves its
+   neighbours sideways every time a challenge arrives is worse than no badge. */
+.ghost.has-badge { position: relative; }
+.badge.count {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 17px;
+  padding: 1px 4px;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  letter-spacing: 0;
+  background: #b23b3b;
+  color: #fff;
+}
+
 /* --------------------------------------------------------------- listings */
 
 .list { display: flex; flex-direction: column; }

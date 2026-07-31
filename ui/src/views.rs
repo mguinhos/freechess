@@ -11,17 +11,30 @@ use chess_core::lobby::LobbyEntry;
 use chess_core::player::validate_nickname;
 use dioxus::prelude::*;
 
-/// Header: brand, connection state, account.
+/// Header: brand, connection state, notifications, account.
 #[component]
 pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     let mut show_account = use_signal(|| false);
     let mut show_admin = use_signal(|| false);
+    let mut show_notifications = use_signal(|| false);
     let s = state.read();
     let status = s.status;
     let nickname = s.account.nickname.clone();
     let rating = s.my_rating();
     let online = s.lobby.presence.online_count(now_ms());
     let is_admin = s.is_admin();
+    // Direct challenges waiting on an answer. The count is of things still to
+    // act on, not of things not yet read: a challenge someone accepted or
+    // withdrew stops counting on its own, which needs no record of what this
+    // device has seen and cannot drift out of step with the network.
+    let challenges: Vec<_> = s
+        .lobby
+        .games
+        .challenges_for(s.me())
+        .into_iter()
+        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
+        .cloned()
+        .collect();
     // Visible to admins, and to everyone while nobody has claimed it — hiding
     // an unclaimed race would only mean whoever reads the source wins it.
     let show_admin_entry = is_admin || s.admin_unclaimed();
@@ -51,13 +64,32 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
                 title: "Source code on GitHub",
                 "GitHub"
             }
+            button {
+                class: if challenges.is_empty() { "ghost" } else { "ghost has-badge" },
+                id: "notifications-button",
+                title: if challenges.is_empty() {
+                    "No challenges waiting for you".to_string()
+                } else {
+                    format!("{} challenge(s) waiting for you", challenges.len())
+                },
+                onclick: move |_| show_notifications.set(true),
+                span { "\u{1F514}" }
+                if !challenges.is_empty() {
+                    span { class: "badge count", id: "notifications-count", "{challenges.len()}" }
+                }
+            }
             if show_admin_entry {
+                // The label is deliberately fixed. It used to gain the word
+                // "admin" once adminship resolved, which changed the button's
+                // width and shifted everything beside it — the header visibly
+                // jumped the moment the lobby arrived. Adminship goes in the
+                // tooltip instead.
                 button {
                     class: "ghost",
                     id: "admin-button",
-                    title: "Administration",
+                    title: if is_admin { "Administration (you are an admin)" } else { "Administration" },
                     onclick: move |_| show_admin.set(true),
-                    if is_admin { "\u{2699} admin" } else { "\u{2699}" }
+                    "\u{2699}"
                 }
             }
             button {
@@ -72,6 +104,93 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
         }
         if show_admin() {
             AdminModal { state, sync, on_close: move |_| show_admin.set(false) }
+        }
+        if show_notifications() {
+            NotificationsModal {
+                state,
+                sync,
+                on_close: move |_| show_notifications.set(false),
+            }
+        }
+    }
+}
+
+/// Challenges addressed to this player, reachable from the bell in the header.
+///
+/// A direct challenge is the one thing on FreeChess that is aimed at *you* and
+/// then waits. An open game sits in a list anyone browses; a challenge is
+/// addressed, and if you never happen to scroll past the "Challenges for you"
+/// panel, nothing tells you it exists. Hence a count in the header, visible
+/// from every page.
+#[component]
+pub fn NotificationsModal(
+    state: Signal<AppState>,
+    sync: Sync,
+    on_close: EventHandler<()>,
+) -> Element {
+    let s = state.read();
+    let me = s.me();
+    let challenges: Vec<_> = s
+        .lobby
+        .games
+        .challenges_for(me)
+        .into_iter()
+        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
+        .cloned()
+        .collect();
+    // Resolve by id from presence, so a challenger who has since renamed shows
+    // under their current name rather than the one frozen into their signature.
+    let named: Vec<(GameId, String, String)> = challenges
+        .iter()
+        .map(|e| {
+            (
+                e.game_id,
+                s.lobby
+                    .display_name(e.creator_id(), &e.setup.setup.creator_nickname),
+                e.time_control().label(),
+            )
+        })
+        .collect();
+    drop(s);
+
+    rsx! {
+        div { class: "modal-bg", onclick: move |_| on_close.call(()),
+            div { class: "modal", onclick: move |e| e.stop_propagation(),
+                h3 { "Notifications" }
+                div { class: "body",
+                    if named.is_empty() {
+                        div { class: "empty", id: "no-notifications",
+                            "Nothing waiting for you right now."
+                        }
+                    } else {
+                        div { class: "small muted", style: "margin-bottom:8px",
+                            "Players who have challenged you directly. Only you can take these seats."
+                        }
+                        div { class: "list",
+                            for (id, name, tc) in named {
+                                div { key: "{id}", id: "notification-{id}", class: "list-item",
+                                    span { class: "grow",
+                                        b { "{name}" }
+                                        span { class: "muted small", " challenged you " }
+                                        span { class: "badge", "{tc}" }
+                                    }
+                                    button {
+                                        class: "primary small",
+                                        onclick: move |_| {
+                                            sync.send(Cmd::JoinGame(id));
+                                            on_close.call(());
+                                        },
+                                        "Play"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "actions",
+                    button { class: "ghost", onclick: move |_| on_close.call(()), "Close" }
+                }
+            }
         }
     }
 }
@@ -504,7 +623,11 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                         }
                     }
 
-                    div { class: "panel",
+                    // Identified so a test can address this panel specifically:
+                    // player names appear in the ranking and in game listings
+                    // too, and matching on a name alone picks whichever comes
+                    // first — a row with no Challenge button on it.
+                    div { class: "panel", id: "players-panel",
                         h2 { "Players" }
                         if players.is_empty() {
                             div { class: "empty", "Nobody else is online." }
