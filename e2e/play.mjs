@@ -288,6 +288,16 @@ async function main() {
     return;
   }
 
+  if (cmd === "version") {
+    const { browser, app } = await open();
+    for (const sel of ["#app-version", "#footer-version", "#footer-build", "#footer-github", "#footer-freenet"]) {
+      const n = app.locator(sel);
+      console.log(`${sel.padEnd(18)} ${(await n.count()) ? (await n.innerText()).trim() : "(ausente)"}`);
+    }
+    await browser.close();
+    return;
+  }
+
   if (cmd === "whoami") {
     const { browser, page, app } = await open();
     page.on("console", (m) => {
