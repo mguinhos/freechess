@@ -107,6 +107,35 @@ async function clickSquare(app, square, orientation) {
   await app.locator(".board > div").nth(index).click();
 }
 
+/**
+ * Which way round the board is drawn for us.
+ *
+ * Reading this matters: with the board flipped, clicking as though it were
+ * White's view lands on the mirrored square, which is either an illegal move
+ * or — worse — a legal one nobody intended.
+ *
+ * The seats are NOT viewer-relative: the app renders Black on top and White
+ * below, always, and flips only the board. So the orientation is the colour of
+ * whichever seat is ours, found by name. (Two players sharing a nickname would
+ * defeat that; there are two seats and it is our own node, so it holds here.)
+ */
+async function myOrientation(app) {
+  const seats = app.locator(".seat");
+  const count = await seats.count();
+  for (let i = 0; i < count; i++) {
+    const text = await seats.nth(i).innerText();
+    // Case-insensitively: the nickname shown is whatever was typed into the
+    // account modal, which need not match the constant's casing.
+    if (!text.toLowerCase().includes(NICKNAME.toLowerCase())) continue;
+    const cls =
+      (await seats.nth(i).locator(".piece").first().getAttribute("class")) ?? "";
+    return cls.includes("black") ? "black" : "white";
+  }
+  // Spectating, or a name we do not recognise: White's view is what the app
+  // falls back to as well.
+  return "white";
+}
+
 /** Print the board, move list and clocks. */
 async function report(app) {
   const moves = await app.locator(".moves .mv").allInnerTexts();
@@ -115,11 +144,26 @@ async function report(app) {
   const clocks = await app.locator(".clock").allInnerTexts();
   if (clocks.length) console.log("clocks:", clocks.join("  |  "));
 
+  if (process.env.FREECHESS_DEBUG) {
+    const seats = app.locator(".seat");
+    console.log("seats:", await seats.count(), "orientation:", await myOrientation(app));
+    for (let i = 0; i < (await seats.count()); i++) {
+      const p = seats.nth(i).locator(".piece").first();
+      console.log(
+        `  seat[${i}] pieceClass=${(await p.count()) ? await p.getAttribute("class") : "-"} text=${(await seats.nth(i).innerText()).replace(/\n/g, " | ")}`,
+      );
+    }
+  }
+
   const result = app.locator(".result-card .headline");
   if (await result.count()) console.log("RESULT:", await result.innerText());
 
-  // The board as text, from White's point of view.
-  const squares = await app.locator(".board > div").allInnerTexts();
+  // Always print from White's point of view, whichever way the app drew it.
+  // Black's layout is the exact reverse of White's, so one reverse normalises
+  // it — without this the rank and file labels are mirrored and the position
+  // reads as a completely different one.
+  let squares = await app.locator(".board > div").allInnerTexts();
+  if ((await myOrientation(app)) === "black") squares = squares.slice().reverse();
   if (squares.length === 64) {
     console.log();
     for (let r = 0; r < 8; r++) {
@@ -211,12 +255,7 @@ async function main() {
     const spectating = await app.getByText("You are spectating").count();
     if (spectating) throw new Error("this account is not a player in that game");
 
-    // Determine our colour from which seat carries our nickname at the bottom.
-    const orientation = (await app.locator(".seat").last().innerText()).includes(
-      NICKNAME,
-    )
-      ? "white"
-      : "white"; // the app always puts the viewer at the bottom
+    const orientation = await myOrientation(app);
     const before = (await app.locator(".moves .mv").allInnerTexts()).length;
 
     await clickSquare(app, uci.slice(0, 2), orientation);
