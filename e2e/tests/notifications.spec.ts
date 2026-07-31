@@ -56,12 +56,18 @@ test("a direct challenge raises a count in the other player's header", async ({
   const bobAgain = await reopen(bob.page, PEER_PORT);
   await expect(bobAgain.locator("#notifications-count")).toHaveText("1");
 
-  // Opening it names the challenger and offers the seat. Taking it clears the
-  // count, because the challenge is no longer waiting on anything.
+  // Opening it names the challenger and offers the seat.
   await bobAgain.locator("#notifications-button").click({ force: true });
   await expect(bobAgain.locator(".modal")).toContainText("alice");
   await bobAgain.locator(".modal").getByRole("button", { name: "Play" }).click();
   await expect(bobAgain.locator(".board")).toBeVisible();
+
+  // The count must clear as soon as Bob answers — NOT when Alice gets round to
+  // countersigning. Taking a seat is a two-step handshake and only the first
+  // step is his, so a badge that stayed lit until the creator acted would be
+  // still asking for the one thing he had just done. It read as "accepting does
+  // not mark it as read", and it was reported that way.
+  await expect(bobAgain.locator("#notifications-count")).toHaveCount(0);
 
   // Alice countersigns, and the game is real — the notification led somewhere.
   await expectSeated(aliceHome, "bob");

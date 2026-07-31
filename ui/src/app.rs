@@ -123,6 +123,33 @@ impl AppState {
         self.account.id()
     }
 
+    /// Challenges still waiting on an answer from me.
+    ///
+    /// A challenge I have already accepted is NOT one of them, even though the
+    /// game stays "open" until the creator countersigns my offer: taking the
+    /// seat is a two-step handshake, and only the first step is mine. Counting
+    /// it until the creator acts would leave the badge lit after the one action
+    /// it was asking for — which is exactly what it looked like.
+    pub fn pending_challenges(&self, now: i64) -> Vec<&chess_core::lobby::LobbyEntry> {
+        let me = self.me();
+        let my_key = self.account.key.verifying_key();
+        self.lobby
+            .games
+            .challenges_for(me, now)
+            .into_iter()
+            .filter(|e| !self.lobby.administration.is_taken_down(&e.game_id))
+            .filter(|e| {
+                // Answered already if our offer is on the table, or if the seat
+                // is filled and the lobby has simply not caught up yet.
+                !self
+                    .games
+                    .get(&e.game_id)
+                    .map(|g| g.opponent.has_offer_from(&my_key) || g.opponent.get().is_some())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     /// My rating, from the ranking if I am in it.
     pub fn my_rating(&self) -> i32 {
         self.lobby.leaderboard.rating_of(self.me())
@@ -156,6 +183,12 @@ pub enum Cmd {
     /// creator has to countersign, which their client does in
     /// [`Cmd::SeatChallenger`].
     JoinGame(GameId),
+    /// Re-publish our own offer for a seat we have not been given yet.
+    ///
+    /// The other half of the same repair: a lost delta in either direction
+    /// leaves the two sides disagreeing about whether a game has started, and
+    /// nothing else would ever retry.
+    ResendOffer(GameId),
     /// Countersign a challenger's offer, which is what actually starts the
     /// game. Only meaningful on the creator's own client: the acceptance is
     /// checked against the creator key in the contract parameters.
@@ -534,6 +567,38 @@ async fn handle_cmd(
             Ok(())
         }
 
+        Cmd::ResendOffer(game_id) => {
+            let (creator, game) = match state.with(|s| {
+                s.creators
+                    .get(&game_id)
+                    .copied()
+                    .zip(s.games.get(&game_id).cloned())
+            }) {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
+            let me = key.verifying_key();
+            // Only while we are still waiting, and only our own offer.
+            if game.opponent.get().is_some() || !game.opponent.has_offer_from(&me) {
+                return Ok(());
+            }
+            let Some(mine) = game.opponent.proposal_offer_by(&me).cloned() else {
+                return Ok(());
+            };
+            let instance = freenet::game_instance(creator, game_id)?;
+            let delta = chess_core::game::ChessGameStateV1Delta {
+                opponent: Some(OpponentDelta::offer(mine)),
+                ..Default::default()
+            };
+            let _ = api
+                .send(freenet::update_request(
+                    instance.key(),
+                    freenet::encode(&delta)?,
+                ))
+                .await;
+            Ok(())
+        }
+
         Cmd::SeatChallenger(game_id) => {
             let (creator, game) = state
                 .with(|s| {
@@ -544,21 +609,41 @@ async fn handle_cmd(
                 })
                 .ok_or_else(|| "that game is not loaded".to_string())?;
 
-            // Nothing to do unless we are the creator and the seat is still
-            // open. Anyone else signing this produces a value every peer
-            // rejects, so bailing out here only saves the round trip.
-            if creator != key.verifying_key() || game.opponent.get().is_some() {
+            // Only the creator can seat anyone: anyone else signing this
+            // produces a value every peer rejects, so bailing out here saves
+            // the round trip.
+            if creator != key.verifying_key() {
                 return Ok(());
             }
-            // Take the first offer in the map's deterministic order. Any choice
-            // is sound — the point is that the choice is *ours* — and a stable
-            // one keeps two tabs of the same account from countersigning
-            // different challengers.
-            let Some(join) = game.opponent.pending_offers().first().map(|j| (*j).clone()) else {
-                return Ok(());
-            };
 
-            let acceptance = SignedAcceptance::new(key, &game_id, join);
+            let acceptance = match game.opponent.accepted() {
+                // Already seated, and no move has been played: re-publish the
+                // SAME acceptance.
+                //
+                // A single lost delta is ordinary in a P2P network, and this
+                // handshake used to publish exactly once. When the acceptance
+                // failed to reach the challenger's node the two disagreed
+                // permanently — one saw a game under way, the other sat on
+                // "waiting for the creator", and nothing ever retried. It
+                // happened in a real game.
+                //
+                // Re-sending is idempotent (the merge keeps one acceptance per
+                // creator by a total order), and it stops the moment a move is
+                // played, so a started game costs nothing.
+                Some(existing) if game.moves.is_empty() => existing.clone(),
+                Some(_) => return Ok(()),
+                None => {
+                    // Take the first offer in the map's deterministic order.
+                    // Any choice is sound — the point is that the choice is
+                    // *ours* — and a stable one keeps two tabs of the same
+                    // account from countersigning different challengers.
+                    let Some(join) = game.opponent.pending_offers().first().map(|j| (*j).clone())
+                    else {
+                        return Ok(());
+                    };
+                    SignedAcceptance::new(key, &game_id, join)
+                }
+            };
             let instance = freenet::game_instance(creator, game_id)?;
             let delta = chess_core::game::ChessGameStateV1Delta {
                 opponent: Some(OpponentDelta::seat(acceptance.clone())),

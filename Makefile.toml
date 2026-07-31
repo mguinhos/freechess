@@ -107,6 +107,19 @@ if [ -z "$KEY" ]; then
 fi
 echo "webapp contract id: $KEY"
 
+# Stamp the build so a running page can say which one it is. Without this a
+# report of "it is doing X" cannot be tied to any particular deploy, which
+# during a session of rapid republishes is most of the difficulty.
+#
+# `option_env!` on the UI side, so a plain `dx build` outside this task still
+# compiles and simply reports an unknown build.
+FREECHESS_BUILD="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+  FREECHESS_BUILD="${FREECHESS_BUILD}+dirty"
+fi
+export FREECHESS_BUILD
+echo "build stamp: $FREECHESS_BUILD"
+
 # Rewrite base_path in place, then restore it afterwards so `dx serve` (which
 # serves from the root) keeps working during development.
 cp ui/Dioxus.toml ui/Dioxus.toml.bak
@@ -362,6 +375,17 @@ fdev --port "${WS_API_PORT}" publish \
   contract \
   --state "$OUT/webapp.state"
 
+# The PUT itself succeeded. From here on, DO NOT roll the counter back.
+#
+# Rolling back on a failed *verification* is what makes the counter lie: the
+# state is already on the network at the bumped version, so restoring the file
+# leaves us numbered behind, and the next publish is rejected for being no
+# higher than what is already there. That is the exact incident the committed
+# counter exists to prevent, reintroduced from the other end. The rollback
+# belongs to a failed publish, and nothing else.
+rm -f "$VERSION_FILE.prev"
+trap - EXIT
+
 # Verify rather than trust the output. `fdev publish` prints "published
 # successfully" in cases where nothing was stored at all, and it has also
 # reported success while the node kept serving a previous build — both of which
@@ -372,17 +396,20 @@ for candidate in "target/dx/chess-ui/release/web/public" "ui/dist/public" "ui/di
 done
 BUILT=$(grep -oE 'assets/chess-ui-[a-z0-9]+\.js' "$DIST/index.html" | head -1)
 
-sleep 5
-SERVED=$(curl -s --max-time 90 \
-  "http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/?__sandbox=1" \
-  | grep -oE 'assets/chess-ui-[a-z0-9]+\.js' | head -1)
+# Poll rather than glance. A single look five seconds in reported a false
+# failure on a node that was serving the new build moments later — and the
+# false alarm was worse than no check, because it triggered a rollback.
+SERVED=""
+for _ in $(seq 12); do
+  sleep 5
+  SERVED=$(curl -s --max-time 90 \
+    "http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/?__sandbox=1" \
+    | grep -oE 'assets/chess-ui-[a-z0-9]+\.js' | head -1)
+  [ "$BUILT" = "$SERVED" ] && break
+done
 
 echo
 if [ "$BUILT" = "$SERVED" ]; then
-  # Publish confirmed: the bumped counter is the new truth, so drop the
-  # snapshot and disarm the rollback.
-  rm -f "$VERSION_FILE.prev"
-  trap - EXIT
   echo "FreeChess is live at:"
   echo "  http://127.0.0.1:${WS_API_PORT}/v1/contract/web/${KEY}/"
   echo
@@ -393,6 +420,10 @@ else
   echo "  served: ${SERVED:-<none>}"
   echo "  The publish reported success regardless — retry, and check with:"
   echo "    fdev --port ${WS_API_PORT} execute get ${KEY}"
+  echo
+  echo "  The version counter was NOT rolled back: the state may well be on the"
+  echo "  network at $(cat "$VERSION_FILE") even though this node is not serving it"
+  echo "  yet, and numbering ourselves back would make every later publish fail."
   exit 1
 fi
 '''

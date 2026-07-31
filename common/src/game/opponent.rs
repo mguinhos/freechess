@@ -350,6 +350,12 @@ impl OpponentSlotV1 {
         self.offers.contains_key(player.as_bytes())
     }
 
+    /// That player's own offer, so a client can re-send exactly what it signed
+    /// rather than minting a second one.
+    pub fn proposal_offer_by(&self, player: &VerifyingKey) -> Option<&SignedJoin> {
+        self.offers.get(player.as_bytes())
+    }
+
     fn absorb_offer(&mut self, incoming: SignedJoin) {
         // A challenger who signs two offers is settled by signature bytes, so
         // the map is a function of the merged set either way.

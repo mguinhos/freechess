@@ -145,6 +145,15 @@ async function report(app) {
   if (clocks.length) console.log("clocks:", clocks.join("  |  "));
 
   if (process.env.FREECHESS_DEBUG) {
+    for (const sel of ["#app-message", ".banner"]) {
+      const n = app.locator(sel);
+      if (await n.count()) console.log(`  ${sel}: ${(await n.first().innerText()).slice(0, 120)}`);
+    }
+    const waiting = await app.getByText("Waiting for the creator to confirm").count();
+    const seatBtn = await app.getByRole("button", { name: "Take the open seat" }).count();
+    console.log(`  my offer pending here: ${waiting > 0}, seat button offered: ${seatBtn > 0}`);
+  }
+  if (process.env.FREECHESS_DEBUG) {
     const seats = app.locator(".seat");
     console.log("seats:", await seats.count(), "orientation:", await myOrientation(app));
     for (let i = 0; i < (await seats.count()); i++) {
@@ -303,7 +312,14 @@ async function main() {
 
   const game = flag("game");
   if (!game) throw new Error("--game <id> is required");
-  const { browser, app } = await open(`?game=${game}`);
+  const { browser, page, app } = await open(`?game=${game}`);
+  if (process.env.FREECHESS_TRACE) {
+    page.on("console", (m) => {
+      const t = m.text();
+      if (/sync|error|update|seat|accept/i.test(t)) console.log("  log>", t.slice(0, 220));
+    });
+    await page.waitForTimeout(12000);
+  }
   await app.locator(".board").waitFor({ timeout: 60000 });
 
   if (cmd === "show") {

@@ -11,6 +11,19 @@ use chess_core::lobby::LobbyEntry;
 use chess_core::player::validate_nickname;
 use dioxus::prelude::*;
 
+/// The release this page was built from.
+///
+/// `version` is the workspace version; `build` is the commit it came from,
+/// stamped by `cargo make build-ui`. A page that cannot say which build it is
+/// makes every report of odd behaviour unattributable — which, during a run of
+/// rapid republishes, is most of the difficulty.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD: &str = match option_env!("FREECHESS_BUILD") {
+    Some(stamp) => stamp,
+    // A plain `dx build`, outside the task that stamps it.
+    None => "unstamped",
+};
+
 /// Header: brand, connection state, notifications, account.
 #[component]
 pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
@@ -29,11 +42,8 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     // withdrew stops counting on its own, which needs no record of what this
     // device has seen and cannot drift out of step with the network.
     let challenges: Vec<_> = s
-        .lobby
-        .games
-        .challenges_for(s.me(), now_ms())
+        .pending_challenges(now_ms())
         .into_iter()
-        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
         .cloned()
         .collect();
     // Visible to admins, and to everyone while nobody has claimed it — hiding
@@ -55,16 +65,7 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
                 span { "{status.label()}" }
             }
             div { class: "conn", "{online} online" }
-            // A plain hyperlink, not a fetched resource — nothing is loaded
-            // from outside, so the gateway's same-origin CSP is unaffected.
-            a {
-                class: "conn gh",
-                href: "https://github.com/mguinhos/freechess",
-                target: "_blank",
-                rel: "noopener noreferrer",
-                title: "Source code on GitHub",
-                "GitHub"
-            }
+            span { class: "conn ver", id: "app-version", title: "build {BUILD}", "v{VERSION}" }
             button {
                 class: if challenges.is_empty() { "ghost" } else { "ghost has-badge" },
                 id: "notifications-button",
@@ -126,6 +127,45 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     }
 }
 
+/// Footer: what this build is, and where to read about the thing it runs on.
+///
+/// Both links are plain hyperlinks. Nothing is *fetched* from outside — no
+/// script, font or image — so the gateway's same-origin CSP is untouched and
+/// the app still works with no route to the wider internet. A link the reader
+/// may choose to follow is not a dependency.
+#[component]
+pub fn Footer() -> Element {
+    rsx! {
+        footer { class: "footer", id: "app-footer",
+            div { class: "page",
+                div { class: "row small muted",
+                    span { id: "footer-version", "FreeChess v{VERSION}" }
+                    span { class: "mono", id: "footer-build", "build {BUILD}" }
+                    span { class: "spacer" }
+                    a {
+                        id: "footer-github",
+                        href: "https://github.com/mguinhos/freechess",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        "Source on GitHub"
+                    }
+                    a {
+                        id: "footer-freenet",
+                        href: "https://freenet.org/about/faq/",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        "What is Freenet?"
+                    }
+                }
+                div { class: "small muted", style: "margin-top:6px",
+                    "Every game, rating and profile here lives in Freenet contracts, "
+                    "replicated between players. There is no server."
+                }
+            }
+        }
+    }
+}
+
 /// Challenges addressed to this player, reachable from the bell in the header.
 ///
 /// A direct challenge is the one thing on FreeChess that is aimed at *you* and
@@ -140,13 +180,9 @@ pub fn NotificationsModal(
     on_close: EventHandler<()>,
 ) -> Element {
     let s = state.read();
-    let me = s.me();
     let challenges: Vec<_> = s
-        .lobby
-        .games
-        .challenges_for(me, now_ms())
+        .pending_challenges(now_ms())
         .into_iter()
-        .filter(|e| !s.lobby.administration.is_taken_down(&e.game_id))
         .cloned()
         .collect();
     // Resolve by id from presence, so a challenger who has since renamed shows
@@ -436,9 +472,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
         .cloned()
         .collect();
     let invites: Vec<_> = s
-        .lobby
-        .games
-        .challenges_for(me, now_ms())
+        .pending_challenges(now_ms())
         .into_iter()
         .cloned()
         .collect();
@@ -993,8 +1027,14 @@ pub fn GameView(
                     div { class: "panel",
                         h2 { "Game" }
                         div { class: "body",
+                            // A pending offer is neither playing nor
+                            // spectating, and saying both at once — which this
+                            // did — is worse than saying neither. Until the
+                            // creator countersigns there is no colour to have,
+                            // so the honest line is that we are waiting.
                             div { class: "small muted", style: "margin-bottom:10px",
                                 if my_color.is_some() { "You are playing this game." }
+                                else if offer_pending { "You have asked for this seat." }
                                 else { "You are spectating." }
                             }
                             if can_join {

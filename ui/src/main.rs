@@ -136,14 +136,29 @@ fn App() -> Element {
     use_future(move || async move {
         loop {
             let awaiting: Vec<GameId> = state.with(|s| {
+                let me = s.account.key.verifying_key();
                 s.games
                     .iter()
-                    .filter(|(_, g)| g.opponent.get().is_none() && !g.opponent.offers.is_empty())
+                    .filter(|(_, g)| {
+                        // Someone is waiting to be seated...
+                        (g.opponent.get().is_none() && !g.opponent.offers.is_empty())
+                            // ...or the seat is filled but the game has not
+                            // started, in which case keep re-sending the
+                            // acceptance until a move proves it arrived. One
+                            // lost delta used to strand the two sides
+                            // permanently on different views of the same game.
+                            || (g.opponent.get().is_some() && g.moves.is_empty())
+                            // ...or our own offer is still unanswered, in which
+                            // case re-send that instead: the loss can happen in
+                            // either direction.
+                            || (g.opponent.get().is_none() && g.opponent.has_offer_from(&me))
+                    })
                     .map(|(id, _)| *id)
                     .collect()
             });
             for id in awaiting {
                 sync.send(app::Cmd::SeatChallenger(id));
+                sync.send(app::Cmd::ResendOffer(id));
             }
             gloo_sleep(2000).await;
         }
@@ -163,6 +178,7 @@ fn App() -> Element {
         loop {
             let pending: Vec<GameId> = state.with(|s| {
                 let me = s.me();
+                let my_key = s.account.key.verifying_key();
                 let rated = s
                     .lobby
                     .leaderboard
@@ -174,8 +190,26 @@ fn App() -> Element {
                     .games
                     .all()
                     .into_iter()
-                    .filter(|e| e.is_finished_game_of(me))
-                    .filter(|e| !rated.contains(&e.game_id))
+                    .filter(|e| {
+                        // Finished games of ours that are not rated yet, so the
+                        // certificate can still be exchanged...
+                        (e.is_finished_game_of(me) && !rated.contains(&e.game_id))
+                            // ...and games of ours that have not started, so the
+                            // seat handshake can be repaired. Both loops below
+                            // only see games this client has LOADED, and a
+                            // client sitting on the home page has none — which
+                            // is how an acceptance that went missing stayed
+                            // missing even with a client running.
+                            || (e.involves(me) && !e.result().is_over())
+                            // ...and challenges addressed to us, so the header
+                            // count can tell "waiting on you" from "you already
+                            // answered". That distinction lives in the game's
+                            // own state, and a client sitting on the home page
+                            // has not loaded it — which left an answered
+                            // challenge counted for ever.
+                            || (e.setup.setup.challenged == Some(my_key)
+                                && !e.result().is_over())
+                    })
                     .filter(|e| !s.games.contains_key(&e.game_id))
                     .map(|e| e.game_id)
                     .take(5)
@@ -184,7 +218,7 @@ fn App() -> Element {
             for id in pending {
                 sync.send(app::Cmd::WatchGame(id));
             }
-            gloo_sleep(15000).await;
+            gloo_sleep(8000).await;
         }
     });
 
@@ -244,6 +278,7 @@ fn App() -> Element {
             },
             Route::Profile(_) => rsx! { views::HomeView { state, sync } },
         }
+        views::Footer {}
     }
 }
 
