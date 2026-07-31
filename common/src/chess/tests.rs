@@ -281,6 +281,63 @@ fn promotion_requires_a_piece_and_rejects_king_or_pawn() {
     );
 }
 
+/// Black promotes on rank 1, and to any of the four pieces. Only White was
+/// covered before, which left the mirrored case — the one that needs
+/// `promotion_rank()` to be colour-aware — resting on nothing.
+#[test]
+fn black_promotes_on_the_first_rank_to_any_piece() {
+    let from = Square::from_algebraic("a2").unwrap();
+    let to = Square::from_algebraic("a1").unwrap();
+
+    for (kind, san) in [
+        (PieceKind::Queen, "a1=Q"),
+        (PieceKind::Rook, "a1=R"),
+        (PieceKind::Bishop, "a1=B"),
+        (PieceKind::Knight, "a1=N"),
+    ] {
+        // Black to move, a lone pawn one step from promoting. The white king
+        // sits off rank 1 and off the a1 diagonal on purpose: with it on e1 a
+        // promoted queen or rook checks immediately, and the SAN under test
+        // would be about the check rather than the promotion.
+        let mut board = board_from("4k3/8/8/8/4K3/8/p7/8 b - - 0 1");
+        let outcome = board
+            .make_move(Move::promoting(from, to, kind))
+            .unwrap_or_else(|e| panic!("black should promote to {kind:?}: {e:?}"));
+        assert_eq!(outcome.san, san);
+        assert_eq!(board.piece_at(to), Some(Piece::new(Color::Black, kind)));
+    }
+
+    // And the same refusals apply as for White.
+    let mut board = board_from("4k3/8/8/8/4K3/8/p7/8 b - - 0 1");
+    assert_eq!(
+        board.make_move(Move::new(from, to)),
+        Err(MoveError::BadPromotion),
+        "reaching the last rank without naming a piece is not a move"
+    );
+    for bad in [PieceKind::King, PieceKind::Pawn] {
+        assert_eq!(
+            board.make_move(Move::promoting(from, to, bad)),
+            Err(MoveError::BadPromotion)
+        );
+    }
+}
+
+/// A promoted piece is a real piece: it moves as one immediately.
+#[test]
+fn a_promoted_knight_gives_check_at_once() {
+    // Black pawn on b2 promoting to a knight on b1 forks nothing, so use a
+    // position where the new knight checks the white king on d2.
+    let mut board = board_from("4k3/8/8/8/8/8/3Kp3/8 b - - 0 1");
+    let outcome = board
+        .make_move(Move::from_uci("e2e1n").unwrap())
+        .expect("black promotes to a knight");
+    assert_eq!(outcome.san, "e1=N");
+    assert_eq!(
+        board.piece_at(Square::from_algebraic("e1").unwrap()),
+        Some(Piece::new(Color::Black, PieceKind::Knight))
+    );
+}
+
 #[test]
 fn non_promotion_move_rejects_a_promotion_piece() {
     let mut board = Board::starting_position();

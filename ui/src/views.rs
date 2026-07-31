@@ -711,7 +711,7 @@ pub fn GameView(
     game_id: GameId,
     replay_mode: bool,
 ) -> Element {
-    let mut promotion = use_signal(|| None::<(Move, Vec<PieceKind>)>);
+    let mut promotion = use_signal(|| None::<(Move, Color, Vec<PieceKind>)>);
     let mut viewing_ply = use_signal(|| None::<usize>);
     let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
 
@@ -903,13 +903,16 @@ pub fn GameView(
                                 // A pawn reaching the last rank needs a piece
                                 // chosen before the move can be signed.
                                 let board = Board::from_fen(&fen).unwrap_or_default();
-                                let is_promo = board
-                                    .piece_at(mv.from)
-                                    .map(|p| p.kind == PieceKind::Pawn
-                                        && mv.to.rank() == p.color.promotion_rank())
-                                    .unwrap_or(false);
-                                if is_promo {
-                                    promotion.set(Some((mv, vec![
+                                // Carry the promoting side, not just the move:
+                                // the picker draws real pieces, and the glyph
+                                // set is the same for both colours — only the
+                                // styling says which is which.
+                                let promoting = board.piece_at(mv.from).filter(|p| {
+                                    p.kind == PieceKind::Pawn
+                                        && mv.to.rank() == p.color.promotion_rank()
+                                });
+                                if let Some(piece) = promoting {
+                                    promotion.set(Some((mv, piece.color, vec![
                                         PieceKind::Queen, PieceKind::Rook,
                                         PieceKind::Bishop, PieceKind::Knight,
                                     ])));
@@ -1070,8 +1073,8 @@ pub fn GameView(
             }
         }
 
-        if let Some((mv, choices)) = promotion() {
-            div { class: "modal-bg",
+        if let Some((mv, side, choices)) = promotion() {
+            div { class: "modal-bg", id: "promotion-picker",
                 div { class: "modal", style: "max-width:320px",
                     h3 { "Promote to" }
                     div { class: "body",
@@ -1079,6 +1082,7 @@ pub fn GameView(
                             for kind in choices {
                                 button {
                                     key: "{kind:?}",
+                                    id: "promote-{kind:?}",
                                     onclick: move |_| {
                                         sync.send(Cmd::PlayMove {
                                             game: game_id,
@@ -1086,7 +1090,14 @@ pub fn GameView(
                                         });
                                         promotion.set(None);
                                     },
-                                    "{crate::board::glyph(kind)}"
+                                    // Same class the board uses, so the choice
+                                    // is drawn in the colour being promoted.
+                                    // It used to be hardcoded dark, which meant
+                                    // White picked from a row of black pieces.
+                                    span {
+                                        class: if side == Color::White { "piece white" } else { "piece black" },
+                                        "{crate::board::glyph(kind)}"
+                                    }
                                 }
                             }
                         }

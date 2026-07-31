@@ -380,7 +380,10 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 5px; }
 
 .promo { display: flex; gap: 8px; justify-content: center; }
-.promo button { font-size: 34px; padding: 6px 14px; line-height: 1; background: var(--light-sq); color: #312e2b; }
+/* No `color` here: the glyph set is identical for both sides, so the piece
+   classes are what say which colour is being promoted. Hardcoding a dark colour
+   meant White chose from a row of black-looking pieces. */
+.promo button { font-size: 34px; padding: 6px 14px; line-height: 1; background: var(--light-sq); }
 
 .banner {
   padding: 11px 15px;
