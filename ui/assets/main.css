@@ -124,7 +124,11 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .dot.error { background: #d33; }
 @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
 
-.page { max-width: 1240px; margin: 0 auto; padding: 20px; }
+/* `width: 100%` is load-bearing since #main became a flex column: in a column
+   flex container the horizontal margins are the CROSS axis, and `margin: 0 auto`
+   there absorbs the free space instead of stretching — so the page collapsed to
+   its content width and dragged the board down to about a third of its size. */
+.page { width: 100%; max-width: 1240px; margin: 0 auto; padding: 20px; }
 
 .conn.ver { opacity: .7; }
 
