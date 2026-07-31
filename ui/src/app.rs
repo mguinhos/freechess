@@ -600,14 +600,19 @@ async fn handle_cmd(
         }
 
         Cmd::SeatChallenger(game_id) => {
-            let (creator, game) = state
-                .with(|s| {
-                    s.creators
-                        .get(&game_id)
-                        .copied()
-                        .zip(s.games.get(&game_id).cloned())
-                })
-                .ok_or_else(|| "that game is not loaded".to_string())?;
+            // Fired by a timer, so it lands whenever a game is in view —
+            // including the seconds before that game has arrived from the
+            // network. Nobody asked for anything, so there is nothing to
+            // report: erroring here put "that game is not loaded" on screen
+            // over a page that was simply still loading.
+            let Some((creator, game)) = state.with(|s| {
+                s.creators
+                    .get(&game_id)
+                    .copied()
+                    .zip(s.games.get(&game_id).cloned())
+            }) else {
+                return Ok(());
+            };
 
             // Only the creator can seat anyone: anyone else signing this
             // produces a value every peer rejects, so bailing out here saves
@@ -756,14 +761,17 @@ async fn handle_cmd(
         }
 
         Cmd::AttestClock(game_id) => {
-            let (creator, game) = state
-                .with(|s| {
-                    s.creators
-                        .get(&game_id)
-                        .copied()
-                        .zip(s.games.get(&game_id).cloned())
-                })
-                .ok_or_else(|| "that game is not loaded".to_string())?;
+            // Same as above: a timer fires this the moment the route names a
+            // game, which is before the game has arrived. Silence, not an
+            // error — this is the one that actually reached the screen.
+            let Some((creator, game)) = state.with(|s| {
+                s.creators
+                    .get(&game_id)
+                    .copied()
+                    .zip(s.games.get(&game_id).cloned())
+            }) else {
+                return Ok(());
+            };
 
             // Only a player's attestation counts, and only while the game is
             // still running. A spectator's would be pruned on arrival.
