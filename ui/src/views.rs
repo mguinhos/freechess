@@ -14,9 +14,17 @@ use dioxus::prelude::*;
 /// The release this page was built from.
 ///
 /// `version` is the workspace version; `build` is the commit it came from,
-/// stamped by `cargo make build-ui`. A page that cannot say which build it is
+/// exported by `cargo make build-ui`. A page that cannot say which build it is
 /// makes every report of odd behaviour unattributable — which, during a run of
 /// rapid republishes, is most of the difficulty.
+///
+/// River stamps theirs from `build.rs` instead, which holds however the UI is
+/// built. That is nicer in principle and does not transfer here: their trick
+/// depends on emitting NO `cargo:rerun-if-changed`, so Cargo's default re-run
+/// heuristic keeps the stamp fresh — and ours must emit several, because it has
+/// to re-run whenever a contract's WASM changes. With those present the script
+/// would not re-run on a commit that touched no contract, and the stamp would
+/// quietly go stale, which is worse than saying nothing.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD: &str = match option_env!("FREECHESS_BUILD") {
     Some(stamp) => stamp,

@@ -111,10 +111,13 @@ echo "webapp contract id: $KEY"
 # report of "it is doing X" cannot be tied to any particular deploy, which
 # during a session of rapid republishes is most of the difficulty.
 #
-# `option_env!` on the UI side, so a plain `dx build` outside this task still
-# compiles and simply reports an unknown build.
+# Here rather than in ui/build.rs on purpose: that script already emits
+# `cargo:rerun-if-changed` for each contract WASM, which it must, and those
+# directives replace Cargo's default re-run heuristic — so a stamp computed
+# there would go stale on any commit that touched no contract. Exporting it per
+# invocation is always fresh for the path that actually publishes.
 FREECHESS_BUILD="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   FREECHESS_BUILD="${FREECHESS_BUILD}+dirty"
 fi
 export FREECHESS_BUILD
