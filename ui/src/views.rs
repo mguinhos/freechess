@@ -867,16 +867,15 @@ pub fn GameView(
     let black_ms = game.time_remaining(Color::Black, clock_now);
     let to_move = replay.side_to_move();
 
-    // A flag fall decides nothing on its own — someone has to claim it. The
-    // claim only holds once the opponent's *own* attestations put the deadline
-    // in the past, so offer it exactly when it would be accepted.
-    let timeout_claimable = my_color
+    // Whether the opponent's clock has emptied. There is no button for this any
+    // more: winning on time is not something one player does to another, it is
+    // what happens when a clock reaches zero, and the client files it by itself.
+    // Offering it as a control invited pressing it as soon as the contract would
+    // accept — which is when the opponent went quiet, not when their time ran
+    // out. This line only tells the player what is about to happen.
+    let opponent_flagged = my_color
         .filter(|_| !is_over)
-        .and_then(|mine| {
-            let at_ply = game.moves.move_list().len() as u32;
-            game.timeout_provable_at(mine.opposite(), at_ply)
-        })
-        .map(|provable| now >= provable)
+        .map(|mine| game.time_remaining(mine.opposite(), now) == 0)
         .unwrap_or(false);
 
     let sans = replay.san_list();
@@ -1066,12 +1065,9 @@ pub fn GameView(
                                     "Resign"
                                 }
                             }
-                            if timeout_claimable {
-                                button {
-                                    class: "primary",
-                                    style: "width:100%;margin-top:8px",
-                                    onclick: move |_| sync.send(Cmd::ClaimTimeout(game_id)),
-                                    "Claim the win on time"
+                            if opponent_flagged {
+                                div { class: "small muted", id: "flag-fall-notice", style: "margin-top:8px",
+                                    "Your opponent's clock has run out. Ending the game\u{2026}"
                                 }
                             }
                             div { class: "small muted", style: "margin-top:12px",

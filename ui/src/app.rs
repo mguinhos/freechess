@@ -212,7 +212,12 @@ pub enum Cmd {
     /// so a client that is playing must keep this going — see
     /// [`chess_core::game::clocks`].
     AttestClock(GameId),
-    /// Claim the opponent's clock ran out.
+    /// End a game whose opponent has run out of time.
+    ///
+    /// Sent on a timer, not by a button. Winning on time is not something one
+    /// player does to another — it is what happens when a clock reaches zero —
+    /// and offering it as a control invited pressing it the moment the contract
+    /// would accept it, which is well before the clock is actually empty.
     ClaimTimeout(GameId),
     /// Take our part in certifying a finished game, and file it once both
     /// halves are in.
@@ -803,26 +808,53 @@ async fn handle_cmd(
         }
 
         Cmd::ClaimTimeout(game_id) => {
-            let (creator, game) = state
-                .with(|s| {
-                    s.creators
-                        .get(&game_id)
-                        .copied()
-                        .zip(s.games.get(&game_id).cloned())
-                })
-                .ok_or_else(|| "that game is not loaded".to_string())?;
+            // Driven by a timer now rather than a button, so a game that has not
+            // arrived yet is the normal early case, not a fault.
+            let Some((creator, game)) = state.with(|s| {
+                s.creators
+                    .get(&game_id)
+                    .copied()
+                    .zip(s.games.get(&game_id).cloned())
+            }) else {
+                return Ok(());
+            };
+            if game.result().is_over() {
+                return Ok(());
+            }
 
-            let my_color = game
-                .color_of(&key.verifying_key())
-                .ok_or_else(|| "you are not playing in that game".to_string())?;
+            let Some(my_color) = game.color_of(&key.verifying_key()) else {
+                return Ok(()); // spectating
+            };
             let at_ply = game.moves.move_list().len() as u32;
             // The deadline is derived from the opponent's own attestations, so
             // the client can name it exactly rather than asserting a time.
-            let provable = game
-                .timeout_provable_at(my_color.opposite(), at_ply)
-                .ok_or_else(|| "your opponent's clock is not running".to_string())?;
+            let Some(provable) = game.timeout_provable_at(my_color.opposite(), at_ply) else {
+                return Ok(());
+            };
             if now < provable {
-                return Err("your opponent still has time".to_string());
+                return Ok(());
+            }
+
+            // Wait for the clock to actually run out, not merely for the claim
+            // to become admissible.
+            //
+            // The contract admits a claim once the opponent's attestations have
+            // gone stale, which happens long before their clock empties — a
+            // player who steps away with twenty minutes in hand could be claimed
+            // against in under a minute. Over the board you do not lose for
+            // being away; your clock runs and you lose when it reaches zero.
+            // That is what this waits for.
+            //
+            // Nothing in the contract has to change for it. `at` is the only
+            // thing validated, and it is still named exactly — a contract has no
+            // clock, so it cannot tell that we sat on the claim, and the value
+            // stays the honest instant the state first supported it.
+            //
+            // An abandoned game still resolves; it resolves when the abandoner
+            // would have flagged anyway, which is the same answer a real board
+            // gives.
+            if game.time_remaining(my_color.opposite(), now) > 0 {
+                return Ok(());
             }
 
             let conclusion = SignedConclusion::claim_timeout(key, &game_id, at_ply, provable);

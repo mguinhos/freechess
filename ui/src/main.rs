@@ -248,6 +248,32 @@ fn App() -> Element {
         }
     });
 
+    // End games whose loser has run out of time.
+    //
+    // On a timer rather than a button. The contract will accept a claim as soon
+    // as the opponent's attestations go stale, which is long before their clock
+    // empties — so a button offered at that moment invites winning against
+    // somebody who merely stepped away. `Cmd::ClaimTimeout` waits for the clock
+    // itself, and nothing in the contract had to change for it: a contract has
+    // no clock, so it cannot tell that the claim sat unfiled, and the timestamp
+    // it validates is still named exactly.
+    use_future(move || async move {
+        loop {
+            let playing: Vec<GameId> = state.with(|s| {
+                let me = s.account.key.verifying_key();
+                s.games
+                    .iter()
+                    .filter(|(_, g)| !g.result().is_over() && g.color_of(&me).is_some())
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+            for id in playing {
+                sync.send(app::Cmd::ClaimTimeout(id));
+            }
+            gloo_sleep(5000).await;
+        }
+    });
+
     // Clock attestation. Unlike the heartbeat above (which is presence, in the
     // lobby) this goes into the game's own contract, because a contract cannot
     // read another one. It is what makes a timeout provable: the only evidence
