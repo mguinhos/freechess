@@ -25,6 +25,13 @@
 
 body {
   margin: 0;
+  /* Sticky footer: the column fills the viewport and the footer is pushed to
+     the bottom by the content above it. Without this a short page — "Loading
+     game…", an empty lobby — left the footer floating in the middle with a
+     large dead area beneath it. */
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font-family: "Segoe UI", Roboto, -apple-system, "Helvetica Neue", Arial, sans-serif;
@@ -115,7 +122,7 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .footer {
   border-top: 1px solid var(--border);
   background: var(--panel);
-  margin-top: 28px;
+  margin-top: auto;
 }
 .footer .page { padding: 16px 20px; }
 .footer .row { gap: 16px; flex-wrap: wrap; }
