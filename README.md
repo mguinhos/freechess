@@ -9,6 +9,19 @@ Every game, the lobby, the Elo ranking, player presence and the shared history
 live in Freenet contracts, replicated across peers. The only thing that never
 leaves your device is your signing key.
 
+## ▶ [Acesse o FreeChess](http://localhost:7509/v1/contract/web/68i7VVAF3rDF47TqnKCys8ewXewEacJqkVcF6wXZsE1J/)
+
+<http://localhost:7509/v1/contract/web/68i7VVAF3rDF47TqnKCys8ewXewEacJqkVcF6wXZsE1J/>
+
+The link is to **your own node**, not to a server — there isn't one. FreeChess
+is served by whichever Freenet node you are running, so the address after the
+host is the app's identity and `localhost:7509` is just where your node happens
+to listen. Change the port if yours differs; the contract id stays the same for
+everyone, everywhere.
+
+If nothing loads, you need a node running: see
+[Freenet's install guide](https://freenet.org/), then reload.
+
 ---
 
 ## What it does
