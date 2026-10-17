@@ -1,6 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
-// The two nodes are started by ../scripts/nodes.sh before the suite runs.
+// The three nodes are started by ../scripts/nodes.sh before the suite runs.
 // Their WebSocket ports are what distinguishes them; the app derives its node
 // connection from the page's own origin, so simply loading the app from a
 // different port makes the browser talk to a different node.

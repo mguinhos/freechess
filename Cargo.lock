@@ -344,7 +344,6 @@ dependencies = [
  "ed25519-dalek",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib",
  "rand 0.8.7",
  "serde",
 ]
@@ -353,7 +352,17 @@ dependencies = [
 name = "chess-delegate"
 version = "0.1.0"
 dependencies = [
- "chess-core",
+ "chess-delegate-protocol",
+ "ciborium",
+ "freenet-stdlib",
+ "serde",
+]
+
+[[package]]
+name = "chess-delegate-protocol"
+version = "0.1.0"
+dependencies = [
+ "blake3",
  "ciborium",
  "freenet-stdlib",
  "serde",
@@ -363,10 +372,9 @@ dependencies = [
 name = "chess-ui"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bs58",
  "chess-core",
- "chrono",
+ "chess-delegate-protocol",
  "ciborium",
  "dioxus",
  "ed25519-dalek",

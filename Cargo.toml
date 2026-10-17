@@ -12,6 +12,7 @@ members = [
     "tools/gen-account",
     "tools/delegate-key",
     "delegates/chess-delegate",
+    "delegates/chess-delegate-protocol",
     "ui",
 ]
 resolver = "2"
@@ -47,6 +48,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "allo
 
 # Internal
 chess-core = { path = "common", package = "chess-core" }
+chess-delegate-protocol = { path = "delegates/chess-delegate-protocol" }
 
 # Freenet
 freenet-scaffold = "0.2.2"

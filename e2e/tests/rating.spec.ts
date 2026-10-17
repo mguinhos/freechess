@@ -28,9 +28,6 @@ import {
  * directions and add up.
  */
 
-/** Everyone starts here, so a rating that never moved still reads 1200. */
-const START = 1200;
-
 /**
  * The rating shown for `nickname` in the ranking, or null if not listed yet.
  *
@@ -54,6 +51,8 @@ async function ratingInRanking(
 test("winning a game moves both players' ratings", async ({ browser }) => {
   const alice = await openApp(browser, GATEWAY_PORT, "elo-white");
   const bob = await openApp(browser, PEER_PORT, "elo-black");
+  const loserBefore = Number(await alice.app.locator("#account-button .muted").innerText());
+  const winnerBefore = Number(await bob.app.locator("#account-button .muted").innerText());
 
   await createGame(alice.app, "10+0");
   const id = await gameId(alice.app);
@@ -83,35 +82,35 @@ test("winning a game moves both players' ratings", async ({ browser }) => {
   //
   // The header is where a player sees their own rating change, so watch that.
   await expect
-    .poll(() => alice.app.locator("#account-button").innerText(), {
+    .poll(async () => Number(await alice.app.locator("#account-button .muted").innerText()), {
       message: "the loser's rating never moved",
     })
-    .not.toContain(String(START));
+    .toBeLessThan(loserBefore);
   await expect
-    .poll(() => bobGame.locator("#account-button").innerText(), {
+    .poll(async () => Number(await bobGame.locator("#account-button .muted").innerText()), {
       message: "the winner's rating never moved",
     })
-    .not.toContain(String(START));
+    .toBeGreaterThan(winnerBefore);
 
   // Now the ranking, which is shared state and should agree on both nodes.
   const bobHome = await reopen(bob.page, PEER_PORT);
   const aliceHome = await reopen(alice.page, GATEWAY_PORT);
   await expect
     .poll(() => ratingInRanking(bobHome, "elo-black"))
-    .toBeGreaterThan(START);
+    .toBeGreaterThan(winnerBefore);
   await expect
     .poll(() => ratingInRanking(aliceHome, "elo-white"))
-    .toBeLessThan(START);
+    .toBeLessThan(loserBefore);
 
   const winner = await ratingInRanking(bobHome, "elo-black");
   const loser = await ratingInRanking(aliceHome, "elo-white");
 
-  // Elo is zero-sum between two players who started level: what one gains the
+  // These players have the same K-factor: what one gains the
   // other loses. Checking the sum, rather than a hardcoded number, keeps this
   // honest if the K-factor is ever retuned.
   expect(winner).not.toBeNull();
   expect(loser).not.toBeNull();
-  expect((winner as number) - START).toBe(START - (loser as number));
+  expect((winner as number) - winnerBefore).toBe(loserBefore - (loser as number));
 
   // And both nodes agree — the ranking is shared state, not a local tally.
   await expect

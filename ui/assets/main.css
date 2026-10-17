@@ -1,9 +1,4 @@
-/* FreeChess — visual language modelled on chess.com's dark theme.
-   Pieces are Unicode glyphs, so there are no third-party assets and no
-   licences to carry: the solid glyph set (U+265A..U+265F) is used for BOTH
-   colours, with white pieces painted white and outlined in dark. Mixing the
-   outline glyphs (U+2654..) for white looks inconsistent across fonts, and
-   several fonts render them at a different weight. */
+/* FreeChess. Board colors, pieces and controls are bundled with the app. */
 
 :root {
   --bg: #302e2b;
@@ -11,7 +6,7 @@
   --panel-2: #21201d;
   --border: #3d3a37;
   --text: #e9e8e6;
-  --text-dim: #9b9895;
+  --text-dim: #b6b3ae;
   --green: #81b64c;
   --green-hi: #95bb4a;
   --light-sq: #ebecd0;
@@ -31,6 +26,7 @@
   flex-direction: column;
   min-height: 0;
 }
+.app-shell { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
 body {
   margin: 0;
@@ -48,7 +44,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-button {
+button, .button {
   font: inherit;
   cursor: pointer;
   border: none;
@@ -57,6 +53,11 @@ button {
   background: var(--panel-2);
   color: var(--text);
   transition: filter .12s ease, transform .04s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-decoration: none;
 }
 button:hover:not(:disabled) { filter: brightness(1.18); }
 button:active:not(:disabled) { transform: translateY(1px); }
@@ -64,15 +65,19 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 
 button.primary {
   background: var(--green);
-  color: #fff;
+  color: #1f3115;
   font-weight: 600;
   box-shadow: 0 3px 0 #5d8a34;
 }
 button.primary:active:not(:disabled) { box-shadow: 0 1px 0 #5d8a34; }
 button.danger { background: #a33; color: #fff; }
-button.ghost { background: transparent; border: 1px solid var(--border); }
+button.ghost, .button.ghost { background: transparent; border: 1px solid var(--border); }
+button:focus-visible, a:focus-visible, [role="button"]:focus-visible { outline: 3px solid var(--green-hi); outline-offset: 3px; }
+.icon { width: 20px; height: 20px; flex: none; }
+.icon-button { width: 38px; height: 38px; padding: 8px; flex: none; }
+.text-button { color: var(--green-hi); padding: 0; background: transparent; text-decoration: underline; }
 
-input, select {
+input, select, textarea {
   font: inherit;
   background: var(--panel-2);
   color: var(--text);
@@ -81,15 +86,15 @@ input, select {
   padding: 9px 12px;
   width: 100%;
 }
-input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1px; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--green); outline-offset: -1px; }
 
 /* ------------------------------------------------------------------ layout */
 
 .topbar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 10px 20px;
+  gap: 12px;
+  padding: 10px 24px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   position: sticky;
@@ -104,8 +109,14 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
   display: flex;
   align-items: center;
   gap: 8px;
+  background: transparent;
+  padding: 0;
+  white-space: nowrap;
 }
-.brand .mark { color: var(--green); }
+.brand .mark { display: flex; align-items: center; width: 35px; height: 38px; }
+.brand .mark .piece-svg { width: 35px; height: 35px; filter: drop-shadow(0 2px 0 #5d8a34); }
+.account-button { max-width: 235px; }
+.account-button span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar .spacer { flex: 1; }
 
 .conn {
@@ -129,6 +140,19 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
    there absorbs the free space instead of stretching — so the page collapsed to
    its content width and dragged the board down to about a third of its size. */
 .page { width: 100%; max-width: 1240px; margin: 0 auto; padding: 20px; }
+.home-hero { display: flex; gap: 40px; align-items: center; justify-content: center; padding: 26px 32px 36px; margin-bottom: 8px; }
+.hero-preview { width: 250px; flex: none; transform: rotate(-3deg); }
+.hero-content { max-width: 440px; }
+.eyebrow { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: var(--green-hi); }
+h1 { font-size: clamp(28px, 3.3vw, 42px); line-height: 1.1; letter-spacing: -1px; margin: 10px 0 12px; }
+.hero-content p { color: var(--text-dim); font-size: 16px; line-height: 1.5; margin: 0 0 20px; }
+.hero-play { min-width: 230px; padding: 15px 24px; font-size: 19px; }
+.hero-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+.hero-computer { font-weight: 600; }
+.hero-note { display: block; margin-top: 14px; }
+.search-row input { background: var(--panel); }
+.time-presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+.time-presets button { min-height: 46px; font-size: 17px; font-weight: 600; }
 
 .conn.ver { opacity: .7; }
 
@@ -142,7 +166,7 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .footer .spacer { flex: 1; }
 .footer a { color: var(--text-dim); text-decoration: none; }
 .footer a:hover { color: var(--text); text-decoration: underline; }
-.columns { display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start; }
+.columns { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
 @media (max-width: 960px) { .columns { grid-template-columns: 1fr; } }
 
 .panel {
@@ -167,6 +191,7 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .panel + .panel { margin-top: 20px; }
 
 .row { display: flex; align-items: center; gap: 10px; }
+.spacer { flex: 1; }
 .muted { color: var(--text-dim); }
 .small { font-size: 12px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -197,19 +222,24 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  /* Scale the glyph to the square, so the board works at any size — from the
-     full game board down to the lobby's 96px previews. */
-  font-size: min(9vw, 46px);
+  border: 0;
+  border-radius: 0;
+  padding: 0;
   line-height: 1;
+  touch-action: manipulation;
 }
+.sq:hover:not(:disabled) { filter: none; }
+.sq:active:not(:disabled) { transform: none; }
+.sq:focus-visible { outline: none; box-shadow: inset 0 0 0 3px #26361e; z-index: 3; }
 .sq.light { background: var(--light-sq); }
 .sq.dark  { background: var(--dark-sq); }
-.sq.last  { background-color: var(--highlight); background-blend-mode: multiply; }
+.sq.last::after { content: ""; position: absolute; inset: 0; background: var(--highlight); pointer-events: none; }
 .sq.sel::after {
   content: "";
   position: absolute;
   inset: 0;
   background: rgba(255, 255, 51, .55);
+  pointer-events: none;
 }
 .sq.check::before {
   content: "";
@@ -239,37 +269,47 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
   z-index: 2;
   cursor: grab;
   line-height: 1;
+  pointer-events: none;
 }
-.piece.white {
-  color: #fff;
-  /* An outline is what makes the solid glyph read as a *white* piece. */
-  text-shadow:
-    0 0 1px #000, 1px 0 1px #000, -1px 0 1px #000, 0 1px 1px #000, 0 -1px 1px #000,
-    1px 1px 1px #000, -1px -1px 1px #000, 1px -1px 1px #000, -1px 1px 1px #000,
-    0 2px 3px rgba(0, 0, 0, .35);
-}
-.piece.black {
-  color: #312e2b;
-  text-shadow: 0 0 1px rgba(255,255,255,.28), 0 2px 3px rgba(0, 0, 0, .35);
-}
-.piece.dragging { opacity: .35; }
+.piece-svg { display: block; width: 84%; height: 84%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+.piece-drag-image { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; }
+.piece-drag-image[draggable="true"] { cursor: grab; }
+.sq > .piece-svg, .piece-drag-image > .piece-svg { width: 100%; height: 100%; }
+.coord { position: absolute; z-index: 3; font-size: clamp(10px, 1.2vw, 13px); font-weight: 600; pointer-events: none; line-height: 1; }
+.coord.rank { top: 5px; left: 5px; }
+.coord.file { bottom: 4px; right: 5px; }
+.sq.light .coord { color: var(--dark-sq); }
+.sq.dark .coord { color: var(--light-sq); }
+.board-container { position: relative; }
+.promotion-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .5); z-index: 10; }
+.promotion-card { background: var(--panel); border-radius: 8px; padding: 18px; box-shadow: 0 8px 30px #0008; text-align: center; }
+.promotion-card h3 { margin: 0 0 14px; }
+.promotion-options { display: flex; gap: 8px; }
+.promotion-options button { width: 60px; height: 66px; padding: 6px; background: var(--light-sq); }
+.promotion-options .piece-svg { width: 44px; height: 44px; }
 
-.coords { display: flex; justify-content: space-between; padding: 4px 2px 0; }
-.coords span { font-size: 11px; color: var(--text-dim); width: 12.5%; text-align: center; }
 
 /* -------------------------------------------------------------- game board */
 
-.game-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+.game-layout { display: grid; grid-template-columns: minmax(0, min(680px, calc(100dvh - 260px))) 320px; gap: 24px; align-items: start; justify-content: center; }
+.game-layout > .panel > p { margin: 12px 16px; line-height: 1.5; }
+.game-layout > .panel > .replay-bar { padding: 0 16px 16px; }
+.game-layout > .panel .moves .mv { cursor: default; }
+.game-toolbar { display: flex; align-items: center; max-width: 1024px; margin: 0 auto 10px; }
 @media (max-width: 900px) { .game-layout { grid-template-columns: 1fr; } }
 
 .seat {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 4px;
+  padding: 9px 0;
+  min-height: 62px;
 }
 .seat .name { font-weight: 600; }
-.seat .rating { color: var(--text-dim); font-size: 12px; }
+.seat-avatar { width: 42px; height: 42px; border-radius: 5px; background: var(--panel-2); display: flex; align-items: center; justify-content: center; flex: none; }
+.seat-avatar .piece-svg { width: 34px; height: 34px; }
+.seat-details { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.seat .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .seat .spacer { flex: 1; }
 
 .clock {
@@ -286,7 +326,32 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 .clock.active { background: #f5f5f0; color: #262421; }
 .clock.low { background: #7a2b2b; color: #fff; }
 
-.captured { font-size: 17px; letter-spacing: -3px; color: #b6b3ae; }
+.captured { display: flex; align-items: center; min-height: 18px; flex-wrap: wrap; }
+.captured .piece-svg { width: 19px; height: 19px; margin-right: -5px; }
+.game-state { font-size: 17px; font-weight: 700; margin-bottom: 12px; }
+.share-actions { display: flex; gap: 8px; margin-top: 10px; }
+.share-actions button { flex: 1; }
+.pgn-modal { max-width: 580px; }
+.pgn-text { min-height: 260px; resize: vertical; font-size: 12px; line-height: 1.6; }
+.modal.appearance-modal { max-width: 650px; }
+.modal .body.appearance-body { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 26px; }
+.appearance-preview { align-self: start; }
+.appearance-preview p { text-align: center; margin: 10px 0 0; }
+.theme-piece-preview { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px 0 0; }
+.theme-piece-preview .piece-svg { width: 56px; height: 56px; }
+.appearance-controls { display: flex; flex-direction: column; gap: 22px; }
+.appearance-note { padding: 0 18px 14px; }
+.appearance-credits { color: var(--text-dim); text-decoration: underline; }
+.appearance-credits:hover { color: var(--text); }
+.board-presets { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.board-preset { justify-content: flex-start; border: 1px solid var(--border); padding: 8px 10px; }
+.board-preset.active { border-color: var(--green-hi); box-shadow: inset 0 0 0 1px var(--green-hi); }
+.board-swatch { width: 26px; height: 26px; border-radius: 3px; flex: none; }
+.theme-colors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.theme-colors label { margin: 0; }
+.theme-colors input[type="color"] { display: block; padding: 3px; height: 36px; margin-top: 7px; cursor: pointer; }
+.piece-set-options { display: flex; gap: 8px; }
+.piece-set-options button { flex: 1; }
 
 /* ------------------------------------------------------------- move list */
 
@@ -298,12 +363,12 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
 }
 .moves .mv-row { display: grid; grid-template-columns: 42px 1fr 1fr; }
 .moves .mv-row:nth-child(odd) { background: var(--panel-2); }
-.moves .num { color: var(--text-dim); padding: 4px 8px; }
-.moves .mv { padding: 4px 8px; cursor: pointer; border-radius: 3px; }
+.moves .num { color: var(--text-dim); padding: 8px; }
+.moves .mv { padding: 8px; text-align: left; justify-content: flex-start; cursor: pointer; border-radius: 3px; background: transparent; }
 .moves .mv:hover { background: rgba(255, 255, 255, .07); }
-.moves .mv.current { background: var(--green); color: #fff; }
+.moves .mv.current { background: var(--green); color: #1f3115; font-weight: 700; }
 
-.replay-bar { display: flex; gap: 6px; padding: 10px 0 0; }
+.replay-bar { display: flex; gap: 6px; }
 .replay-bar button { flex: 1; padding: 7px; }
 
 /* ------------------------------------------------------------- lobby grid */
@@ -407,16 +472,11 @@ input:focus, select:focus { outline: 2px solid var(--green); outline-offset: -1p
   max-height: 90vh;
   overflow-y: auto;
 }
-.modal h3 { margin: 0; padding: 15px 18px; border-bottom: 1px solid var(--border); font-size: 16px; }
+.modal h3 { margin: 0; padding: 15px 18px; border-bottom: 1px solid var(--border); font-size: 16px; display: flex; align-items: center; justify-content: space-between; }
 .modal .body { padding: 18px; display: flex; flex-direction: column; gap: 13px; }
-.modal .actions { display: flex; gap: 9px; justify-content: flex-end; }
+.modal .actions { display: flex; gap: 9px; justify-content: flex-end; padding: 0 18px 18px; }
+.modal .body .actions { padding: 0; }
 label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 5px; }
-
-.promo { display: flex; gap: 8px; justify-content: center; }
-/* No `color` here: the glyph set is identical for both sides, so the piece
-   classes are what say which colour is being promoted. Hardcoding a dark colour
-   meant White chose from a row of black-looking pieces. */
-.promo button { font-size: 34px; padding: 6px 14px; line-height: 1; background: var(--light-sq); }
 
 .banner {
   padding: 11px 15px;
@@ -447,6 +507,7 @@ label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 
   box-shadow: 0 10px 40px rgba(0, 0, 0, .6);
 }
 .result-card .headline { font-size: 21px; font-weight: 700; margin-bottom: 4px; }
+.result-card button { margin-top: 18px; }
 
 .board-wrap { position: relative; }
 
@@ -465,17 +526,6 @@ code.key {
   line-height: 1.5;
 }
 
-/* Source link in the top bar. A hyperlink only — nothing is loaded from an
-   external origin, so the gateway's same-origin CSP is unaffected. */
-.conn.gh {
-  color: var(--text-dim);
-  text-decoration: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 5px 10px;
-}
-.conn.gh:hover { color: var(--text); border-color: var(--green); }
-
 /* A finished game in the lobby: still browsable, visibly not live. */
 .game-card.finished { opacity: .55; }
 .game-card.finished:hover { opacity: .85; }
@@ -484,4 +534,61 @@ code.key {
   font-weight: 700;
   color: var(--text-dim);
   letter-spacing: .4px;
+}
+
+@media (max-width: 760px) {
+  .topbar { gap: 8px; padding: 8px 12px; }
+  .topbar .conn.ver, .topbar .conn:not(:first-of-type) { display: none; }
+  .topbar .conn { font-size: 0; gap: 0; }
+  .brand { font-size: 17px; }
+  .account-button { max-width: 165px; padding: 8px; }
+  .account-button .muted { display: none; }
+  .page { padding: 14px; }
+  .home-hero { padding: 12px 0 26px; gap: 24px; }
+  .hero-preview { width: 190px; }
+  .hero-play { min-width: 160px; }
+  .hero-content p { font-size: 14px; }
+  .game-layout { gap: 16px; }
+  .game-layout > div { min-width: 0; }
+  .moves { max-height: 220px; }
+}
+@media (max-width: 520px) {
+  .topbar { gap: 6px; }
+  .topbar .conn { display: none; }
+  .account-button { width: 38px; height: 38px; padding: 8px; }
+  .account-button span { display: none; }
+  .brand .mark { width: 28px; }
+  .brand .mark .piece-svg { width: 28px; height: 28px; }
+  .page { padding: 12px; }
+  .home-hero { gap: 18px; }
+  .hero-preview { width: 110px; }
+  .hero-content p { margin-bottom: 15px; }
+  .hero-play { min-width: 0; padding: 11px 18px; font-size: 16px; }
+  .hero-actions { flex-direction: column; gap: 9px; }
+  .hero-note { font-size: 11px; }
+  .eyebrow { font-size: 10px; letter-spacing: 1px; }
+  h1 { font-size: 27px; }
+  .list-item { padding: 10px 12px; gap: 8px; }
+  .clock { font-size: 21px; min-width: 88px; padding: 7px 10px; }
+  .seat { gap: 8px; }
+  .seat-avatar { width: 36px; height: 36px; }
+  .seat-avatar .piece-svg { width: 30px; height: 30px; }
+  .modal-bg { padding: 12px; }
+  .modal .body { padding: 16px; }
+  .modal .body.appearance-body { grid-template-columns: 1fr; gap: 20px; }
+  .appearance-preview { display: flex; align-items: center; gap: 16px; }
+  .appearance-preview .board { width: 160px; flex: none; }
+  .appearance-preview p { text-align: left; margin: 0; }
+  .theme-piece-preview { gap: 4px; padding: 0; }
+  .theme-piece-preview .piece-svg { width: 44px; height: 44px; }
+  .footer .page { padding: 14px 12px; }
+  .footer .row { gap: 10px; }
+  .footer .spacer { display: none; }
+}
+@media (max-width: 360px) {
+  .brand > span:last-child { display: none; }
+  .appearance-preview .board { width: 130px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }

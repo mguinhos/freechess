@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Isolated two-node Freenet network for testing FreeChess.
+# Isolated three-node Freenet network for testing FreeChess.
 #
 # Why the isolation is fussy: `--data-dir` does NOT isolate everything. The
 # gateway bootstrap list lives in the global config dir, so a "local" node will
@@ -10,7 +10,7 @@
 # So each node gets its own `--config-dir` (the only flag that also wins against
 # XDG_CONFIG_HOME on CI), and the gateway gets an empty `gateways.toml`.
 #
-# Both nodes also run with --disable-auto-update. A bare `freenet network` exits
+# All nodes also run with --disable-auto-update. A bare `freenet network` exits
 # with code 42 the moment it notices a newer release, and with no supervisor to
 # catch that it simply dies — mid-test, looking exactly like a crash. These are
 # throwaway test nodes, so staying pinned to the installed version is correct;
@@ -52,7 +52,7 @@ start_gateway() {
     --public-network-port "$GW_NET" \
     --network-port "$GW_NET" \
     --ws-api-port "$GW_WS" \
-    --ws-api-address 0.0.0.0 \
+    --ws-api-address 127.0.0.1 \
     --config-dir "$gw_dir/config" \
     --data-dir "$gw_dir/data" \
     --log-dir "$gw_dir/logs" \
@@ -108,7 +108,7 @@ start_peer() {
     --disable-auto-update \
     --network-port "$net" \
     --ws-api-port "$ws" \
-    --ws-api-address 0.0.0.0 \
+    --ws-api-address 127.0.0.1 \
     --gateway "127.0.0.1:$GW_NET,$pubkey" \
     --config-dir "$dir/config" \
     --data-dir "$dir/data" \

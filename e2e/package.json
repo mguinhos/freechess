@@ -2,7 +2,7 @@
   "name": "freechess-e2e",
   "private": true,
   "version": "0.1.0",
-  "description": "Two-node browser tests for FreeChess",
+  "description": "Three-node browser tests for FreeChess",
   "scripts": {
     "test": "playwright test",
     "test:headed": "playwright test --headed",

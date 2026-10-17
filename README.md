@@ -6,8 +6,8 @@ A decentralized chess site built on [Freenet](https://freenet.org). Play, watch,
 search and replay games — with no server anywhere in the picture.
 
 Every game, the lobby, the Elo ranking, player presence and the shared history
-live in Freenet contracts, replicated across peers. The only thing that never
-leaves your device is your signing key.
+live in Freenet contracts, replicated across peers. Your signing key and
+appearance preferences stay in the local delegate.
 
 ## ▶ [Acesse o FreeChess](http://localhost:7509/v1/contract/web/68i7VVAF3rDF47TqnKCys8ewXewEacJqkVcF6wXZsE1J/)
 
@@ -29,6 +29,14 @@ If nothing loads, you need a node running: see
 - **Play chess.** Full rules: castling, en passant, promotion, checkmate,
   stalemate, threefold repetition, the fifty-move rule, and clocks with
   Fischer increment.
+- **Play the computer immediately.** Untimed practice against Stockfish 19 Lite
+  (Stockfish.js 19.0.1), running privately in a local browser worker, with move
+  history, undo and adjustable difficulty; works without a node connection.
+- **Board controls.** Click or drag pieces, choose promotions, flip the board,
+  and move using the keyboard. Bundled SVG pieces and optional game sounds.
+- **Appearance.** Neo and Classic piece sets, board presets, and custom square
+  and piece colors. Changes preview immediately and save for your account on
+  your Freenet node.
 - **Watch any game live.** Every game is public by default. The home page shows
   the current board of *every* game in progress, updating in real time.
 - **Search.** Find games by player nickname or game id.
@@ -59,7 +67,7 @@ FreeChess uses four contracts and one delegate.
 | `lobby-contract` | A singleton: live games (each with a signed board snapshot), the Elo ranking, and presence. |
 | `archive-contract` | The shared history, sharded into buckets of 1000 games. |
 | `player-contract` | One instance per player: nickname and certified game history. |
-| `chess-delegate` | Runs locally. Holds the private signing key — the one thing not replicated. |
+| `chess-delegate` | Runs locally. Stores the private signing key and per-account appearance preferences. |
 
 ### One subscription drives the home page
 
@@ -178,12 +186,26 @@ target, `cargo-make`, the Dioxus CLI, and a Freenet node.
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install cargo-make dioxus-cli --locked
+cargo install cargo-make --locked
+cargo install dioxus-cli --version 0.7.9 --locked
 
 cargo make build        # contracts, delegate, and the web UI
 cargo make test         # the full test suite
 cargo make publish      # publish to the local node
 ```
+
+For local development, use Dioxus CLI **0.7.9** to match `Cargo.lock`, Python
+**3.11+** for the build regression checks, and `cryptography` for the isolated node harness:
+
+```bash
+python3 -m pip install cryptography
+./scripts/local.sh      # builds and prints URLs for two local players
+```
+
+This runs a separate three-node network on ports 7511, 7512 and 7514. It uses
+`target/local-webapp/` for its publisher key and version, so it needs no production
+publisher key. Run it again after editing; stop with `./scripts/nodes.sh down`.
+`cargo make dev` runs the same script.
 
 The UI embeds the contract WASM at build time (a client PUTs the contract, not
 just its state), so the contracts must be built before the UI — `cargo make`
@@ -194,7 +216,16 @@ handles the ordering.
 ```bash
 cargo test                          # unit and state tests
 cargo test --release -- --ignored   # deep perft
-cargo make test-e2e                 # two-node browser test
+cargo make test-e2e                 # three-node browser test
+```
+
+Optional account-theme isolation check: publish the app to a disposable node
+first. This test imports public fixture accounts; regular node ports are blocked.
+
+```bash
+FREECHESS_THEME_ACCOUNT_PORT=7521 \
+FREECHESS_CONTRACT_ID="$(cat target/local-webapp/contract-id.txt)" \
+npm --prefix e2e test -- tests/theme-account.spec.ts
 ```
 
 The move generator is verified with **perft** against the five standard
@@ -211,13 +242,26 @@ any number of times, reaches the same state).
 ## Design notes
 
 **No external requests.** The gateway serves the app under a same-origin CSP, so
-there are no CDN scripts, no web fonts and no remote images. Pieces are Unicode
-glyphs, the stylesheet ships in the bundle, and the WebSocket URL is derived from
+there are no CDN scripts, no web fonts and no remote images. Pieces and icons are
+bundled SVGs, sounds use Web Audio, and the WebSocket URL is derived from
 the page's own origin rather than hardcoded.
 
-**No third-party assets**, and therefore no licence obligations beyond this
-project's own: the solid Unicode glyph set (U+265A–U+265F) is used for both
-colours, with white pieces painted white and outlined in CSS.
+**Piece artwork.** Neo uses Kadagaden's Kaneo set (CC BY 4.0); Classic uses
+Cburnett's pieces (CC BY-SA 3.0). Recoloring preserves each artwork license.
+The bundled credits page is linked from Appearance; interface icons are drawn
+in this project.
+
+**Computer practice.** The bundled Stockfish.js 19.0.1 lite single-threaded
+worker runs entirely in your browser. Positions stay local; the engine needs no
+cloud service or CDN. Its GPLv3 license, authors, checksums, build instructions,
+and complete corresponding source (including the embedded NNUE network) are in
+[`ui/assets/stockfish/`](ui/assets/stockfish/SOURCE.md) and linked from practice.
+The root project license is unchanged.
+
+**Appearance preferences.** The local Freenet delegate stores board and piece
+preferences privately for each player account. Wait for **Saved for this account**
+in Appearance before closing the page. New browser sessions on the same node
+restore these choices from the normal app URL; no theme fragment is needed.
 
 **Contracts must not pull in `getrandom`.** They run under wasmtime on
 `wasm32-unknown-unknown`, which has no backend for it; any dependency that does
@@ -259,15 +303,6 @@ Freenet's reference decentralized chat application, and the
 MIT — see [LICENSE](LICENSE).
 
 ## Publishing notes
-
-Two things about publishing are worth knowing before you try it.
-
-**Republishing needs UPDATE, not PUT.** `fdev publish` is a PUT, and a PUT
-against a contract that already holds state does not replace it. To ship a new
-release of the webapp, PUT once to create it and use
-`fdev execute update <key> <state> --as-state` afterwards. The web-container
-contract only accepts full-state replacements (a webapp has no meaningful
-incremental form), which is what `--as-state` selects.
 
 **Large states do not publish reliably on freenet 0.2.114.** Observed on a clean
 two-node network: publishing the 56-byte lobby succeeds and the contract is

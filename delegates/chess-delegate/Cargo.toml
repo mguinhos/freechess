@@ -11,7 +11,7 @@ default = ["freenet-main-delegate"]
 freenet-main-delegate = []
 
 [dependencies]
-chess-core.workspace = true
+chess-delegate-protocol.workspace = true
 ciborium.workspace = true
 serde.workspace = true
 freenet-stdlib.workspace = true

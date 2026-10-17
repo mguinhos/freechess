@@ -9,6 +9,7 @@ pub mod admin;
 pub mod archive;
 pub mod certificate;
 pub mod chess;
+// Frozen to preserve contract WASM identities; current messages use chess-delegate-protocol.
 pub mod delegate_api;
 pub mod elo;
 pub mod game;

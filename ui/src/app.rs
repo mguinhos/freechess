@@ -29,7 +29,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{HostResponse, WebApi};
-use freenet_stdlib::prelude::ContractInstanceId;
+use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -38,9 +38,8 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
     Home,
+    Practice,
     Game(GameId),
-    Replay(GameId),
-    Profile(PlayerId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +99,17 @@ pub struct AppState {
     /// Whether the retired delegates have already been asked this session, so
     /// a second empty answer does not restart the probe in a loop.
     pub legacy_probed: bool,
+    pub legacy_account: Option<(DelegateKey, PlayerId)>,
+    pub legacy_nickname_pending: bool,
+    pub legacy_theme_source: Option<DelegateKey>,
+    pub pending_import: Option<[u8; 32]>,
+    pending_import_context: Option<Vec<u8>>,
+    theme_probe: Option<ThemeProbe>,
+    /// The account whose private appearance settings have finished loading.
+    pub theme_player: Option<[u8; 32]>,
+    pub stored_theme: Option<crate::theme::Theme>,
+    pub pending_theme: Option<crate::theme::Theme>,
+    pub theme_error: Option<String>,
 }
 
 impl AppState {
@@ -116,6 +126,16 @@ impl AppState {
             nickname_unset: true,
             account_settled: false,
             legacy_probed: false,
+            legacy_account: None,
+            legacy_nickname_pending: false,
+            legacy_theme_source: None,
+            pending_import: None,
+            pending_import_context: None,
+            theme_probe: None,
+            theme_player: None,
+            stored_theme: None,
+            pending_theme: None,
+            theme_error: None,
         }
     }
 
@@ -157,6 +177,12 @@ impl AppState {
 
     pub fn game(&self, id: &GameId) -> Option<&ChessGameStateV1> {
         self.games.get(id)
+    }
+
+    pub fn can_create_game(&self) -> bool {
+        self.status == ConnStatus::Online
+            && self.account_settled
+            && self.lobby.administration.accepting_new_games()
     }
 
     /// Am I an admin?
@@ -244,8 +270,18 @@ pub enum Cmd {
     ProbeLegacyDelegates,
     /// Hand this session's account to the delegate for safekeeping.
     StoreAccount,
+    ImportAccount {
+        seed: [u8; 32],
+    },
+    LoadLegacyNickname(DelegateKey),
+    LoadLegacyTheme(DelegateKey),
     /// Ask the delegate for the stored nickname.
     LoadNickname,
+    LoadTheme,
+    SaveTheme {
+        player: [u8; 32],
+        theme: crate::theme::Theme,
+    },
 
     // --- administration ---
     /// Claim adminship. Only takes effect if nobody claimed it earlier.
@@ -287,7 +323,7 @@ pub type Sync = Coroutine<Cmd>;
 
 /// Bridges the WebApi callback (which is not a future) into the loop.
 enum Event {
-    Response(HostResponse),
+    Response(Box<HostResponse>),
     Failed(String),
     Open,
 }
@@ -303,12 +339,12 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
         let api = freenet::connect(
             move |result| {
                 let _ = match result {
-                    Ok(response) => resp_tx.unbounded_send(Event::Response(response)),
-                    Err(e) => resp_tx.unbounded_send(Event::Failed(e.to_string())),
+                    Ok(response) => resp_tx.unbounded_send(Event::Response(Box::new(response))),
+                    Err(e) => resp_tx.unbounded_send(Event::Failed(freenet::error_message(e))),
                 };
             },
             move |e| {
-                let _ = err_tx.unbounded_send(Event::Failed(e.to_string()));
+                let _ = err_tx.unbounded_send(Event::Failed(freenet::api_error(e)));
             },
             move || {
                 let _ = open_tx.unbounded_send(Event::Open);
@@ -352,7 +388,7 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
                         if let Err(e) = api
                             .send(freenet::register_delegate_request())
                             .await
-                            .map_err(|e| format!("could not register the delegate: {e}"))
+                            .map_err(|e| format!("could not register the delegate: {}", freenet::api_error(e)))
                         {
                             state.with_mut(|s| s.message = Some(e));
                         }
@@ -368,7 +404,7 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
                         }
                     }
                     Some(Event::Response(response)) => {
-                        if let Some(followup) = handle_response(&mut state, &instances, response) {
+                        if let Some(followup) = handle_response(&mut state, &instances, *response) {
                             if let Err(e) =
                                 handle_cmd(&mut api, &mut state, &mut instances, followup).await
                             {
@@ -397,7 +433,6 @@ pub fn use_sync(mut state: Signal<AppState>) -> Sync {
 enum Subject {
     Lobby,
     Game(GameId),
-    Profile(PlayerId),
 }
 
 /// Publish the lobby if needed, then follow it.
@@ -418,7 +453,7 @@ async fn ensure_lobby(
     let empty = freenet::encode(&LobbyStateV1::default())?;
     api.send(freenet::put_request(&lobby, empty, true))
         .await
-        .map_err(|e| format!("could not publish the lobby: {e}"))?;
+        .map_err(|e| format!("could not publish the lobby: {}", freenet::api_error(e)))?;
 
     // GET with subscribe=true, and nothing else: a separate SUBSCRIBE sent
     // straight after would arrive before this GET has primed the local store,
@@ -428,7 +463,7 @@ async fn ensure_lobby(
     // of that error.
     api.send(freenet::get_request(id, true))
         .await
-        .map_err(|e| format!("could not fetch the lobby: {e}"))
+        .map_err(|e| format!("could not fetch the lobby: {}", freenet::api_error(e)))
 }
 
 async fn handle_cmd(
@@ -447,6 +482,12 @@ async fn handle_cmd(
             time_control,
             challenged,
         } => {
+            if !state.with(AppState::can_create_game) {
+                return Err(
+                    "New games are unavailable. Check your connection and the lobby notice."
+                        .to_string(),
+                );
+            }
             // Mining the proof-of-work is what makes creating a game cost
             // something; at 16 bits it is a few milliseconds.
             let setup = GameSetup::mine_challenge(
@@ -472,7 +513,7 @@ async fn handle_cmd(
                 true,
             ))
             .await
-            .map_err(|e| format!("could not publish the game: {e}"))?;
+            .map_err(|e| format!("could not publish the game: {}", freenet::api_error(e)))?;
 
             // Announce it in the lobby so it shows up on everyone's home page.
             let entry = LobbyEntry::new(game_id, signed);
@@ -504,7 +545,7 @@ async fn handle_cmd(
                 return api
                     .send(freenet::get_request(instance.id(), true))
                     .await
-                    .map_err(|e| format!("could not fetch the game: {e}"));
+                    .map_err(|e| format!("could not fetch the game: {}", freenet::api_error(e)));
             }
             // An offer, not a seat. Only the creator's countersignature seats a
             // player, so nothing here starts the game — see
@@ -524,13 +565,13 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not offer to play: {e}"))?;
+            .map_err(|e| format!("could not offer to play: {}", freenet::api_error(e)))?;
             // GET as well as subscribe: subscribing only delivers *future*
             // changes, so without this the board stays empty until the
             // opponent happens to move.
             api.send(freenet::get_request(instance.id(), true))
                 .await
-                .map_err(|e| format!("could not fetch the game: {e}"))?;
+                .map_err(|e| format!("could not fetch the game: {}", freenet::api_error(e)))?;
 
             // The lobby entry is only updated once the creator accepts, which
             // happens in `Cmd::SeatChallenger` on the creator's own client.
@@ -560,7 +601,7 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not decline the challenge: {e}"))?;
+            .map_err(|e| format!("could not decline the challenge: {}", freenet::api_error(e)))?;
 
             // Mirror into the lobby so the listing stops being offered to
             // anyone, including us — otherwise the challenge would keep showing
@@ -664,7 +705,7 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not accept the challenger: {e}"))?;
+            .map_err(|e| format!("could not accept the challenger: {}", freenet::api_error(e)))?;
 
             // Mirror into the lobby so the home page moves the game from "open"
             // to "live". The lobby carries the acceptance, not the bare offer,
@@ -686,7 +727,7 @@ async fn handle_cmd(
             });
             api.send(freenet::get_request(instance.id(), true))
                 .await
-                .map_err(|e| format!("could not fetch the game: {e}"))
+                .map_err(|e| format!("could not fetch the game: {}", freenet::api_error(e)))
         }
 
         Cmd::PlayMove { game: game_id, mv } => {
@@ -698,6 +739,8 @@ async fn handle_cmd(
                         .zip(s.games.get(&game_id).cloned())
                 })
                 .ok_or_else(|| "that game is not loaded".to_string())?;
+
+            validate_move(&game, &key.verifying_key(), mv)?;
 
             let ply = game.moves.move_list().len() as u32;
             let authorized = AuthorizedMove::new(key, &game_id, ply, mv, now);
@@ -712,20 +755,20 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not send the move: {e}"))?;
+            .map_err(|e| format!("could not send the move: {}", freenet::api_error(e)))?;
 
             // Apply locally so the board responds immediately; the network
             // update will confirm the same thing.
             let mut updated = game.clone();
             updated.moves.moves.insert(ply, authorized);
             let params = chess_core::game::ChessGameParametersV1 { creator, game_id };
-            let _ = updated.prune(&params);
-            publish_snapshot(api, key, game_id, &updated, now).await?;
+            updated.prune(&params)?;
 
             let finished = updated.result().is_over();
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
+            publish_snapshot(api, key, game_id, &updated, now).await?;
             if finished {
                 certify_and_file(api, state, key, game_id, &updated, now).await?;
             }
@@ -741,6 +784,12 @@ async fn handle_cmd(
                         .zip(s.games.get(&game_id).cloned())
                 })
                 .ok_or_else(|| "that game is not loaded".to_string())?;
+            if game.result().is_over() {
+                return Err("the game is already over".to_string());
+            }
+            if game.player_keys().is_none() || game.color_of(&key.verifying_key()).is_none() {
+                return Err("you are not playing in this game".to_string());
+            }
             let ply = game.moves.move_list().len() as u32;
             let conclusion = SignedConclusion::resign(key, &game_id, ply, now);
 
@@ -754,14 +803,14 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not resign: {e}"))?;
+            .map_err(|e| format!("could not resign: {}", freenet::api_error(e)))?;
 
             let mut updated = game.clone();
             updated.conclusion = ConclusionV1::single(conclusion);
-            publish_snapshot(api, key, game_id, &updated, now).await?;
             state.with_mut(|s| {
                 s.games.insert(game_id, updated.clone());
             });
+            publish_snapshot(api, key, game_id, &updated, now).await?;
             certify_and_file(api, state, key, game_id, &updated, now).await
         }
 
@@ -795,7 +844,12 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not publish the clock attestation: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "could not publish the clock attestation: {}",
+                    freenet::api_error(e)
+                )
+            })?;
 
             state.with_mut(|s| {
                 if let Some(g) = s.games.get_mut(&game_id) {
@@ -868,7 +922,7 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not claim the timeout: {e}"))?;
+            .map_err(|e| format!("could not claim the timeout: {}", freenet::api_error(e)))?;
 
             let mut updated = game.clone();
             updated.conclusion = ConclusionV1::single(conclusion);
@@ -904,7 +958,7 @@ async fn handle_cmd(
 
             // Also hand it to the delegate: localStorage throws in the
             // gateway's sandbox, so without this the name is lost on reload.
-            let store = chess_core::delegate_api::ChessDelegateRequest::SetNickname {
+            let store = chess_delegate_protocol::ChessDelegateRequest::SetNickname {
                 nickname: nickname.clone(),
             };
             if let Ok(payload) = store.to_bytes() {
@@ -922,32 +976,80 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not publish the nickname: {e}"))
+            .map_err(|e| format!("could not publish the nickname: {}", freenet::api_error(e)))
         }
 
         Cmd::LoadNickname => {
-            let payload = chess_core::delegate_api::ChessDelegateRequest::GetNickname
+            let payload = chess_delegate_protocol::ChessDelegateRequest::GetNickname
                 .to_bytes()
                 .map_err(|e| format!("could not encode the delegate request: {e}"))?;
             api.send(freenet::delegate_request(payload))
                 .await
-                .map_err(|e| format!("could not ask the delegate for the nickname: {e}"))
+                .map_err(|e| {
+                    format!(
+                        "could not ask the delegate for the nickname: {}",
+                        freenet::api_error(e)
+                    )
+                })
+        }
+
+        Cmd::LoadLegacyNickname(source) => {
+            if state.read().pending_import.is_some()
+                || !state.with(|s| {
+                    s.legacy_account
+                        .as_ref()
+                        .is_some_and(|(key, player)| key == &source && *player == s.me())
+                })
+            {
+                return Ok(());
+            }
+            let payload = chess_delegate_protocol::ChessDelegateRequest::GetNickname.to_bytes()?;
+            api.send(freenet::delegate_request_to(source, payload))
+                .await
+                .map_err(|e| format!("could not recover the nickname: {}", freenet::api_error(e)))
+        }
+
+        Cmd::ImportAccount { seed } => {
+            let payload =
+                chess_delegate_protocol::ChessDelegateRequest::StoreAccount { seed }.to_bytes()?;
+            let nonce: [u8; 16] = rand::random();
+            let context = [b"freechess:import:v1:".as_slice(), nonce.as_slice()].concat();
+            state.with_mut(|s| {
+                s.pending_import = Some(seed);
+                s.pending_import_context = Some(context.clone());
+            });
+            let result = api
+                .send(freenet::delegate_request_with_context(payload, context))
+                .await
+                .map_err(|_| "could not import the account: node connection failed".to_string());
+            if result.is_err() {
+                state.with_mut(|s| {
+                    s.pending_import = None;
+                    s.pending_import_context = None;
+                });
+            }
+            result
         }
 
         Cmd::LoadAccount => {
-            let payload = chess_core::delegate_api::ChessDelegateRequest::GetAccount
+            let payload = chess_delegate_protocol::ChessDelegateRequest::GetAccount
                 .to_bytes()
                 .map_err(|e| format!("could not encode the delegate request: {e}"))?;
             api.send(freenet::delegate_request(payload))
                 .await
-                .map_err(|e| format!("could not ask the delegate for the account: {e}"))
+                .map_err(|e| {
+                    format!(
+                        "could not ask the delegate for the account: {}",
+                        freenet::api_error(e)
+                    )
+                })
         }
 
         Cmd::ProbeLegacyDelegates => {
-            let payload = chess_core::delegate_api::ChessDelegateRequest::GetAccount
+            let payload = chess_delegate_protocol::ChessDelegateRequest::GetAccount
                 .to_bytes()
                 .map_err(|e| format!("could not encode the delegate request: {e}"))?;
-            for code_hash in chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES {
+            for code_hash in chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES {
                 let key = freenet::legacy_delegate_key(code_hash);
                 // A node that never ran this delegate simply does not answer.
                 // That is not an error worth surfacing — it is the normal case
@@ -960,14 +1062,117 @@ async fn handle_cmd(
         }
 
         Cmd::StoreAccount => {
-            let payload = chess_core::delegate_api::ChessDelegateRequest::StoreAccount {
+            if !state.with(account_store_ready) {
+                return Ok(());
+            }
+            let payload = chess_delegate_protocol::ChessDelegateRequest::StoreAccount {
                 seed: key.to_bytes(),
             }
             .to_bytes()
             .map_err(|e| format!("could not encode the delegate request: {e}"))?;
             api.send(freenet::delegate_request(payload))
                 .await
-                .map_err(|e| format!("could not store the account: {e}"))
+                .map_err(|e| format!("could not store the account: {}", freenet::api_error(e)))?;
+            if state.with(|s| {
+                s.legacy_account
+                    .as_ref()
+                    .is_some_and(|(_, player)| *player == s.me())
+            }) {
+                if !state.read().nickname_unset {
+                    let payload = chess_delegate_protocol::ChessDelegateRequest::SetNickname {
+                        nickname: account.nickname,
+                    }
+                    .to_bytes()?;
+                    api.send(freenet::delegate_request(payload))
+                        .await
+                        .map_err(|e| {
+                            format!("could not migrate the nickname: {}", freenet::api_error(e))
+                        })?;
+                }
+                state.with_mut(|s| s.legacy_account = None);
+            }
+            Ok(())
+        }
+
+        Cmd::LoadTheme => {
+            if !state.read().account_settled || state.read().pending_import.is_some() {
+                return Ok(());
+            }
+            let request = chess_delegate_protocol::ChessDelegateRequest::GetTheme {
+                player: key.verifying_key().to_bytes(),
+            };
+            let result = api
+                .send(freenet::delegate_request(request.to_bytes()?))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not load appearance preferences: {}",
+                        freenet::api_error(e)
+                    )
+                });
+            if let Err(error) = &result {
+                state.with_mut(|s| fail_theme_probe(s, error.clone()));
+            }
+            result
+        }
+
+        Cmd::LoadLegacyTheme(source) => {
+            if !state.with(|s| {
+                s.pending_import.is_none()
+                    && s.account_settled
+                    && s.theme_player.is_none()
+                    && s.theme_probe.as_ref().is_some_and(|probe| {
+                        probe.player == key.verifying_key().to_bytes()
+                            && probe.sources.first() == Some(&source)
+                    })
+            }) {
+                return Ok(());
+            }
+            let request = chess_delegate_protocol::ChessDelegateRequest::GetTheme {
+                player: key.verifying_key().to_bytes(),
+            };
+            state.with_mut(|s| {
+                if let Some(probe) = s.theme_probe.as_mut() {
+                    probe.deadline_ms = Some(now + 8000);
+                }
+            });
+            let result = api
+                .send(freenet::delegate_request_to(source, request.to_bytes()?))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not recover appearance preferences: {}",
+                        freenet::api_error(e)
+                    )
+                });
+            if let Err(error) = &result {
+                state.with_mut(|s| fail_theme_probe(s, error.clone()));
+            }
+            result
+        }
+
+        Cmd::SaveTheme { player, theme } => {
+            if !state.read().account_settled || player != key.verifying_key().to_bytes() {
+                return Ok(());
+            }
+            state.with_mut(|s| {
+                s.theme_error = None;
+                s.pending_theme = Some(theme.clone());
+            });
+            let request = chess_delegate_protocol::ChessDelegateRequest::SetTheme { player, theme };
+            let result = api
+                .send(freenet::delegate_request(request.to_bytes()?))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not save appearance preferences: {}",
+                        freenet::api_error(e)
+                    )
+                });
+            if let Err(error) = &result {
+                state.with_mut(|s| s.theme_error = Some(error.clone()));
+            }
+            result
         }
 
         Cmd::ClaimAdmin => {
@@ -1032,7 +1237,7 @@ async fn handle_cmd(
                 freenet::encode(&delta)?,
             ))
             .await
-            .map_err(|e| format!("could not publish presence: {e}"))
+            .map_err(|e| format!("could not publish presence: {}", freenet::api_error(e)))
         }
     }
 }
@@ -1060,7 +1265,12 @@ async fn push_admin(
         freenet::encode(&delta)?,
     ))
     .await
-    .map_err(|e| format!("could not publish the administrative action: {e}"))
+    .map_err(|e| {
+        format!(
+            "could not publish the administrative action: {}",
+            freenet::api_error(e)
+        )
+    })
 }
 
 /// Publish or refresh a game's entry in the lobby.
@@ -1074,7 +1284,7 @@ async fn push_lobby_entry(api: &mut WebApi, entry: LobbyEntry) -> Result<(), Str
         freenet::encode(&delta)?,
     ))
     .await
-    .map_err(|e| format!("could not update the lobby: {e}"))
+    .map_err(|e| format!("could not update the lobby: {}", freenet::api_error(e)))
 }
 
 /// Mirror a game's current position into the lobby, which is what makes the
@@ -1199,7 +1409,12 @@ async fn certify_and_file(
         freenet::encode(&delta)?,
     ))
     .await
-    .map_err(|e| format!("could not publish the certificate signature: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "could not publish the certificate signature: {}",
+            freenet::api_error(e)
+        )
+    })?;
 
     state.with_mut(|s| {
         s.games.insert(game_id, game.clone());
@@ -1306,7 +1521,12 @@ async fn file_certificate(
         freenet::encode(&delta)?,
     ))
     .await
-    .map_err(|e| format!("could not file the ranking entry: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "could not file the ranking entry: {}",
+            freenet::api_error(e)
+        )
+    })?;
 
     state.with_mut(|s| s.message = Some(format!("game rated: {rating}")));
     Ok(())
@@ -1320,8 +1540,8 @@ fn handle_response(
 ) -> Option<Cmd> {
     // The delegate answers about the account, which is the one piece of state
     // that must survive a reload.
-    if let HostResponse::DelegateResponse { values, .. } = &response {
-        return handle_delegate_response(state, values);
+    if let HostResponse::DelegateResponse { key, values } = &response {
+        return handle_delegate_response(state, key, values);
     }
 
     let HostResponse::ContractResponse(contract_response) = response else {
@@ -1471,7 +1691,6 @@ fn handle_response(
             }
         }
 
-        Some(Subject::Profile(_)) => {}
         None => {
             sync_log(&format!(
                 "DROP response for {id}: instance not in the routing map"
@@ -1494,11 +1713,12 @@ fn sync_log(msg: &str) {
 /// player the network already knows, with their games and rating attached.
 fn handle_delegate_response(
     state: &mut Signal<AppState>,
+    origin: &DelegateKey,
     values: &[freenet_stdlib::prelude::OutboundDelegateMsg],
 ) -> Option<Cmd> {
-    use chess_core::delegate_api::ChessDelegateResponse;
+    use chess_delegate_protocol::ChessDelegateResponse;
     use freenet_stdlib::prelude::OutboundDelegateMsg;
-
+    let mut followup = None;
     for value in values {
         let OutboundDelegateMsg::ApplicationMessage(msg) = value else {
             continue;
@@ -1506,61 +1726,332 @@ fn handle_delegate_response(
         let Ok(response) = ChessDelegateResponse::from_bytes(&msg.payload) else {
             continue;
         };
-        match response {
-            ChessDelegateResponse::Account { seed: Some(seed) } => {
-                let key = ed25519_dalek::SigningKey::from_bytes(&seed);
-                state.with_mut(|s| {
-                    s.account_settled = true;
-                    if s.account.key.to_bytes() != seed {
-                        s.account.key = key;
-                        // Anything cached belongs to the previous identity.
-                        s.games.clear();
-                    }
-                });
-                crate::identity::save_local(&ed25519_dalek::SigningKey::from_bytes(&seed));
-                // Write it back unconditionally. When the seed came from a
-                // retired delegate this is the whole point — it moves the
-                // account onto the current one, so the recovery happens once
-                // rather than on every load. When it came from the current
-                // delegate it is a harmless no-op.
-                return Some(Cmd::StoreAccount);
-            }
-            ChessDelegateResponse::Account { seed: None } => {
-                // Nobody home. Before claiming this device as fresh, ask the
-                // delegates we have retired — the seed may be filed under one
-                // of their keys, and adopting a session-generated account now
-                // would strand it for good.
-                let should_probe = state.with_mut(|s| {
-                    let first = !s.legacy_probed;
-                    s.legacy_probed = true;
-                    first && !chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES.is_empty()
-                });
-                if should_probe {
-                    // Not settled yet: `main.rs` stores this session's account
-                    // if no legacy answers in time.
-                    return Some(Cmd::ProbeLegacyDelegates);
-                }
-                // Either there is nothing retired to ask, or we already asked.
-                state.with_mut(|s| s.account_settled = true);
-                return Some(Cmd::StoreAccount);
-            }
-            ChessDelegateResponse::Nickname {
-                nickname: Some(name),
-            } => {
-                if !name.trim().is_empty() {
-                    state.with_mut(|s| {
-                        s.account.nickname = name.clone();
-                        s.nickname_unset = false;
-                    });
-                }
-            }
-            ChessDelegateResponse::Error { message } => {
-                state.with_mut(|s| s.message = Some(format!("delegate: {message}")));
-            }
-            _ => {}
+        let action =
+            state.with_mut(|s| apply_delegate_reply(s, origin, msg.context.as_ref(), response));
+        if followup.is_none() {
+            followup = action;
         }
     }
-    None
+    followup
+}
+
+fn account_store_ready(state: &AppState) -> bool {
+    state.pending_import.is_none()
+        && !state.legacy_nickname_pending
+        && state.legacy_theme_source.is_none()
+}
+
+#[derive(Clone)]
+struct ThemeProbe {
+    player: [u8; 32],
+    sources: Vec<DelegateKey>,
+    deadline_ms: Option<i64>,
+    failed: bool,
+}
+
+fn fail_theme_probe(state: &mut AppState, message: String) {
+    if let Some(probe) = state.theme_probe.as_mut() {
+        probe.failed = true;
+    }
+    state.theme_error = Some(message);
+}
+
+fn start_theme_probe(state: &mut AppState, player: [u8; 32]) -> Option<Cmd> {
+    let sources: Vec<_> = chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES
+        .iter()
+        .map(freenet::legacy_delegate_key)
+        .collect();
+    let Some(source) = sources.first().cloned() else {
+        crate::theme::receive(state, player, None);
+        return None;
+    };
+    state.theme_probe = Some(ThemeProbe {
+        player,
+        sources,
+        deadline_ms: None,
+        failed: false,
+    });
+    Some(Cmd::LoadLegacyTheme(source))
+}
+
+fn next_theme_probe(state: &mut AppState) -> Option<Cmd> {
+    let mut probe = state.theme_probe.take()?;
+    probe.sources.remove(0);
+    if let Some(source) = probe.sources.first().cloned() {
+        probe.deadline_ms = None;
+        probe.failed = false;
+        state.theme_probe = Some(probe);
+        Some(Cmd::LoadLegacyTheme(source))
+    } else {
+        state.legacy_theme_source = None;
+        crate::theme::receive(state, probe.player, None);
+        state.legacy_account.as_ref().map(|_| Cmd::StoreAccount)
+    }
+}
+
+pub fn check_theme_recovery(state: &mut AppState, now: i64) -> Option<Cmd> {
+    let probe = state.theme_probe.as_ref()?;
+    if state.pending_import.is_none()
+        && state.account_settled
+        && state.theme_player.is_none()
+        && probe.player == state.account.key.verifying_key().to_bytes()
+        && !probe.failed
+        && probe.deadline_ms.is_some_and(|deadline| now >= deadline)
+    {
+        next_theme_probe(state)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn apply_delegate_response(
+    state: &mut AppState,
+    origin: &DelegateKey,
+    response: chess_delegate_protocol::ChessDelegateResponse,
+) -> Option<Cmd> {
+    apply_delegate_reply(state, origin, &[], response)
+}
+
+fn apply_delegate_reply(
+    state: &mut AppState,
+    origin: &DelegateKey,
+    context: &[u8],
+    response: chess_delegate_protocol::ChessDelegateResponse,
+) -> Option<Cmd> {
+    use chess_delegate_protocol::ChessDelegateResponse;
+    let current = origin == &freenet::delegate_key();
+    let legacy = chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES
+        .iter()
+        .any(|hash| origin == &freenet::legacy_delegate_key(hash));
+    if !current && !legacy {
+        return None;
+    }
+    if current {
+        clear_registration_error(state);
+    }
+    if state.pending_import.is_some()
+        && matches!(
+            &response,
+            ChessDelegateResponse::Account { .. }
+                | ChessDelegateResponse::Nickname { .. }
+                | ChessDelegateResponse::Theme { .. }
+        )
+    {
+        return None;
+    }
+    match response {
+        ChessDelegateResponse::Account { seed: Some(seed) } => {
+            if state.account_settled || (!current && !state.legacy_probed) {
+                return None;
+            }
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+            if state.account.key.to_bytes() != seed {
+                state.account.key = key;
+                state.games.clear();
+                state.theme_player = None;
+                state.stored_theme = None;
+                state.pending_theme = None;
+                state.theme_error = None;
+                state.theme_probe = None;
+                if !current {
+                    state.account.nickname = Account::default_nickname(state.me());
+                    state.nickname_unset = true;
+                }
+            }
+            state.account_settled = true;
+            #[cfg(target_arch = "wasm32")]
+            crate::identity::save_local(&state.account.key);
+            if current {
+                state.legacy_account = None;
+                state.legacy_nickname_pending = false;
+                state.legacy_theme_source = None;
+                Some(Cmd::StoreAccount)
+            } else {
+                state.legacy_account = Some((origin.clone(), state.me()));
+                state.legacy_nickname_pending = true;
+                state.legacy_theme_source =
+                    chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES
+                        .iter()
+                        .any(|hash| origin == &freenet::legacy_delegate_key(hash))
+                        .then(|| origin.clone());
+                Some(Cmd::LoadLegacyNickname(origin.clone()))
+            }
+        }
+        ChessDelegateResponse::Account { seed: None } if current => {
+            if state.account_settled || state.legacy_probed {
+                return None;
+            }
+            if !chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES.is_empty() {
+                state.legacy_probed = true;
+                Some(Cmd::ProbeLegacyDelegates)
+            } else {
+                state.account_settled = true;
+                Some(Cmd::StoreAccount)
+            }
+        }
+        ChessDelegateResponse::Nickname { nickname } => {
+            let recovering = state
+                .legacy_account
+                .as_ref()
+                .is_some_and(|(source, player)| source == origin && *player == state.me());
+            if !current && !recovering {
+                return None;
+            }
+            if current && state.legacy_account.is_some() {
+                return None;
+            }
+            if recovering {
+                state.legacy_nickname_pending = false;
+            }
+            if let Some(name) = nickname.filter(|name| !name.trim().is_empty()) {
+                if current || state.nickname_unset {
+                    state.account.nickname = name;
+                    state.nickname_unset = false;
+                    #[cfg(target_arch = "wasm32")]
+                    crate::identity::save_local_nickname(&state.account.nickname);
+                }
+            }
+            recovering.then_some(Cmd::StoreAccount)
+        }
+        ChessDelegateResponse::AccountStored { seed } if current => {
+            if state.pending_import == Some(seed) {
+                state.pending_import = None;
+                state.pending_import_context = None;
+                state.legacy_account = None;
+                state.legacy_nickname_pending = false;
+                state.legacy_theme_source = None;
+                state.account.key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                state.account_settled = true;
+                state.games.clear();
+                state.theme_player = None;
+                state.stored_theme = None;
+                state.pending_theme = None;
+                state.theme_error = None;
+                state.theme_probe = None;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    crate::identity::save_local(&state.account.key);
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().reload();
+                    }
+                }
+            }
+            None
+        }
+        ChessDelegateResponse::Theme { player, theme } => {
+            if !state.account_settled
+                || player != state.account.key.verifying_key().to_bytes()
+                || state.theme_player.is_some()
+            {
+                return None;
+            }
+            let recovering = state.theme_probe.as_ref().is_some_and(|probe| {
+                probe.player == player && probe.sources.first() == Some(origin)
+            });
+            if !current && !recovering {
+                return None;
+            }
+            if current && theme.is_none() {
+                if let Some(probe) = state.theme_probe.as_ref() {
+                    return probe
+                        .failed
+                        .then(|| Cmd::LoadLegacyTheme(probe.sources[0].clone()));
+                }
+                return start_theme_probe(state, player);
+            }
+            if theme.as_ref().is_some_and(|theme| !theme.valid()) {
+                fail_theme_probe(state, "stored appearance preferences are invalid".into());
+                return None;
+            }
+            if recovering && theme.is_none() {
+                return next_theme_probe(state);
+            }
+            if recovering {
+                state.legacy_theme_source = Some(origin.clone());
+            }
+            state.theme_probe = None;
+            let migrate = state.legacy_theme_source.is_some();
+            let copied = theme.clone();
+            crate::theme::receive(state, player, theme);
+            if migrate {
+                copied.map(|theme| Cmd::SaveTheme { player, theme })
+            } else {
+                None
+            }
+        }
+        ChessDelegateResponse::ThemeSaved { player, theme } if current => {
+            let matching = state.account_settled
+                && player == state.account.key.verifying_key().to_bytes()
+                && state.pending_theme.as_ref() == Some(&theme)
+                && theme.valid();
+            crate::theme::saved(state, player, theme);
+            if matching
+                && state.legacy_theme_source.take().is_some()
+                && state.legacy_account.is_some()
+            {
+                Some(Cmd::StoreAccount)
+            } else {
+                None
+            }
+        }
+        ChessDelegateResponse::Error { message }
+            if state.legacy_theme_source.as_ref() == Some(origin)
+                || state
+                    .theme_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.sources.first() == Some(origin)) =>
+        {
+            let message = freenet::error_message(message);
+            fail_theme_probe(state, message.clone());
+            state.message = Some(format!("delegate: {message}"));
+            None
+        }
+        ChessDelegateResponse::Error { message } if current => {
+            let message = freenet::error_message(message);
+            if !context.is_empty()
+                && state
+                    .pending_import_context
+                    .as_deref()
+                    .is_some_and(|expected| expected == context)
+            {
+                state.pending_import = None;
+                state.pending_import_context = None;
+            } else {
+                fail_theme_probe(state, message.clone());
+            }
+            state.message = Some(format!("delegate: {message}"));
+            None
+        }
+        _ => None,
+    }
+}
+
+fn clear_registration_error(state: &mut AppState) {
+    if state
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("missing delegate"))
+    {
+        state.message = None;
+    }
+}
+
+fn validate_move(game: &ChessGameStateV1, player: &VerifyingKey, mv: Move) -> Result<(), String> {
+    if game.result().is_over() {
+        return Err("the game is already over".to_string());
+    }
+    if game.player_keys().is_none() {
+        return Err("waiting for an opponent to join".to_string());
+    }
+    let replay = game.replay();
+    if game.color_of(player) != Some(replay.side_to_move()) {
+        return Err("it is not your turn".to_string());
+    }
+    if !replay.is_legal(mv) {
+        return Err("illegal move".to_string());
+    }
+    Ok(())
 }
 
 /// Ratings and results are read straight off state; this is the label the
@@ -1619,6 +2110,664 @@ pub fn format_clock(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_delegate_error_import_regression() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let current = freenet::delegate_key();
+        state.pending_import = Some([7; 32]);
+        apply_delegate_response(
+            &mut state,
+            &current,
+            Reply::Error {
+                message: "could not decode stored theme".into(),
+            },
+        );
+        assert_eq!(state.pending_import, Some([7; 32]));
+        apply_delegate_response(&mut state, &current, Reply::AccountStored { seed: [7; 32] });
+        assert_eq!(state.account.key.to_bytes(), [7; 32]);
+    }
+
+    #[test]
+    fn inactive_account_theme_recovery_regression() {
+        use chess_delegate_protocol::{ChessDelegateResponse as Reply, Theme};
+        let mut state = recovery_state();
+        state.account_settled = true;
+        let player = state.account.key.verifying_key().to_bytes();
+        let current = freenet::delegate_key();
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &current,
+                Reply::Theme {
+                    player,
+                    theme: None
+                }
+            ),
+            Some(Cmd::LoadLegacyTheme(_))
+        ));
+        assert!(state.theme_player.is_none());
+        let source = freenet::legacy_delegate_key(
+            &chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES[0],
+        );
+        let theme = Theme {
+            dark_square: "#123456".into(),
+            ..Theme::default()
+        };
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &source,
+                Reply::Theme {
+                    player,
+                    theme: Some(theme.clone())
+                }
+            ),
+            Some(Cmd::SaveTheme { .. })
+        ));
+        assert_eq!(state.stored_theme, Some(theme.clone()));
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+        assert!(state.legacy_account.is_none());
+        state.pending_theme = Some(theme.clone());
+        apply_delegate_response(&mut state, &current, Reply::ThemeSaved { player, theme });
+        assert!(state.legacy_theme_source.is_none());
+    }
+
+    #[test]
+    fn missing_or_silent_retired_themes_finish_but_errors_require_recovery() {
+        use chess_delegate_protocol::{ChessDelegateResponse as Reply, Theme};
+        let source = freenet::legacy_delegate_key(
+            &chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES[0],
+        );
+        for silent in [false, true] {
+            let mut state = recovery_state();
+            state.account_settled = true;
+            let player = state.account.key.verifying_key().to_bytes();
+            start_theme_probe(&mut state, player);
+            if silent {
+                state.theme_probe.as_mut().unwrap().deadline_ms = Some(100);
+                check_theme_recovery(&mut state, 99);
+                assert!(state.theme_player.is_none());
+                check_theme_recovery(&mut state, 100);
+            } else {
+                apply_delegate_response(
+                    &mut state,
+                    &source,
+                    Reply::Theme {
+                        player,
+                        theme: None,
+                    },
+                );
+            }
+            assert_eq!(state.theme_player, Some(player));
+            assert!(state.stored_theme.is_none());
+            assert!(state.theme_probe.is_none());
+        }
+        let mut state = recovery_state();
+        state.account_settled = true;
+        let player = state.account.key.verifying_key().to_bytes();
+        start_theme_probe(&mut state, player);
+        state.theme_probe.as_mut().unwrap().deadline_ms = Some(100);
+        apply_delegate_response(
+            &mut state,
+            &source,
+            Reply::Error {
+                message: "old theme is unreadable".into(),
+            },
+        );
+        check_theme_recovery(&mut state, 1000);
+        assert!(state.theme_player.is_none());
+        assert_eq!(
+            state.theme_error.as_deref(),
+            Some("old theme is unreadable")
+        );
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &freenet::delegate_key(),
+                Reply::Theme {
+                    player,
+                    theme: None
+                }
+            ),
+            Some(Cmd::LoadLegacyTheme(_))
+        ));
+        apply_delegate_response(
+            &mut state,
+            &source,
+            Reply::Theme {
+                player,
+                theme: Some(Theme::default()),
+            },
+        );
+        assert_eq!(state.theme_player, Some(player));
+        assert!(state.theme_error.is_none());
+    }
+
+    #[test]
+    fn only_a_matching_import_error_context_cancels_pending_import() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        state.pending_import = Some([7; 32]);
+        state.pending_import_context = Some(b"import:1".to_vec());
+        let current = freenet::delegate_key();
+        for (origin, context) in [
+            (current.clone(), b"theme:1".as_slice()),
+            (current.clone(), b"import:old".as_slice()),
+            (current.clone(), b"".as_slice()),
+            (retired_delegate(), b"import:1".as_slice()),
+        ] {
+            apply_delegate_reply(
+                &mut state,
+                &origin,
+                context,
+                Reply::Error {
+                    message: "unrelated".into(),
+                },
+            );
+            assert_eq!(state.pending_import, Some([7; 32]));
+        }
+        apply_delegate_reply(
+            &mut state,
+            &current,
+            b"import:1",
+            Reply::Error {
+                message: "account store rejected".into(),
+            },
+        );
+        assert!(state.pending_import.is_none());
+        assert!(state.pending_import_context.is_none());
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+    }
+
+    #[test]
+    fn timed_out_legacy_theme_remains_unwritten_and_can_recover_next_session() {
+        use chess_delegate_protocol::{ChessDelegateResponse as Reply, Theme};
+        let mut state = recovery_state();
+        state.account_settled = true;
+        let player = state.account.key.verifying_key().to_bytes();
+        let source = freenet::legacy_delegate_key(
+            &chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES[0],
+        );
+        state.legacy_account = Some((source.clone(), state.me()));
+        state.legacy_theme_source = Some(source.clone());
+        start_theme_probe(&mut state, player);
+        state.theme_probe.as_mut().unwrap().deadline_ms = Some(100);
+        assert!(matches!(
+            check_theme_recovery(&mut state, 100),
+            Some(Cmd::StoreAccount)
+        ));
+        assert!(state.legacy_theme_source.is_none());
+        assert_eq!(state.theme_player, Some(player));
+        assert!(state.stored_theme.is_none());
+        assert!(state.pending_theme.is_none());
+
+        let mut reloaded = recovery_state();
+        reloaded.account_settled = true;
+        assert!(matches!(
+            apply_delegate_response(
+                &mut reloaded,
+                &freenet::delegate_key(),
+                Reply::Theme {
+                    player,
+                    theme: None
+                }
+            ),
+            Some(Cmd::LoadLegacyTheme(_))
+        ));
+        let previous = Theme {
+            dark_square: "#123456".into(),
+            ..Theme::default()
+        };
+        assert!(matches!(
+            apply_delegate_response(
+                &mut reloaded,
+                &source,
+                Reply::Theme {
+                    player,
+                    theme: Some(previous.clone())
+                }
+            ),
+            Some(Cmd::SaveTheme { .. })
+        ));
+        assert_eq!(reloaded.stored_theme, Some(previous));
+    }
+
+    fn recovery_state() -> AppState {
+        AppState::new(Account {
+            key: ed25519_dalek::SigningKey::from_bytes(&[6; 32]),
+            nickname: "Player".into(),
+        })
+    }
+
+    fn retired_delegate() -> DelegateKey {
+        chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES
+            .iter()
+            .map(freenet::legacy_delegate_key)
+            .find(|key| key != &freenet::delegate_key())
+            .unwrap()
+    }
+
+    #[test]
+    fn recovery_accepts_one_legacy_identity_and_preserves_its_nickname() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let current = freenet::delegate_key();
+        let old = retired_delegate();
+        assert!(matches!(
+            apply_delegate_response(&mut state, &current, Reply::Account { seed: None }),
+            Some(Cmd::ProbeLegacyDelegates)
+        ));
+        assert!(apply_delegate_response(&mut state, &old, Reply::Account { seed: None }).is_none());
+        assert!(!state.account_settled);
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &old,
+                Reply::Account {
+                    seed: Some([7; 32])
+                }
+            ),
+            Some(Cmd::LoadLegacyNickname(_))
+        ));
+        assert_eq!(state.account.key.to_bytes(), [7; 32]);
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &old,
+                Reply::Nickname {
+                    nickname: Some("Recovered".into())
+                }
+            ),
+            Some(Cmd::StoreAccount)
+        ));
+        assert_eq!(state.account.nickname, "Recovered");
+        assert!(!state.nickname_unset);
+        apply_delegate_response(
+            &mut state,
+            &old,
+            Reply::Account {
+                seed: Some([8; 32]),
+            },
+        );
+        apply_delegate_response(&mut state, &current, Reply::Account { seed: None });
+        assert_eq!(state.account.key.to_bytes(), [7; 32]);
+        state.account.key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        apply_delegate_response(
+            &mut state,
+            &old,
+            Reply::Nickname {
+                nickname: Some("Stale".into()),
+            },
+        );
+        assert_eq!(state.account.nickname, "Recovered");
+    }
+
+    #[test]
+    fn settled_current_and_unknown_sources_cannot_replace_identity() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let old = retired_delegate();
+        state.account_settled = true;
+        state.legacy_probed = true;
+        apply_delegate_response(
+            &mut state,
+            &old,
+            Reply::Account {
+                seed: Some([7; 32]),
+            },
+        );
+        apply_delegate_response(
+            &mut state,
+            &freenet::delegate_key(),
+            Reply::Account {
+                seed: Some([7; 32]),
+            },
+        );
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+        state.account_settled = false;
+        let unknown = freenet::legacy_delegate_key(&[0xff; 32]);
+        apply_delegate_response(
+            &mut state,
+            &unknown,
+            Reply::Account {
+                seed: Some([7; 32]),
+            },
+        );
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+        assert!(!state.account_settled);
+    }
+
+    #[test]
+    fn import_requires_matching_current_delegate_ack_and_keeps_errors_visible() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let current = freenet::delegate_key();
+        state.pending_import = Some([7; 32]);
+        apply_delegate_response(&mut state, &current, Reply::Stored);
+        apply_delegate_response(
+            &mut state,
+            &retired_delegate(),
+            Reply::AccountStored { seed: [7; 32] },
+        );
+        apply_delegate_response(&mut state, &current, Reply::AccountStored { seed: [8; 32] });
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+        assert_eq!(state.pending_import, Some([7; 32]));
+        apply_delegate_response(&mut state, &current, Reply::AccountStored { seed: [7; 32] });
+        assert_eq!(state.account.key.to_bytes(), [7; 32]);
+        assert_eq!(state.pending_import, None);
+        state.pending_import = Some([8; 32]);
+        state.pending_import_context = Some(b"import:2".to_vec());
+        apply_delegate_response(
+            &mut state,
+            &current,
+            Reply::Error {
+                message: "store rejected".into(),
+            },
+        );
+        assert_eq!(state.pending_import, Some([8; 32]));
+        apply_delegate_reply(
+            &mut state,
+            &current,
+            b"import:2",
+            Reply::Error {
+                message: "store rejected".into(),
+            },
+        );
+        assert!(state.pending_import.is_none());
+        assert_eq!(state.account.key.to_bytes(), [7; 32]);
+        assert_eq!(state.message.as_deref(), Some("delegate: store rejected"));
+    }
+
+    #[test]
+    fn pending_import_blocks_recovery_replies_and_account_writes() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let old = retired_delegate();
+        state.account_settled = true;
+        state.legacy_account = Some((old.clone(), state.me()));
+        state.pending_import = Some([7; 32]);
+        assert!(!account_store_ready(&state));
+        assert!(apply_delegate_response(
+            &mut state,
+            &old,
+            Reply::Nickname {
+                nickname: Some("Old".into())
+            }
+        )
+        .is_none());
+        assert!(apply_delegate_response(
+            &mut state,
+            &freenet::delegate_key(),
+            Reply::Account {
+                seed: Some([8; 32])
+            }
+        )
+        .is_none());
+        assert_eq!(state.account.key.to_bytes(), [6; 32]);
+        assert_eq!(state.account.nickname, "Player");
+    }
+
+    #[test]
+    fn legacy_theme_migration_waits_for_matching_player_source_and_save_ack() {
+        use chess_delegate_protocol::{ChessDelegateResponse as Reply, Theme};
+        let mut state = recovery_state();
+        let source = freenet::legacy_delegate_key(
+            &chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES[0],
+        );
+        let current = freenet::delegate_key();
+        let player = state.account.key.verifying_key().to_bytes();
+        state.account_settled = true;
+        state.legacy_account = Some((source.clone(), state.me()));
+        state.legacy_nickname_pending = true;
+        state.legacy_theme_source = Some(source.clone());
+        let custom = Theme {
+            dark_square: "#112233".into(),
+            ..Theme::default()
+        };
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &current,
+                Reply::Theme {
+                    player,
+                    theme: None
+                }
+            ),
+            Some(Cmd::LoadLegacyTheme(_))
+        ));
+        assert!(state.theme_player.is_none());
+        apply_delegate_response(
+            &mut state,
+            &source,
+            Reply::Theme {
+                player: [0; 32],
+                theme: Some(custom.clone()),
+            },
+        );
+        apply_delegate_response(
+            &mut state,
+            &freenet::legacy_delegate_key(&chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES[1]),
+            Reply::Theme {
+                player,
+                theme: Some(custom.clone()),
+            },
+        );
+        assert!(state.theme_player.is_none());
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &source,
+                Reply::Theme {
+                    player,
+                    theme: Some(custom.clone())
+                }
+            ),
+            Some(Cmd::SaveTheme { .. })
+        ));
+        assert!(!account_store_ready(&state));
+        state.pending_theme = Some(custom.clone());
+        apply_delegate_response(
+            &mut state,
+            &current,
+            Reply::ThemeSaved {
+                player,
+                theme: Theme::default(),
+            },
+        );
+        assert!(state.legacy_theme_source.is_some());
+        assert!(matches!(
+            apply_delegate_response(
+                &mut state,
+                &current,
+                Reply::ThemeSaved {
+                    player,
+                    theme: custom.clone()
+                }
+            ),
+            Some(Cmd::StoreAccount)
+        ));
+        assert!(!account_store_ready(&state));
+        apply_delegate_response(
+            &mut state,
+            &source,
+            Reply::Nickname {
+                nickname: Some("Recovered".into()),
+            },
+        );
+        assert!(account_store_ready(&state));
+        assert_eq!(state.stored_theme, Some(custom));
+        assert_eq!(state.account.nickname, "Recovered");
+    }
+
+    #[test]
+    fn legacy_theme_failure_keeps_recovery_pending_instead_of_saving_defaults() {
+        use chess_delegate_protocol::ChessDelegateResponse as Reply;
+        let mut state = recovery_state();
+        let source = freenet::legacy_delegate_key(
+            &chess_delegate_protocol::LEGACY_THEME_DELEGATE_CODE_HASHES[0],
+        );
+        state.account_settled = true;
+        state.legacy_theme_source = Some(source.clone());
+        apply_delegate_response(
+            &mut state,
+            &source,
+            Reply::Error {
+                message: "could not read old preferences".into(),
+            },
+        );
+        assert!(state.theme_player.is_none());
+        assert!(state.legacy_theme_source.is_some());
+        assert!(!account_store_ready(&state));
+        assert_eq!(
+            state.theme_error.as_deref(),
+            Some("could not read old preferences")
+        );
+    }
+
+    #[test]
+    fn account_reply_does_not_drop_later_nickname_in_the_same_batch() {
+        fn repro() -> Element {
+            use chess_delegate_protocol::ChessDelegateResponse as Reply;
+            use freenet_stdlib::prelude::{ApplicationMessage, OutboundDelegateMsg};
+            let mut state = use_signal(recovery_state);
+            let values = [
+                Reply::Account {
+                    seed: Some([7; 32]),
+                },
+                Reply::Nickname {
+                    nickname: Some("Recovered".into()),
+                },
+            ]
+            .into_iter()
+            .map(|reply| {
+                OutboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(reply.to_bytes().unwrap()).processed(true),
+                )
+            })
+            .collect::<Vec<_>>();
+            assert!(matches!(
+                handle_delegate_response(&mut state, &freenet::delegate_key(), &values),
+                Some(Cmd::StoreAccount)
+            ));
+            assert_eq!(state.read().account.nickname, "Recovered");
+            rsx! {}
+        }
+        VirtualDom::new(repro).rebuild_in_place();
+    }
+
+    #[test]
+    fn repeated_empty_account_reply_waits_for_legacy_recovery() {
+        fn repro() -> Element {
+            let mut state = use_signal(|| {
+                let mut state = AppState::new(Account {
+                    key: ed25519_dalek::SigningKey::from_bytes(&[6; 32]),
+                    nickname: "Player".into(),
+                });
+                state.legacy_probed = true;
+                state
+            });
+            let reply = chess_delegate_protocol::ChessDelegateResponse::Account { seed: None };
+            let values = vec![
+                freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(reply.to_bytes().unwrap())
+                        .processed(true),
+                ),
+            ];
+            assert!(
+                handle_delegate_response(&mut state, &freenet::delegate_key(), &values).is_none()
+            );
+            assert!(!state.read().account_settled);
+            rsx! {}
+        }
+        VirtualDom::new(repro).rebuild_in_place();
+    }
+
+    #[test]
+    fn delegate_recovery_clears_registration_errors_without_hiding_other_messages() {
+        let mut state = AppState::new(Account {
+            key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+            nickname: "Player".into(),
+        });
+        state.message = Some("client error: missing delegate".into());
+        clear_registration_error(&mut state);
+        assert!(state.message.is_none());
+        state.message = Some("could not publish move".into());
+        clear_registration_error(&mut state);
+        assert_eq!(state.message.as_deref(), Some("could not publish move"));
+    }
+
+    #[test]
+    fn creating_games_requires_connection_settled_identity_and_an_open_lobby() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut state = AppState::new(Account {
+            key: key.clone(),
+            nickname: "Player".into(),
+        });
+        assert!(!state.can_create_game());
+        state.status = ConnStatus::Online;
+        assert!(!state.can_create_game());
+        state.account_settled = true;
+        assert!(state.can_create_game());
+        state.lobby.administration.migration = Some(chess_core::admin::Migration::announce(
+            &key,
+            bs58::encode([2; 32]).into_string(),
+            "Moved".into(),
+            1,
+        ));
+        assert!(!state.can_create_game());
+        state.lobby.administration.migration = Some(chess_core::admin::Migration::cancel(&key, 2));
+        assert!(state.can_create_game());
+    }
+
+    #[test]
+    fn move_commands_reject_waiting_spectators_wrong_turn_illegal_and_finished_games() {
+        use chess_core::game::opponent::OpponentSlotV1;
+        use ed25519_dalek::SigningKey;
+
+        let white = SigningKey::from_bytes(&[1; 32]);
+        let black = SigningKey::from_bytes(&[2; 32]);
+        let spectator = SigningKey::from_bytes(&[3; 32]);
+        let created_at = 1_700_000_000_000;
+        let setup = GameSetup {
+            creator_plays: Color::White,
+            time_control: TimeControl::default(),
+            created_at,
+            pow_nonce: 0,
+            creator_nickname: "White".to_string(),
+            challenged: None,
+        };
+        let game_id = setup.derive_game_id(&white.verifying_key());
+        let mut game = ChessGameStateV1 {
+            setup: GameSetupV1(Some(setup.sign(&white, &game_id))),
+            ..Default::default()
+        };
+        let e4 = Move::from_uci("e2e4").unwrap();
+        assert!(validate_move(&game, &white.verifying_key(), e4).is_err());
+        let join = SignedJoin::new(&black, &game_id, created_at + 1000, "Black".to_string());
+        game.opponent = OpponentSlotV1 {
+            seated: Some(SignedAcceptance::new(&white, &game_id, join)),
+            ..Default::default()
+        };
+        assert!(validate_move(&game, &white.verifying_key(), e4).is_ok());
+        assert!(validate_move(&game, &black.verifying_key(), e4).is_err());
+        assert!(validate_move(&game, &spectator.verifying_key(), e4).is_err());
+        assert!(validate_move(
+            &game,
+            &white.verifying_key(),
+            Move::from_uci("e2e5").unwrap()
+        )
+        .is_err());
+        game.conclusion = ConclusionV1::single(SignedConclusion::resign(
+            &black,
+            &game_id,
+            0,
+            created_at + 2000,
+        ));
+        assert!(game.result().is_over());
+        assert!(validate_move(&game, &white.verifying_key(), e4).is_err());
+    }
 
     #[test]
     fn clock_formatting_switches_to_tenths_under_ten_seconds() {

@@ -124,7 +124,10 @@ test("a spectator sees the game live and cannot move", async ({ browser }) => {
   // move list must not grow — the contract would reject her signature anyway,
   // but the UI should not even attempt it.
   const before = await moveList(carolGame);
-  await playMove(carolGame, "e7", "e5", "white");
+  const e7 = carolGame.locator('.sq[data-square="e7"]');
+  await expect(e7).toHaveAttribute("aria-disabled", "true");
+  await e7.click({ force: true });
+  await carolGame.locator('.sq[data-square="e5"]').click({ force: true });
   await carol.page.waitForTimeout(3000);
   expect(await moveList(carolGame)).toEqual(before);
 
@@ -162,7 +165,7 @@ test("a game link replays for someone who never saw it live", async ({
   // Scrub back to the start: the replay controls must reconstruct the opening
   // position from the move list alone.
   await replay.locator(".replay-bar button").first().click();
-  await expect(replay.locator("#replay-position")).toContainText("Viewing move 0");
+  await expect(replay.locator("#replay-position")).toContainText("Viewing position 0");
 
   await alice.context.close();
   await bob.context.close();

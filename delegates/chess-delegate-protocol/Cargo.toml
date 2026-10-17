@@ -1,0 +1,13 @@
+[package]
+name = "chess-delegate-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Private UI/delegate messages, isolated from contract WASM identities"
+
+[dependencies]
+serde.workspace = true
+ciborium.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+freenet-stdlib.workspace = true

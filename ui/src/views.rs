@@ -1,8 +1,9 @@
 //! The screens.
 
-use crate::app::{format_clock, result_headline, AppState, Cmd, Route, Sync};
-use crate::board::{captured_material, GameBoard, MiniBoard};
+use crate::app::{format_clock, result_headline, AppState, Cmd, ConnStatus, Route, Sync};
+use crate::board::{captured_material, GameBoard, MiniBoard, PieceImage};
 use crate::identity::now_ms;
+use crate::theme::{PieceSet, Theme};
 use chess_core::account;
 use chess_core::chess::{Board, Color, Move, PieceKind};
 use chess_core::game::setup::TimeControl;
@@ -31,6 +32,42 @@ pub const BUILD: &str = match option_env!("FREECHESS_BUILD") {
     // A plain `dx build`, outside the task that stamps it.
     None => "unstamped",
 };
+const PIECE_CREDITS: Asset = asset!("/assets/pieces/credits.html");
+
+fn icon(name: &str) -> Element {
+    let path = match name {
+        "bell" => "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4",
+        "settings" => "M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1 1-3z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
+        "palette" => "M12 3C6 3 3 7 3 12s4 9 9 9h1a2 2 0 0 0 0-4h-1a1 1 0 0 1-1-1c0-1 1-2 3-2h2a5 5 0 0 0 5-5c0-3-4-6-9-6z M7 10h.01 M10 6h.01 M15 6h.01 M18 9h.01",
+        "user" => "M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0 M4 21v-2a8 8 0 0 1 16 0v2",
+        "play" => "m8 4 12 8-12 8V4z",
+        "first" => "M5 4v16 M19 4 7 12l12 8V4z",
+        "previous" => "m16 4-12 8 12 8V4z",
+        "next" => "m8 4 12 8-12 8V4z",
+        "last" => "M19 4v16 M5 4l12 8-12 8V4z",
+        "flip" => "M4 8h15l-4-4 M20 16H5l4 4",
+        "copy" => "M9 9h12v12H9V9z M15 5V3H3v12h2",
+        "download" => "M12 3v12m-5-5 5 5 5-5 M4 16v5h16v-5",
+        "sound" => "M3 9h4l5-5v16l-5-5H3V9z M16 8a6 6 0 0 1 0 8 M19 5a10 10 0 0 1 0 14",
+        "muted" => "M3 9h4l5-5v16l-5-5H3V9z M16 9l6 6m0-6-6 6",
+        "close" => "m6 6 12 12 M6 18 18 6",
+        "home" => "m3 11 9-8 9 8 M5 10v11h5v-6h4v6h5V10",
+        _ => "",
+    };
+    rsx! {
+        svg {
+            class: "icon",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.8",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            path { d: "{path}" }
+        }
+    }
+}
 
 /// Header: brand, connection state, notifications, account.
 #[component]
@@ -38,6 +75,8 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     let mut show_account = use_signal(|| false);
     let mut show_admin = use_signal(|| false);
     let mut show_notifications = use_signal(|| false);
+    let mut show_appearance = use_signal(|| false);
+    let mut sound_enabled = use_signal(crate::sound::enabled);
     let s = state.read();
     let status = s.status;
     let nickname = s.account.nickname.clone();
@@ -45,6 +84,7 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
     let online = s.lobby.presence.online_count(now_ms());
     let is_admin = s.is_admin();
     let account_settled = s.account_settled;
+    let theme_loaded = s.theme_player == Some(s.account.key.verifying_key().to_bytes());
     // Direct challenges waiting on an answer. The count is of things still to
     // act on, not of things not yet read: a challenge someone accepted or
     // withdrew stops counting on its own, which needs no record of what this
@@ -61,10 +101,11 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
 
     rsx! {
         div { class: "topbar",
-            div {
+            button {
                 class: "brand",
+                title: "Home",
                 onclick: move |_| state.with_mut(|s| s.route = Route::Home),
-                span { class: "mark", "\u{265E}" }
+                span { class: "mark", "aria-hidden": "true", PieceImage { kind: PieceKind::Knight, color: Color::White } }
                 span { "FreeChess" }
             }
             div { class: "spacer" }
@@ -75,15 +116,35 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
             div { class: "conn", "{online} online" }
             span { class: "conn ver", id: "app-version", title: "build {BUILD}", "v{VERSION}" }
             button {
-                class: if challenges.is_empty() { "ghost" } else { "ghost has-badge" },
+                class: "ghost icon-button", id: "theme-button", title: "Appearance", "aria-label": "Appearance",
+                "data-loaded": "{theme_loaded}",
+                onclick: move |_| show_appearance.set(true),
+                {icon("palette")}
+            }
+            button {
+                class: "ghost icon-button",
+                id: "sound-button",
+                title: if sound_enabled() { "Mute sounds" } else { "Enable sounds" },
+                "aria-label": if sound_enabled() { "Mute sounds" } else { "Enable sounds" },
+                "aria-pressed": "{sound_enabled}",
+                onclick: move |_| {
+                    let enabled = !sound_enabled();
+                    crate::sound::set_enabled(enabled);
+                    sound_enabled.set(enabled);
+                },
+                {icon(if sound_enabled() { "sound" } else { "muted" })}
+            }
+            button {
+                class: if challenges.is_empty() { "ghost icon-button" } else { "ghost icon-button has-badge" },
                 id: "notifications-button",
+                "aria-label": "Notifications",
                 title: if challenges.is_empty() {
                     "No challenges waiting for you".to_string()
                 } else {
                     format!("{} challenge(s) waiting for you", challenges.len())
                 },
                 onclick: move |_| show_notifications.set(true),
-                span { "\u{1F514}" }
+                {icon("bell")}
                 if !challenges.is_empty() {
                     span { class: "badge count", id: "notifications-count", "{challenges.len()}" }
                 }
@@ -95,16 +156,19 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
                 // jumped the moment the lobby arrived. Adminship goes in the
                 // tooltip instead.
                 button {
-                    class: "ghost",
+                    class: "ghost icon-button",
                     id: "admin-button",
+                    "aria-label": "Administration",
                     title: if is_admin { "Administration (you are an admin)" } else { "Administration" },
                     onclick: move |_| show_admin.set(true),
-                    "\u{2699}"
+                    {icon("settings")}
                 }
             }
             button {
-                class: "ghost",
+                class: "ghost account-button",
                 id: "account-button",
+                title: "Your account",
+                disabled: !account_settled,
                 // Whether identity has come back from the delegate yet.
                 //
                 // Until it has, the app is running on a session key it just
@@ -116,7 +180,9 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
                 // of.
                 "data-settled": "{account_settled}",
                 onclick: move |_| show_account.set(true),
-                "{nickname} ({rating})"
+                {icon("user")}
+                span { "{nickname}" }
+                span { class: "muted small", "{rating}" }
             }
         }
         if show_account() {
@@ -131,6 +197,9 @@ pub fn TopBar(state: Signal<AppState>, sync: Sync) -> Element {
                 sync,
                 on_close: move |_| show_notifications.set(false),
             }
+        }
+        if show_appearance() {
+            AppearanceModal { state, sync, on_close: move |_| show_appearance.set(false) }
         }
     }
 }
@@ -166,7 +235,7 @@ pub fn Footer() -> Element {
                     }
                 }
                 div { class: "small muted", style: "margin-top:6px",
-                    "Every game, rating and profile here lives in Freenet contracts, "
+                    "Online games, ratings and profiles live in Freenet contracts, "
                     "replicated between players. There is no server."
                 }
             }
@@ -210,7 +279,7 @@ pub fn NotificationsModal(
 
     rsx! {
         div { class: "modal-bg", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal", id: "notifications-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Notifications", onclick: move |e| e.stop_propagation(), onmounted: move |_| focus_dialog("notifications-dialog"), onkeydown: move |e| { if e.key() == Key::Escape { on_close.call(()); } },
                 h3 { "Notifications" }
                 div { class: "body",
                     if named.is_empty() {
@@ -269,12 +338,16 @@ pub fn AccountModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<
 
     rsx! {
         div { class: "modal-bg", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
-                h3 { "Your account" }
+            div { class: "modal", id: "account-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Your account", onclick: move |e| e.stop_propagation(), onmounted: move |_| focus_dialog("account-dialog"), onkeydown: move |e| { if e.key() == Key::Escape { on_close.call(()); } },
+                h3 {
+                    "Your account"
+                    button { class: "ghost icon-button", title: "Close account", "aria-label": "Close account", onclick: move |_| on_close.call(()), {icon("close")} }
+                }
                 div { class: "body",
                     div {
-                        label { "Nickname" }
+                        label { r#for: "account-nickname", "Nickname" }
                         input {
+                            id: "account-nickname",
                             value: "{nickname}",
                             oninput: move |e| nickname.set(e.value()),
                             maxlength: 32,
@@ -320,8 +393,9 @@ pub fn AccountModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<
                     }
 
                     div {
-                        label { "Import an account" }
+                        label { r#for: "account-import", "Import an account" }
                         input {
+                            id: "account-import",
                             value: "{import_text}",
                             placeholder: "fchess1...",
                             oninput: move |e| import_text.set(e.value()),
@@ -332,14 +406,7 @@ pub fn AccountModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<
                                 onclick: move |_| {
                                     match account::import(&import_text()) {
                                         Ok(key) => {
-                                            crate::identity::save_local(&key);
-                                            // A full reload is the honest way to
-                                            // swap identity: every subscription,
-                                            // cached game and signature context
-                                            // belongs to the old key.
-                                            if let Some(w) = web_sys::window() {
-                                                let _ = w.location().reload();
-                                            }
+                                            sync.send(Cmd::ImportAccount { seed: key.to_bytes() });
                                         }
                                         Err(e) => error.set(Some(e.to_string())),
                                     }
@@ -348,6 +415,124 @@ pub fn AccountModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn AppearanceModal(state: Signal<AppState>, sync: Sync, on_close: EventHandler<()>) -> Element {
+    let mut theme = use_context::<Signal<Theme>>();
+    let current = theme();
+    let s = state.read();
+    let player = s.account.key.verifying_key().to_bytes();
+    let loaded = s.account_settled && s.theme_player == Some(player);
+    let saved = loaded
+        && s.pending_theme.is_none()
+        && s.stored_theme.as_ref().unwrap_or(&Theme::default()) == &current;
+    let failed = s.theme_error.is_some() && !saved;
+    let save_status = if failed {
+        if loaded {
+            "Could not save preferences"
+        } else {
+            "Could not load preferences"
+        }
+    } else if !loaded {
+        "Loading preferences…"
+    } else if saved {
+        "Saved for this account"
+    } else {
+        "Saving…"
+    };
+    drop(s);
+
+    rsx! {
+        div { class: "modal-bg", onclick: move |_| on_close.call(()),
+            div {
+                class: "modal appearance-modal", id: "appearance-dialog", role: "dialog",
+                "aria-modal": "true", "aria-label": "Appearance",
+                onclick: move |e| e.stop_propagation(),
+                onmounted: move |_| focus_dialog("appearance-dialog"),
+                onkeydown: move |e| { if e.key() == Key::Escape { on_close.call(()); } },
+                h3 { "Appearance" }
+                div { class: "body appearance-body",
+                    div { class: "appearance-preview",
+                        MiniBoard { fen: Board::starting_position().to_fen(), orientation: Color::White }
+                        div { class: "theme-preview-detail",
+                            div { class: "theme-piece-preview", "aria-label": "Piece preview",
+                                PieceImage { kind: PieceKind::Knight, color: Color::White }
+                                PieceImage { kind: PieceKind::Knight, color: Color::Black }
+                            }
+                            p { class: "small muted", "Changes apply immediately." }
+                        }
+                    }
+                    fieldset { class: "appearance-controls", disabled: !loaded, style: "border:0;padding:0;margin:0;min-width:0",
+                        div {
+                            label { "Board" }
+                            div { class: "board-presets",
+                                for (name, light, dark) in [
+                                    ("Green", "#ebecd0", "#739552"),
+                                    ("Brown", "#f0d9b5", "#b58863"),
+                                    ("Blue", "#dee3e6", "#8ca2ad"),
+                                    ("Gray", "#dedede", "#8a8a8a"),
+                                ] {
+                                    button {
+                                        key: "{name}",
+                                        class: if current.light_square == light && current.dark_square == dark { "board-preset active" } else { "board-preset" },
+                                        "aria-pressed": "{current.light_square == light && current.dark_square == dark}",
+                                        onclick: move |_| theme.with_mut(|t| { t.light_square = light.to_string(); t.dark_square = dark.to_string(); }),
+                                        span { class: "board-swatch", style: "background:linear-gradient(135deg, {light} 50%, {dark} 50%)", "aria-hidden": "true" }
+                                        "{name}"
+                                    }
+                                }
+                            }
+                            div { class: "theme-colors",
+                                label { r#for: "light-square-color", "Light squares"
+                                    input { id: "light-square-color", r#type: "color", value: "{current.light_square}", oninput: move |e| theme.with_mut(|t| t.light_square = e.value()) }
+                                }
+                                label { r#for: "dark-square-color", "Dark squares"
+                                    input { id: "dark-square-color", r#type: "color", value: "{current.dark_square}", oninput: move |e| theme.with_mut(|t| t.dark_square = e.value()) }
+                                }
+                            }
+                        }
+                        div {
+                            label { "Pieces" }
+                            div { class: "piece-set-options",
+                                for (set, name) in [(PieceSet::Neo, "Neo"), (PieceSet::Classic, "Classic")] {
+                                    button {
+                                        key: "{name}",
+                                        class: if current.piece_set == set { "primary" } else { "ghost" },
+                                        "aria-pressed": "{current.piece_set == set}",
+                                        onclick: move |_| theme.with_mut(|t| t.piece_set = set),
+                                        "{name}"
+                                    }
+                                }
+                            }
+                            div { class: "theme-colors",
+                                label { r#for: "white-piece-color", "White pieces"
+                                    input { id: "white-piece-color", r#type: "color", value: "{current.white_piece}", oninput: move |e| theme.with_mut(|t| t.white_piece = e.value()) }
+                                }
+                                label { r#for: "black-piece-color", "Black pieces"
+                                    input { id: "black-piece-color", r#type: "color", value: "{current.black_piece}", oninput: move |e| theme.with_mut(|t| t.black_piece = e.value()) }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "appearance-note small muted", id: "theme-save-status", role: "status", "{save_status}" }
+                if failed {
+                    button { class: "ghost", onclick: move |_| {
+                        if loaded { sync.send(Cmd::SaveTheme { player, theme: theme() }); }
+                        else { sync.send(Cmd::LoadTheme); }
+                    }, "Retry" }
+                }
+                div { class: "appearance-note small muted",
+                    a { class: "appearance-credits", href: "{PIECE_CREDITS}", target: "_blank", rel: "noopener noreferrer", "Piece artwork credits" }
+                }
+                div { class: "actions",
+                    button { class: "ghost", disabled: !loaded, onclick: move |_| theme.set(Theme::default()), "Reset defaults" }
+                    button { class: "primary", onclick: move |_| on_close.call(()), "Close" }
                 }
             }
         }
@@ -374,7 +559,7 @@ pub fn NewGameModal(
 
     rsx! {
         div { class: "modal-bg", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal", id: "new-game-dialog", role: "dialog", "aria-modal": "true", "aria-label": "New game", onclick: move |e| e.stop_propagation(), onmounted: move |_| focus_dialog("new-game-dialog"), onkeydown: move |e| { if e.key() == Key::Escape { on_close.call(()); } },
                 h3 {
                     if let Some(name) = challenge_name.clone() {
                         "Challenge {name}"
@@ -385,18 +570,20 @@ pub fn NewGameModal(
                 div { class: "body",
                     div {
                         label { "Time control" }
-                        div { class: "row",
+                        div { class: "time-presets",
                             for preset in [(1u32, 0u32), (3, 2), (5, 0), (10, 0), (15, 10), (30, 0)] {
                                 button {
                                     key: "{preset.0}-{preset.1}",
                                     class: if minutes() == preset.0 && increment() == preset.1 { "primary" } else { "ghost" },
+                                    "aria-pressed": "{minutes() == preset.0 && increment() == preset.1}",
                                     onclick: move |_| { minutes.set(preset.0); increment.set(preset.1); },
                                     "{preset.0}+{preset.1}"
                                 }
                             }
                         }
-                        div { class: "small muted", style: "margin-top:8px",
+                        div { class: "small muted", style: "margin-top:12px",
                             span { class: "badge {tc.category().to_lowercase()}", "{tc.category()}" }
+                            " {minutes} minutes + {increment} seconds per move"
                         }
                     }
                     div {
@@ -404,11 +591,13 @@ pub fn NewGameModal(
                         div { class: "row",
                             button {
                                 class: if color() == Color::White { "primary" } else { "ghost" },
+                                "aria-pressed": "{color() == Color::White}",
                                 onclick: move |_| color.set(Color::White),
                                 "White"
                             }
                             button {
                                 class: if color() == Color::Black { "primary" } else { "ghost" },
+                                "aria-pressed": "{color() == Color::Black}",
                                 onclick: move |_| color.set(Color::Black),
                                 "Black"
                             }
@@ -450,6 +639,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     let search = query();
     let searching = !search.trim().is_empty();
     let accepting_new_games = s.lobby.administration.accepting_new_games();
+    let ready = s.status == ConnStatus::Online && s.account_settled;
 
     let mut live: Vec<_> = if searching {
         s.lobby.games.search(&search).into_iter().cloned().collect()
@@ -496,26 +686,42 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
 
     rsx! {
         div { class: "page",
+            div { class: "home-hero",
+                div { class: "hero-preview",
+                    MiniBoard { fen: Board::starting_position().to_fen(), orientation: Color::White }
+                }
+                div { class: "hero-content",
+                    span { class: "eyebrow", "Your next move" }
+                    h1 { "Play chess online" }
+                    p { "Choose a time control. Invite a friend or join an open challenge." }
+                    div { class: "hero-actions",
+                        button {
+                            class: "primary hero-play",
+                            disabled: !accepting_new_games || !ready,
+                            title: if !accepting_new_games { "New games are closed at this address" } else if !ready { "Connecting your account to the node" } else { "Choose your time control and color" },
+                            onclick: move |_| show_new.set(true),
+                            {icon("play")}
+                            "New game"
+                        }
+                        button {
+                            class: "ghost hero-computer",
+                            onclick: move |_| state.with_mut(|s| s.route = Route::Practice),
+                            "Play computer"
+                        }
+                    }
+                    span { class: "small muted hero-note",
+                        if !ready { "Connecting your account..." } else { "Free to play. Your account stays on this device." }
+                    }
+                }
+            }
             div { class: "columns",
                 div {
-                    div { class: "row", style: "margin-bottom:16px",
+                    div { class: "row search-row", style: "margin-bottom:16px",
                         input {
                             placeholder: "Search games by player or id\u{2026}",
+                            "aria-label": "Search games",
                             value: "{query}",
                             oninput: move |e| query.set(e.value()),
-                        }
-                        // Disabled while the app is migrating. The lobby also
-                        // refuses the listing, so this is the honest signal
-                        // rather than the enforcement — a button that appears
-                        // to work and then silently drops the game would be
-                        // worse than one that says why it is off.
-                        button {
-                            class: "primary",
-                            style: "white-space:nowrap",
-                            disabled: !accepting_new_games,
-                            title: if accepting_new_games { "" } else { "FreeChess has moved — new games are closed at this address" },
-                            onclick: move |_| show_new.set(true),
-                            "New game"
                         }
                     }
 
@@ -534,6 +740,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                                         }
                                         button {
                                             class: "primary",
+                                            disabled: !ready,
                                             onclick: {
                                                 let id = entry.game_id;
                                                 move |_| sync.send(Cmd::JoinGame(id))
@@ -553,6 +760,43 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                                                 move |_| sync.send(Cmd::DeclineChallenge(id))
                                             },
                                             "Decline"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "panel",
+                        h2 { "Open challenges" }
+                        if open.is_empty() {
+                            div { class: "empty", "Nobody is waiting for an opponent right now." }
+                        } else {
+                            div { class: "list",
+                                for entry in open {
+                                    // The id is here so a test can address one
+                                    // specific listing: several open games
+                                    // usually share a creator name, so picking
+                                    // by name gets an arbitrary one of them.
+                                    div { key: "{entry.game_id}", id: "listing-{entry.game_id}", class: "list-item",
+                                        span { class: "grow",
+                                            b { "{entry.setup.setup.creator_nickname}" }
+                                        }
+                                        span { class: "badge {entry.time_control().category().to_lowercase()}",
+                                            "{entry.time_control().label()}"
+                                        }
+                                        if entry.creator_id() == me {
+                                            span { class: "muted small", "yours" }
+                                        } else {
+                                            button {
+                                                class: "primary",
+                                                disabled: !ready,
+                                                onclick: {
+                                                    let id = entry.game_id;
+                                                    move |_| sync.send(Cmd::JoinGame(id))
+                                                },
+                                                "Play"
+                                            }
                                         }
                                     }
                                 }
@@ -611,6 +855,15 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                                                     div {
                                                         key: "{id}",
                                                         class: "{class}",
+                                                        role: "button",
+                                                        tabindex: "0",
+                                                        "aria-label": "Watch {white} versus {black}",
+                                                        onkeydown: move |e| {
+                                                            if e.key() == Key::Enter || e.key() == Key::Character(" ".into()) {
+                                                                sync.send(Cmd::WatchGame(id));
+                                                                state.with_mut(|s| s.route = Route::Game(id));
+                                                            }
+                                                        },
                                                         onclick: move |_| {
                                                             sync.send(Cmd::WatchGame(id));
                                                             state.with_mut(|s| s.route = Route::Game(id));
@@ -641,41 +894,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                         }
                     }
 
-                    div { class: "panel",
-                        h2 { "Open challenges" }
-                        if open.is_empty() {
-                            div { class: "empty", "Nobody is waiting for an opponent right now." }
-                        } else {
-                            div { class: "list",
-                                for entry in open {
-                                    // The id is here so a test can address one
-                                    // specific listing: several open games
-                                    // usually share a creator name, so picking
-                                    // by name gets an arbitrary one of them.
-                                    div { key: "{entry.game_id}", id: "listing-{entry.game_id}", class: "list-item",
-                                        span { class: "grow",
-                                            b { "{entry.setup.setup.creator_nickname}" }
-                                        }
-                                        span { class: "badge {entry.time_control().category().to_lowercase()}",
-                                            "{entry.time_control().label()}"
-                                        }
-                                        if entry.creator_id() == me {
-                                            span { class: "muted small", "yours" }
-                                        } else {
-                                            button {
-                                                class: "primary",
-                                                onclick: {
-                                                    let id = entry.game_id;
-                                                    move |_| sync.send(Cmd::JoinGame(id))
-                                                },
-                                                "Play"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+
                 }
 
                 div {
@@ -715,6 +934,7 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
                                         span { class: "grow", "{p.nickname}" }
                                         button {
                                             class: "ghost small",
+                                            disabled: !ready || !accepting_new_games,
                                             onclick: {
                                                 let name = p.nickname.clone();
                                                 let key = p.player;
@@ -744,18 +964,22 @@ pub fn HomeView(state: Signal<AppState>, sync: Sync) -> Element {
     }
 }
 
+fn replay_position(ply: usize, total_plies: usize) -> Option<usize> {
+    // Returning to the current position resumes live updates.
+    (ply < total_plies).then_some(ply)
+}
+
 /// A single game — playing or spectating, plus the replay scrubber once it is
 /// over.
 #[component]
-pub fn GameView(
-    state: Signal<AppState>,
-    sync: Sync,
-    game_id: GameId,
-    replay_mode: bool,
-) -> Element {
-    let mut promotion = use_signal(|| None::<(Move, Color, Vec<PieceKind>)>);
+pub fn GameView(state: Signal<AppState>, sync: Sync, game_id: GameId) -> Element {
     let mut viewing_ply = use_signal(|| None::<usize>);
     let mut challenge_target = use_signal(|| None::<(String, ed25519_dalek::VerifyingKey)>);
+    let mut flipped = use_signal(|| false);
+    let mut result_dismissed = use_signal(|| false);
+    let mut confirm_resign = use_signal(|| false);
+    let mut show_pgn = use_signal(|| false);
+    let mut copy_feedback = use_signal(String::new);
 
     // Tick once a second so the clocks actually count down. Everything else in
     // this view is driven by state changes, and between moves there are none —
@@ -773,6 +997,7 @@ pub fn GameView(
     let s = state.read();
     let me = s.me();
     let now = now_ms();
+    let ready = s.status == ConnStatus::Online && s.account_settled;
     let game = match s.game(&game_id) {
         Some(g) => g.clone(),
         None => {
@@ -795,21 +1020,28 @@ pub fn GameView(
     drop(s);
 
     let replay = game.replay();
-    let my_color = game
-        .player_keys()
-        .and_then(|_| game.color_of(&state.read().account.key.verifying_key()));
-    let orientation = my_color.unwrap_or(Color::White);
+    let my_key = state.read().account.key.verifying_key();
+    let my_color = game.color_of(&my_key).or_else(|| {
+        game.setup
+            .get()
+            .filter(|setup| setup.creator == my_key)
+            .map(|setup| setup.setup.creator_plays)
+    });
+    let orientation = if flipped() {
+        my_color.unwrap_or(Color::White).opposite()
+    } else {
+        my_color.unwrap_or(Color::White)
+    };
     let result = game.result();
     let is_over = result.is_over();
 
-    // In replay mode (or when scrubbing) the board shows a past position and is
-    // not playable.
+    // A past position is not playable.
     let total_plies = replay.ply();
     let shown_ply = viewing_ply().unwrap_or(total_plies).min(total_plies);
     let scrubbing = shown_ply != total_plies;
     let fen = replay.fen_at(shown_ply).to_string();
 
-    let playable = if replay_mode || scrubbing || is_over {
+    let playable = if scrubbing || is_over || !ready {
         None
     } else {
         my_color.filter(|c| game.replay().side_to_move() == *c && game.opponent.get().is_some())
@@ -848,8 +1080,7 @@ pub fn GameView(
         None => ("White".to_string(), "Black".to_string()),
     };
 
-    let board_now = Board::from_fen(&fen).unwrap_or_default();
-    let (captured_by_white, captured_by_black) = captured_material(&board_now);
+    let (captured_by_white, captured_by_black) = captured_material(&replay.outcomes()[..shown_ply]);
     // Freeze the clocks at the moment the game ended. `time_remaining` measures
     // against "now" and judges liveness from the BOARD alone (so that a timeout
     // claim can be verified against the state that contains it) — which means a
@@ -879,6 +1110,21 @@ pub fn GameView(
         .unwrap_or(false);
 
     let sans = replay.san_list();
+    let link = share_link(game_id);
+    let pgn = replay.to_pgn(
+        &[
+            ("Event", "FreeChess online game".to_string()),
+            ("Site", link.clone()),
+            ("White", white_name.clone()),
+            ("Black", black_name.clone()),
+        ],
+        result.pgn_token(),
+    );
+    let pgn_copy = pgn.clone();
+    let pgn_download = format!(
+        "data:application/x-chess-pgn;charset=utf-8,{}",
+        js_sys::encode_uri_component(&pgn)
+    );
     // Our offer is on the table but the creator has not countersigned it yet.
     // Until they do the seat is empty and no move is legal — see
     // `chess_core::game::opponent`.
@@ -903,7 +1149,7 @@ pub fn GameView(
             .map(|k| PlayerId::from(&k) == me)
             .unwrap_or(true);
 
-    let seat = |name: String, ms: i64, color: Color, captured: String| {
+    let seat = |name: String, ms: i64, color: Color, captured: Vec<PieceKind>| {
         let active = !is_over && to_move == color && game.opponent.get().is_some();
         let low = ms < 20_000;
         let mut class = String::from("clock");
@@ -913,27 +1159,41 @@ pub fn GameView(
         if active && low {
             class.push_str(" low");
         }
-        let piece_class = if color == Color::White {
-            "piece white"
-        } else {
-            "piece black"
-        };
         rsx! {
-            div { class: "seat",
-                span { class: "{piece_class}", style: "font-size:20px", "\u{265F}" }
-                span { class: "name", "{name}" }
-                span { class: "captured", "{captured}" }
+            div { class: "seat", "data-color": if color == Color::White { "white" } else { "black" },
+                div { class: "seat-avatar", PieceImage { kind: PieceKind::Pawn, color } }
+                div { class: "seat-details",
+                    span { class: "name", "{name}" }
+                    span { class: "captured",
+                        for kind in captured {
+                            PieceImage { kind, color: color.opposite() }
+                        }
+                    }
+                }
                 span { class: "spacer" }
-                span { class: "{class}", "{format_clock(ms)}" }
+                span { class: "{class}", "aria-label": "{name}: {format_clock(ms)} remaining", "{format_clock(ms)}" }
             }
         }
     };
 
     rsx! {
         div { class: "page",
+            div { class: "game-toolbar",
+                button { class: "ghost small", onclick: move |_| state.with_mut(|s| s.route = Route::Home), {icon("home")} "Lobby" }
+                span { class: "spacer" }
+                button {
+                    class: "ghost small", id: "flip-board", title: "Flip board",
+                    onclick: move |_| flipped.set(!flipped()),
+                    {icon("flip")} "Flip board"
+                }
+            }
             div { class: "game-layout",
                 div {
-                    { seat(black_name.clone(), black_ms, Color::Black, captured_by_black) }
+                    if orientation == Color::White {
+                        {seat(black_name.clone(), black_ms, Color::Black, captured_by_black.clone())}
+                    } else {
+                        {seat(white_name.clone(), white_ms, Color::White, captured_by_white.clone())}
+                    }
                     div { class: "board-wrap",
                         GameBoard {
                             fen: fen.clone(),
@@ -941,37 +1201,24 @@ pub fn GameView(
                             playable,
                             last_move,
                             on_move: move |mv: Move| {
-                                // A pawn reaching the last rank needs a piece
-                                // chosen before the move can be signed.
-                                let board = Board::from_fen(&fen).unwrap_or_default();
-                                // Carry the promoting side, not just the move:
-                                // the picker draws real pieces, and the glyph
-                                // set is the same for both colours — only the
-                                // styling says which is which.
-                                let promoting = board.piece_at(mv.from).filter(|p| {
-                                    p.kind == PieceKind::Pawn
-                                        && mv.to.rank() == p.color.promotion_rank()
-                                });
-                                if let Some(piece) = promoting {
-                                    promotion.set(Some((mv, piece.color, vec![
-                                        PieceKind::Queen, PieceKind::Rook,
-                                        PieceKind::Bishop, PieceKind::Knight,
-                                    ])));
-                                } else {
-                                    sync.send(Cmd::PlayMove { game: game_id, mv });
-                                }
+                                sync.send(Cmd::PlayMove { game: game_id, mv });
                             },
                         }
-                        if is_over && !scrubbing {
+                        if is_over && !scrubbing && !result_dismissed() {
                             div { class: "result-overlay",
                                 div { class: "result-card",
                                     div { class: "headline", "{result_headline(result, my_color)}" }
-                                    div { class: "muted small", "Replay is shareable — copy the page link." }
+                                    div { class: "muted small", "{white_name} vs {black_name}" }
+                                    button { class: "primary", onclick: move |_| result_dismissed.set(true), "Review game" }
                                 }
                             }
                         }
                     }
-                    { seat(white_name.clone(), white_ms, Color::White, captured_by_white) }
+                    if orientation == Color::White {
+                        {seat(white_name.clone(), white_ms, Color::White, captured_by_white)}
+                    } else {
+                        {seat(black_name.clone(), black_ms, Color::Black, captured_by_black)}
+                    }
                 }
 
                 div {
@@ -984,15 +1231,17 @@ pub fn GameView(
                                 for (i, pair) in sans.chunks(2).enumerate() {
                                     div { key: "{i}", class: "mv-row",
                                         span { class: "num", "{i + 1}." }
-                                        span {
+                                        button {
                                             class: if shown_ply == i * 2 + 1 { "mv current" } else { "mv" },
-                                            onclick: move |_| viewing_ply.set(Some(i * 2 + 1)),
+                                            onclick: move |_| viewing_ply.set(replay_position(i * 2 + 1, total_plies)),
+                                            "aria-label": "Move {i + 1}, White: {pair[0]}",
                                             "{pair[0]}"
                                         }
                                         if pair.len() > 1 {
-                                            span {
+                                            button {
                                                 class: if shown_ply == i * 2 + 2 { "mv current" } else { "mv" },
-                                                onclick: move |_| viewing_ply.set(Some(i * 2 + 2)),
+                                                onclick: move |_| viewing_ply.set(replay_position(i * 2 + 2, total_plies)),
+                                                "aria-label": "Move {i + 1}, Black: {pair[1]}",
                                                 "{pair[1]}"
                                             }
                                         }
@@ -1002,29 +1251,31 @@ pub fn GameView(
                         }
                         div { class: "body",
                             div { class: "replay-bar",
-                                button { class: "ghost", onclick: move |_| viewing_ply.set(Some(0)), "\u{23EE}" }
+                                button { class: "ghost", title: "Starting position", "aria-label": "Starting position", disabled: shown_ply == 0, onclick: move |_| viewing_ply.set(replay_position(0, total_plies)), {icon("first")} }
                                 button {
                                     class: "ghost",
-                                    onclick: move |_| viewing_ply.set(Some(shown_ply.saturating_sub(1))),
-                                    "\u{25C0}"
+                                    title: "Previous move", "aria-label": "Previous move", disabled: shown_ply == 0,
+                                    onclick: move |_| viewing_ply.set(replay_position(shown_ply.saturating_sub(1), total_plies)),
+                                    {icon("previous")}
                                 }
                                 button {
                                     class: "ghost",
-                                    onclick: move |_| viewing_ply.set(Some((shown_ply + 1).min(total_plies))),
-                                    "\u{25B6}"
+                                    title: "Next move", "aria-label": "Next move", disabled: shown_ply == total_plies,
+                                    onclick: move |_| viewing_ply.set(replay_position(shown_ply + 1, total_plies)),
+                                    {icon("next")}
                                 }
-                                button { class: "ghost", onclick: move |_| viewing_ply.set(None), "\u{23ED}" }
+                                button { class: "ghost", title: "Latest position", "aria-label": "Latest position", disabled: !scrubbing, onclick: move |_| viewing_ply.set(None), {icon("last")} }
                             }
                             if scrubbing {
                                 div {
                                     class: "banner warn small",
                                     id: "replay-position",
                                     style: "margin-top:10px",
-                                    "Viewing move {shown_ply} of {total_plies}. "
-                                    span {
-                                        style: "cursor:pointer;text-decoration:underline",
+                                    "Viewing position {shown_ply} of {total_plies}. "
+                                    button {
+                                        class: "text-button",
                                         onclick: move |_| viewing_ply.set(None),
-                                        "Jump to live"
+                                        if is_over { "Latest position" } else { "Jump to live" }
                                     }
                                 }
                             }
@@ -1044,10 +1295,24 @@ pub fn GameView(
                                 else if offer_pending { "You have asked for this seat." }
                                 else { "You are spectating." }
                             }
+                            div { class: "game-state", role: "status",
+                                if is_over { "{result_headline(result, my_color)}" }
+                                else if game.opponent.get().is_none() { "Waiting for an opponent" }
+                                else if !ready { "Reconnecting..." }
+                                else if scrubbing { "Reviewing the game" }
+                                else if playable.is_some() { "Your turn" }
+                                else if my_color.is_some() { "Opponent's turn" }
+                                else if to_move == Color::White { "White to move" }
+                                else { "Black to move" }
+                            }
+                            if my_color.is_some() && game.opponent.get().is_none() {
+                                div { class: "small muted", "Share the link below to invite a friend." }
+                            }
                             if can_join {
                                 button {
                                     class: "primary",
                                     style: "width:100%",
+                                    disabled: !ready,
                                     onclick: move |_| sync.send(Cmd::JoinGame(game_id)),
                                     "Take the open seat"
                                 }
@@ -1061,7 +1326,8 @@ pub fn GameView(
                                 button {
                                     class: "danger",
                                     style: "width:100%;margin-top:8px",
-                                    onclick: move |_| sync.send(Cmd::Resign(game_id)),
+                                    disabled: !ready,
+                                    onclick: move |_| confirm_resign.set(true),
                                     "Resign"
                                 }
                             }
@@ -1083,8 +1349,28 @@ pub fn GameView(
                                 code {
                                     class: "key",
                                     id: "share-link",
-                                    "{share_link(game_id)}"
+                                    "{link}"
                                 }
+                            }
+                            div { class: "share-actions",
+                                button {
+                                    class: "ghost small", id: "copy-game-link",
+                                    onclick: move |_| {
+                                        let text = share_link(game_id);
+                                        spawn(async move {
+                                            copy_feedback.set(if copy_to_clipboard(text).await {
+                                                "Game link copied.".to_string()
+                                            } else {
+                                                "Select the link above to copy it.".to_string()
+                                            });
+                                        });
+                                    },
+                                    {icon("copy")} "Copy link"
+                                }
+                                button { class: "ghost small", id: "export-pgn", onclick: move |_| { copy_feedback.set(String::new()); show_pgn.set(true); }, {icon("download")} "PGN" }
+                            }
+                            if !copy_feedback().is_empty() {
+                                div { class: "small muted", role: "status", "{copy_feedback}" }
                             }
                         }
                     }
@@ -1101,6 +1387,7 @@ pub fn GameView(
                                         span { class: "grow", "{p.nickname}" }
                                         button {
                                             class: "ghost small",
+                                            disabled: !ready,
                                             onclick: {
                                                 let name = p.nickname.clone();
                                                 let key = p.player;
@@ -1117,32 +1404,51 @@ pub fn GameView(
             }
         }
 
-        if let Some((mv, side, choices)) = promotion() {
-            div { class: "modal-bg", id: "promotion-picker",
-                div { class: "modal", style: "max-width:320px",
-                    h3 { "Promote to" }
+        if confirm_resign() && !is_over {
+            div { class: "modal-bg", onclick: move |_| confirm_resign.set(false),
+                div {
+                    class: "modal", id: "resign-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Resign game",
+                    onmounted: move |_| focus_dialog("resign-dialog"),
+                    onclick: move |e| e.stop_propagation(),
+                    onkeydown: move |e| { if e.key() == Key::Escape { confirm_resign.set(false); } },
+                    h3 { "Resign this game?" }
+                    div { class: "body", "Your opponent will win. This cannot be undone." }
+                    div { class: "actions",
+                        button { class: "ghost", onclick: move |_| confirm_resign.set(false), "Keep playing" }
+                        button {
+                            class: "danger", id: "confirm-resign", disabled: !ready,
+                            onclick: move |_| { sync.send(Cmd::Resign(game_id)); confirm_resign.set(false); },
+                            "Resign game"
+                        }
+                    }
+                }
+            }
+        }
+        if show_pgn() {
+            div { class: "modal-bg", onclick: move |_| show_pgn.set(false),
+                div { class: "modal pgn-modal", id: "pgn-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Export PGN", onclick: move |e| e.stop_propagation(), onmounted: move |_| focus_dialog("pgn-dialog"), onkeydown: move |e| { if e.key() == Key::Escape { show_pgn.set(false); } },
+                    h3 { "Export PGN" }
                     div { class: "body",
-                        div { class: "promo",
-                            for kind in choices {
-                                button {
-                                    key: "{kind:?}",
-                                    id: "promote-{kind:?}",
-                                    onclick: move |_| {
-                                        sync.send(Cmd::PlayMove {
-                                            game: game_id,
-                                            mv: Move::promoting(mv.from, mv.to, kind),
+                        textarea { class: "pgn-text mono", id: "pgn-text", "aria-label": "Game PGN", readonly: true, value: "{pgn}" }
+                        if !copy_feedback().is_empty() {
+                            div { class: "small muted", role: "status", "{copy_feedback}" }
+                        }
+                        div { class: "actions",
+                            button { class: "ghost", onclick: move |_| show_pgn.set(false), "Close" }
+                            a { class: "button ghost", href: "{pgn_download}", download: "freechess-{game_id}.pgn", {icon("download")} "Download" }
+                            button {
+                                class: "primary", id: "copy-pgn",
+                                onclick: move |_| {
+                                    let text = pgn_copy.clone();
+                                    spawn(async move {
+                                        copy_feedback.set(if copy_to_clipboard(text).await {
+                                            "PGN copied.".to_string()
+                                        } else {
+                                            "Select the PGN to copy it.".to_string()
                                         });
-                                        promotion.set(None);
-                                    },
-                                    // Same class the board uses, so the choice
-                                    // is drawn in the colour being promoted.
-                                    // It used to be hardcoded dark, which meant
-                                    // White picked from a row of black pieces.
-                                    span {
-                                        class: if side == Color::White { "piece white" } else { "piece black" },
-                                        "{crate::board::glyph(kind)}"
-                                    }
-                                }
+                                    });
+                                },
+                                {icon("copy")} "Copy PGN"
                             }
                         }
                     }
@@ -1189,6 +1495,68 @@ pub fn StatusBanner(state: Signal<AppState>) -> Element {
             }
         }
     }
+}
+
+async fn copy_to_clipboard(text: String) -> bool {
+    let mut eval = document::eval(
+        r#"
+        const text = await dioxus.recv();
+        let copied = false;
+        try {
+            await navigator.clipboard.writeText(text);
+            copied = true;
+        } catch (_) {
+            // The gateway's sandbox may deny the Clipboard API.
+            const previous = document.activeElement;
+            const input = document.createElement('textarea');
+            input.value = text;
+            input.style.cssText = 'position:fixed;left:-9999px;top:0';
+            document.body.appendChild(input);
+            input.select();
+            try { copied = document.execCommand('copy'); } catch (_) {}
+            input.remove();
+            previous?.focus();
+        }
+        dioxus.send(copied);
+    "#,
+    );
+    if eval.send(text).is_err() {
+        return false;
+    }
+    eval.recv::<bool>().await.unwrap_or(false)
+}
+
+fn focus_dialog(id: &str) {
+    let eval = document::eval(
+        r#"
+        const dialog = document.getElementById(await dioxus.recv());
+        if (!dialog) return;
+        const previous = document.activeElement;
+        const controls = () => [...dialog.querySelectorAll('button, a[href], input, select, textarea, [tabindex]')]
+            .filter(el => !el.disabled && el.tabIndex >= 0 && el.getClientRects().length);
+        dialog.tabIndex = -1;
+        (controls()[0] || dialog).focus();
+        dialog.addEventListener('keydown', event => {
+            if (event.key !== 'Tab') return;
+            const items = controls();
+            const first = items[0], last = items[items.length - 1];
+            if (!first) { event.preventDefault(); dialog.focus(); }
+            else if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
+                event.preventDefault(); last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault(); first.focus();
+            }
+        });
+        const observer = new MutationObserver(() => {
+            if (!dialog.isConnected) {
+                observer.disconnect();
+                if (previous?.isConnected) previous.focus();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    "#,
+    );
+    let _ = eval.send(id);
 }
 
 /// The URL that opens this game for someone else.
@@ -1612,6 +1980,7 @@ pub fn short_result(result: chess_core::game::GameResult) -> &'static str {
 pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
     let mut chosen = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
+    let mut dismissed = use_signal(|| false);
     // Only prompt once the delegate has answered; before that we do not yet
     // know whether this player already has a name.
     let mut waited = use_signal(|| false);
@@ -1620,6 +1989,7 @@ pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
     let needs_name = s.nickname_unset;
     let settled = s.account_settled;
     let player_id = s.me();
+    let practicing = matches!(s.route, Route::Practice);
     drop(s);
 
     use_future(move || async move {
@@ -1627,13 +1997,30 @@ pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
         waited.set(true);
     });
 
-    if !needs_name || !settled || !waited() {
+    if dismissed() || practicing || !needs_name || !settled || !waited() {
+        return rsx! {};
+    }
+
+    if web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| {
+            document
+                .query_selector("[role=dialog]:not(#nickname-dialog)")
+                .ok()
+                .flatten()
+        })
+        .is_some()
+    {
         return rsx! {};
     }
 
     rsx! {
-        div { class: "modal-bg",
-            div { class: "modal", style: "max-width:400px",
+        div { class: "modal-bg", id: "nickname-prompt",
+            div {
+                class: "modal", id: "nickname-dialog", style: "max-width:440px",
+                role: "dialog", "aria-modal": "true", "aria-label": "Choose a nickname",
+                onmounted: move |_| focus_dialog("nickname-dialog"),
+                onkeydown: move |e| { if e.key() == Key::Escape { dismissed.set(true); } },
                 h3 { "Choose a nickname" }
                 div { class: "body",
                     div { class: "small muted",
@@ -1644,7 +2031,6 @@ pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
                         value: "{chosen}",
                         placeholder: "your name",
                         maxlength: 32,
-                        autofocus: true,
                         oninput: move |e| chosen.set(e.value()),
                     }
                     div { class: "small muted",
@@ -1655,6 +2041,7 @@ pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
                         div { class: "banner err small", "{err}" }
                     }
                     div { class: "actions",
+                        button { class: "ghost", id: "nickname-later", onclick: move |_| dismissed.set(true), "Later" }
                         button {
                             class: "primary",
                             id: "confirm-nickname",
@@ -1671,8 +2058,45 @@ pub fn ChooseNicknamePrompt(state: Signal<AppState>, sync: Sync) -> Element {
                             "Continue"
                         }
                     }
+                    button {
+                        class: "text-button small", id: "nickname-play-computer",
+                        onclick: move |_| { dismissed.set(true); state.with_mut(|s| s.route = Route::Practice); },
+                        "Play computer instead"
+                    }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_position;
+    use chess_core::chess::{Game, Move};
+
+    #[test]
+    fn returning_to_current_position_follows_the_next_move() {
+        let mut game = Game::new();
+        game.play(Move::from_uci("e2e4").unwrap()).unwrap();
+        let start = replay_position(0, game.ply());
+        assert_eq!(start, Some(0));
+        let next = replay_position(start.unwrap() + 1, game.ply());
+
+        game.play(Move::from_uci("e7e5").unwrap()).unwrap();
+        assert_eq!(
+            game.fen_at(next.unwrap_or(game.ply())),
+            game.current_fen(),
+            "Next back to the current position must resume following live moves"
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn only_past_positions_pin_the_replay() {
+        assert_eq!(replay_position(0, 0), None);
+        assert_eq!(replay_position(0, 4), Some(0));
+        assert_eq!(replay_position(3, 4), Some(3));
+        assert_eq!(replay_position(4, 4), None);
+        assert_eq!(replay_position(5, 4), None);
     }
 }

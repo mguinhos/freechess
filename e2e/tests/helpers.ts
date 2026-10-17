@@ -36,6 +36,7 @@ export const PEER2_PORT = 7514;
  * publish landed.
  */
 export function contractId(): string {
+  if (process.env.FREECHESS_CONTRACT_ID) return process.env.FREECHESS_CONTRACT_ID;
   const path = join(__dirname, "../../published-contract/contract-id.txt");
   try {
     return readFileSync(path, "utf8").trim();
@@ -93,6 +94,11 @@ export async function openApp(
 
   await page.goto(appUrl(port), { waitUntil: "domcontentloaded" });
   const frame = app(page);
+  if (nickname) {
+    await page.addLocatorHandler(frame.locator("#nickname-prompt"), async () => {
+      await frame.locator("#nickname-later").click();
+    });
+  }
   await expect(frame.locator(".topbar")).toBeVisible();
   // Wait for the node connection before doing anything that needs the network.
   await expect(frame.locator(".conn .dot.online")).toBeVisible();
@@ -189,19 +195,14 @@ export async function createGame(frame: FrameLocator, timeControl = "10+0") {
 /**
  * Play a move by clicking the origin square then the destination.
  *
- * Squares carry no test id, so they are addressed by index. The board is laid
- * out rank 8 → rank 1, file a → h when oriented for White.
+ * Algebraic square names stay stable when either player flips the board.
  */
 export async function clickSquare(
   frame: FrameLocator,
   square: string,
   orientation: "white" | "black" = "white",
 ) {
-  const file = square.charCodeAt(0) - "a".charCodeAt(0);
-  const rank = parseInt(square[1], 10) - 1;
-  const index =
-    orientation === "white" ? (7 - rank) * 8 + file : rank * 8 + (7 - file);
-  await frame.locator(".board > div").nth(index).click();
+  await frame.locator(`.board > .sq[data-square="${square}"]`).click();
 }
 
 export async function playMove(

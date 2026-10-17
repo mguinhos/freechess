@@ -29,8 +29,8 @@ const NICK = flag("nick", "claude");
 const CMDFILE = flag("cmdfile", "/tmp/freechess-cmds");
 // Read from the file the publish step writes, rather than a constant edited by
 // hand on every release — that only ever showed up as a dirty working tree.
-const CONTRACT = readFileSync(
-  new URL("../target/webapp/contract-id", import.meta.url),
+const CONTRACT = process.env.FREECHESS_CONTRACT_ID || readFileSync(
+  new URL("../published-contract/contract-id.txt", import.meta.url),
   "utf8",
 ).trim();
 const APP = `http://127.0.0.1:${PORT}/v1/contract/web/${CONTRACT}/`;
@@ -40,7 +40,7 @@ let page, app, myColor = "white";
 const log = (...m) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...m);
 
 async function board() {
-  const squares = await app.locator(".board > div").allInnerTexts();
+  const squares = await app.locator(".board > .sq").evaluateAll(squares => squares.map(square => square.getAttribute("data-piece") || "."));
   if (squares.length !== 64) return;
   const lines = [];
   for (let r = 0; r < 8; r++) {
@@ -69,11 +69,7 @@ async function status() {
 }
 
 async function clickSquare(sq) {
-  const file = sq.charCodeAt(0) - 97;
-  const rank = parseInt(sq[1], 10) - 1;
-  const index =
-    myColor === "white" ? (7 - rank) * 8 + file : rank * 8 + (7 - file);
-  await app.locator(".board > div").nth(index).click();
+  await app.locator(`.board > .sq[data-square="${sq}"]`).click();
 }
 
 async function run(line) {
@@ -114,6 +110,11 @@ async function run(line) {
     const before = (await app.locator(".moves .mv").allInnerTexts()).length;
     await clickSquare(a.slice(0, 2));
     await clickSquare(a.slice(2, 4));
+    if (a[4]) {
+      const kind = { q: "Queen", r: "Rook", b: "Bishop", n: "Knight" }[a[4]];
+      if (!kind) throw new Error("invalid promotion piece");
+      await app.locator(`#promote-${kind}`).click();
+    }
     for (let i = 0; i < 120; i++) {
       const now = (await app.locator(".moves .mv").allInnerTexts()).length;
       if (now > before) break;

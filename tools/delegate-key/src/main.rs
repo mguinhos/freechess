@@ -1,7 +1,7 @@
 //! Print a delegate WASM's code hash and the key derived from it.
 //!
 //! Needed whenever the delegate is about to change: the OLD key has to be
-//! recorded in [`chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES`] before
+//! recorded in `LEGACY_DELEGATE_CODE_HASHES` in the private protocol crate before
 //! the change lands, or the players' account seeds become unreachable — they are
 //! stored under the key, and the key is a hash of the bytes.
 //!
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
     println!("delegate_key    {}", bs58::encode(key).into_string());
     println!();
     println!("To retire this delegate, add its code hash to");
-    println!("LEGACY_DELEGATE_CODE_HASHES in common/src/delegate_api.rs:");
+    println!("LEGACY_DELEGATE_CODE_HASHES in delegates/chess-delegate-protocol/src/lib.rs:");
     println!();
     println!("    hex!(\"{}\"),", hex(&code_hash));
     ExitCode::SUCCESS

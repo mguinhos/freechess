@@ -130,6 +130,7 @@ sed -i "s|^#*base_path = .*|base_path = \"v1/contract/web/$KEY\"|" ui/Dioxus.tom
 ( cd ui && dx build --release --platform web )
 status=$?
 mv ui/Dioxus.toml.bak ui/Dioxus.toml
+./scripts/copy-stockfish-assets.sh target/dx/chess-ui/release/web/public
 exit $status
 '''
 
@@ -141,8 +142,14 @@ dependencies = ["build-contracts", "build-delegate", "build-ui"]
 
 [tasks.test]
 description = "Run the test suite"
+dependencies = ["build-contracts", "build-delegate", "test-build-workflows"]
 command = "cargo"
-args = ["test", "--workspace", "--exclude", "chess-ui"]
+args = ["test", "--workspace"]
+
+[tasks.test-build-workflows]
+description = "Check publishing retries and pinned browser-engine assets without nodes"
+command = "python3"
+args = ["scripts/tests/build-workflows.py"]
 
 [tasks.test-deep]
 description = "Run the slow perft checks"
@@ -154,8 +161,9 @@ command = "cargo"
 args = ["fmt", "--all"]
 
 [tasks.clippy]
+dependencies = ["build-contracts", "build-delegate"]
 command = "cargo"
-args = ["clippy", "--workspace", "--exclude", "chess-ui", "--", "-D", "warnings"]
+args = ["clippy", "--workspace", "--", "-D", "warnings"]
 
 [tasks.preflight]
 description = "Everything CI would run, before publishing"
@@ -203,7 +211,7 @@ script = '''
 # means recording the outgoing hash first.
 BUILT=$(cargo run --quiet -p delegate-key -- "${WASM_DIR}/chess_delegate.wasm" \
   | awk '/code_hash_hex/ {print $2}')
-RECORDED=$(grep -A3 'pub const CURRENT_DELEGATE_CODE_HASH' common/src/delegate_api.rs \
+RECORDED=$(grep -A3 'pub const CURRENT_DELEGATE_CODE_HASH' delegates/chess-delegate-protocol/src/lib.rs \
   | grep -oE '0x[0-9a-f]{2}' | sed 's/0x//' | tr -d '\n')
 
 if [ "$BUILT" = "$RECORDED" ]; then
@@ -217,7 +225,7 @@ echo "  recorded: $RECORDED" >&2
 echo >&2
 echo "Every player's account seed is stored under the OLD key. Before shipping:" >&2
 echo "  1. Add the recorded hash above to LEGACY_DELEGATE_CODE_HASHES in" >&2
-echo "     common/src/delegate_api.rs, so clients know where to look." >&2
+echo "     delegates/chess-delegate-protocol/src/lib.rs, so clients know where to look." >&2
 echo "  2. Set CURRENT_DELEGATE_CODE_HASH to the built hash." >&2
 echo "  3. Commit both in the same change." >&2
 exit 1
@@ -504,14 +512,12 @@ dependencies = [
 # ---------------------------------------------------------------- dev
 
 [tasks.dev]
-description = "Serve the UI with hot reload against the local node"
-dependencies = ["build-contracts"]
-cwd = "ui"
-command = "dx"
-args = ["serve", "--platform", "web"]
+description = "Build and run the app on the isolated local network"
+command = "bash"
+args = ["scripts/local.sh"]
 
 [tasks.nodes-up]
-description = "Start the isolated two-node test network"
+description = "Start the isolated three-node test network"
 script_runner = "@shell"
 script = "./scripts/nodes.sh up"
 
@@ -521,7 +527,6 @@ script = "./scripts/nodes.sh down"
 
 [tasks.test-e2e]
 description = "Three-node browser test, from a wiped network"
-dependencies = ["build"]
 script_runner = "@shell"
 script = '''
 set -e
@@ -538,14 +543,8 @@ set -e
 # Both are the rules working correctly. Starting clean is what makes a red run
 # mean something.
 ./scripts/nodes.sh wipe
-./scripts/nodes.sh up
-
-# Publish to all three: a node only serves the app it holds itself.
-for port in 7511 7512 7514; do
-  WS_API_PORT=$port cargo make --quiet publish-delegate
-  WS_API_PORT=$port cargo make --quiet publish-webapp
-done
-
+./scripts/local.sh
+export FREECHESS_CONTRACT_ID="$(cat target/local-webapp/contract-id.txt)"
 cd e2e && npx playwright test
 '''
 

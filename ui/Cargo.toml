@@ -6,11 +6,9 @@ description = "FreeChess browser UI"
 
 [dependencies]
 chess-core.workspace = true
+chess-delegate-protocol.workspace = true
 serde.workspace = true
 ciborium.workspace = true
-blake3.workspace = true
-bs58.workspace = true
-chrono.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 
 # The UI is the one crate that legitimately needs randomness: it generates the
@@ -33,6 +31,7 @@ web-sys = { version = "0.3", features = [
     "Element",
     "HtmlElement",
     "HtmlInputElement",
+    "HtmlImageElement",
     "Window",
     "WebSocket",
     "BinaryType",
@@ -49,7 +48,5 @@ web-sys = { version = "0.3", features = [
 ] }
 futures = "0.3"
 
-[build-dependencies]
-# The build script hashes the read-only contracts so the client can derive
-# their keys without shipping their WASM.
-blake3.workspace = true
+[dev-dependencies]
+bs58.workspace = true

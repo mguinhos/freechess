@@ -30,7 +30,7 @@ const PORT = flag("port", "7513");
 // Read the address from the committed artifact rather than hardcoding it. A
 // hardcoded id goes stale the moment the app is re-keyed, and this file sat
 // pointing at a long-dead contract for exactly that reason.
-const CONTRACT = readFileSync(
+const CONTRACT = process.env.FREECHESS_CONTRACT_ID || readFileSync(
   new URL("../published-contract/contract-id.txt", import.meta.url),
   "utf8",
 ).trim();
@@ -100,11 +100,7 @@ async function waitForAccount(app) {
 
 /** Click a square by algebraic name, given the board orientation. */
 async function clickSquare(app, square, orientation) {
-  const file = square.charCodeAt(0) - 97;
-  const rank = parseInt(square[1], 10) - 1;
-  const index =
-    orientation === "white" ? (7 - rank) * 8 + file : rank * 8 + (7 - file);
-  await app.locator(".board > div").nth(index).click();
+  await app.locator(`.board > .sq[data-square="${square}"]`).click();
 }
 
 /**
@@ -114,10 +110,8 @@ async function clickSquare(app, square, orientation) {
  * White's view lands on the mirrored square, which is either an illegal move
  * or — worse — a legal one nobody intended.
  *
- * The seats are NOT viewer-relative: the app renders Black on top and White
- * below, always, and flips only the board. So the orientation is the colour of
- * whichever seat is ours, found by name. (Two players sharing a nickname would
- * defeat that; there are two seats and it is our own node, so it holds here.)
+ * The board and player seats flip together; square addressing uses algebraic
+ * names so move input also works after the viewer manually flips the board.
  */
 async function myOrientation(app) {
   const seats = app.locator(".seat");
@@ -171,7 +165,7 @@ async function report(app) {
   // Black's layout is the exact reverse of White's, so one reverse normalises
   // it — without this the rank and file labels are mirrored and the position
   // reads as a completely different one.
-  let squares = await app.locator(".board > div").allInnerTexts();
+  let squares = await app.locator(".board > .sq").evaluateAll(squares => squares.map(square => square.getAttribute("data-piece") || "."));
   if ((await myOrientation(app)) === "black") squares = squares.slice().reverse();
   if (squares.length === 64) {
     console.log();
@@ -351,6 +345,11 @@ async function main() {
 
     await clickSquare(app, uci.slice(0, 2), orientation);
     await clickSquare(app, uci.slice(2, 4), orientation);
+    if (uci[4]) {
+      const kind = { q: "Queen", r: "Rook", b: "Bishop", n: "Knight" }[uci[4]];
+      if (!kind) throw new Error("invalid promotion piece");
+      await app.locator(`#promote-${kind}`).click();
+    }
 
     // Wait for the move to register rather than assuming it did.
     for (let i = 0; i < 60; i++) {

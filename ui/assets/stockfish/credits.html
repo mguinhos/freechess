@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FreeChess Stockfish engine credits</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;background:#262421;color:#eee;max-width:760px;margin:48px auto;padding:0 24px}a{color:#a7cc75}h1{font-size:28px}h2{font-size:20px;margin-top:28px}code,pre{font-size:14px;overflow-wrap:anywhere}pre{padding:16px;background:#1f1e1b;white-space:pre-wrap}li{margin:8px 0}</style>
+</head>
+<body>
+<h1>Stockfish engine credits</h1>
+<p>FreeChess bundles <strong>Stockfish 19 Lite</strong>, the lite single-threaded
+WebAssembly variant of <a href="https://github.com/nmrugg/stockfish.js/releases/tag/v19.0.1">Stockfish.js 19.0.1</a>.
+The unmodified engine runs in a local browser worker. Your practice positions
+are processed on your device.</p>
+<p>Stockfish.js is maintained by Nathan Rugg.
+Based on Stockfish by Tord Romstad, Marco Costalba, Joona Kiiski, Gary Linscott,
+and <a href="AUTHORS">other contributors</a>. Lite neural network by Chris Bao (sscg13).</p>
+<h2 id="license">License and corresponding source</h2>
+<p>The engine is free software under the <a href="Copying.txt">GNU General Public
+License, version 3</a>, without any warranty. You may use, modify, and redistribute
+it under that license.</p>
+<ul>
+<li><a href="stockfish-19.0.1-source.tar.xz" download>Download complete corresponding source (1.27 MB)</a>:
+the full pinned source tree, build scripts, and embedded lite NNUE network.</li>
+<li><a href="SOURCE.md">Build instructions and provenance</a>;
+<a href="SHA256SUMS">SHA-256 checksums</a>;
+<a href="AUTHORS">upstream authors</a>;
+<a href="Copying.txt">full GPLv3 license</a>.</li>
+<li>Upstream source commit:
+<a href="https://github.com/nmrugg/stockfish.js/tree/0d5dd7944f88c817c07a26bc4fb1905d5f9c46d6"><code>0d5dd7944f88c817c07a26bc4fb1905d5f9c46d6</code></a>.</li>
+</ul>
+<h2 id="build">Build this variant</h2>
+<p>Extract the source archive. Install and activate
+<a href="https://emscripten.org/docs/getting_started/downloads.html">Emscripten 6.0.9</a>,
+Node.js/npm, Python 3, make, and shasum or sha256sum. In the extracted source directory:</p>
+<pre>npm install --ignore-scripts
+node build.js --single-threaded --lite --strict-em-check -f</pre>
+<p>The package pins Terser 5.51.2. The build validates and uses the included
+<code>src/nn-61e7af4bb97d.nnue</code>; no network download is needed for that input.
+Outputs are <code>src/stockfish-19-lite-single.js</code> and
+<code>src/stockfish-19-lite-single.wasm</code>. FreeChess applies no engine patches.
+The build recipe was inspected; these bundled files are the upstream release assets.</p>
+<h2>Release checksums</h2>
+<pre>stockfish-19-lite-single.js
+ccb130d7ff29408531c47d859a49f91d59d4f482d05a53eb1a3231a4f624c91a
+
+stockfish-19-lite-single.wasm
+ee4f115bdb2d32cadf96cada104a05b5ec257d7ad6f57582190b49bc71f096de
+
+stockfish-19.0.1-source.tar.xz
+6a485f433e83a75ca5b22203130a879a7e5602f67e3b6da3285822d26dc18622</pre>
+</body>
+</html>

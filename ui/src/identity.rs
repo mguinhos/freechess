@@ -63,13 +63,6 @@ pub fn save_local_nickname(nickname: &str) {
     }
 }
 
-pub fn clear_local() {
-    if let Some(store) = storage() {
-        let _ = store.remove_item(STORAGE_KEY);
-        let _ = store.remove_item(STORAGE_NICK);
-    }
-}
-
 /// Mint a fresh account.
 pub fn generate() -> SigningKey {
     // `OsRng` maps to `crypto.getRandomValues` under the `getrandom/js`

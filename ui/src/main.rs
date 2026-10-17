@@ -7,13 +7,17 @@
 //!
 //! No external requests are made at runtime. The gateway serves the app under a
 //! same-origin CSP, so there are no CDN scripts, no web fonts and no remote
-//! images: the pieces are Unicode glyphs and the stylesheet ships in the
+//! images: the SVG pieces and stylesheet ship in the
 //! bundle.
 
 mod app;
 mod board;
+mod engine;
 mod freenet;
 mod identity;
+mod practice;
+mod sound;
+mod theme;
 mod views;
 
 use app::{AppState, Route};
@@ -31,9 +35,84 @@ fn main() {
 
 #[component]
 fn App() -> Element {
+    let mut theme = use_context_provider(|| Signal::new(theme::Theme::default()));
     let account = use_signal(identity::load_or_create);
     let mut state = use_signal(|| AppState::new(account()));
     let sync = app::use_sync(state);
+
+    // Load before enabling edits: a late reply must never overwrite a new choice.
+    use_future(move || async move {
+        loop {
+            let ready = state.read().account_settled;
+            if ready {
+                if let Some(command) =
+                    state.with_mut(|s| app::check_theme_recovery(s, identity::now_ms()))
+                {
+                    sync.send(command);
+                }
+                if state.read().theme_player.is_some() {
+                    return;
+                }
+                sync.send(app::Cmd::LoadTheme);
+            }
+            gloo_sleep(2000).await;
+        }
+    });
+    let mut observed_theme = use_signal(|| None::<([u8; 32], theme::Theme)>);
+    use_effect(move || {
+        let current = theme.read().clone();
+        let s = state.read();
+        let player = s.account.key.verifying_key().to_bytes();
+        if !s.account_settled || s.theme_player != Some(player) {
+            return;
+        }
+        let previous = observed_theme.peek().clone();
+        if previous.as_ref().map(|(id, _)| *id) != Some(player) {
+            let initial = s.stored_theme.clone().unwrap_or_default();
+            drop(s);
+            observed_theme.set(Some((player, initial.clone())));
+            theme.set(initial.clone());
+        } else if previous
+            .as_ref()
+            .is_some_and(|(_, saved)| saved != &current)
+        {
+            drop(s);
+            observed_theme.set(Some((player, current.clone())));
+            sync.send(app::Cmd::SaveTheme {
+                player,
+                theme: current,
+            });
+        }
+    });
+
+    let mut heard = use_signal(|| None::<(GameId, usize, bool)>);
+    use_effect(move || {
+        let s = state.read();
+        let Route::Game(id) = s.route else {
+            if heard().is_some() {
+                heard.set(None);
+            }
+            return;
+        };
+        let Some(game) = s.game(&id) else { return };
+        let replay = game.replay();
+        let ended = game.result().is_over();
+        if let Some((previous_id, ply, was_over)) = heard() {
+            if previous_id == id {
+                if replay.ply() > ply {
+                    if let Some(outcome) = replay.outcomes().last() {
+                        sound::play(sound::for_move(outcome, ended));
+                    }
+                } else if ended && !was_over {
+                    sound::play(sound::Sound::End);
+                }
+            }
+        }
+        let current = Some((id, replay.ply(), ended));
+        if heard() != current {
+            heard.set(current);
+        }
+    });
 
     // A game id in the query string opens straight into that game — this is
     // what makes a replay link shareable.
@@ -51,7 +130,7 @@ fn App() -> Element {
     let mut requested = use_signal(|| None::<GameId>);
     use_effect(move || {
         let s = state.read();
-        let (Route::Game(id) | Route::Replay(id)) = s.route.clone() else {
+        let Route::Game(id) = s.route else {
             return;
         };
         let missing = !s.games.contains_key(&id);
@@ -79,10 +158,13 @@ fn App() -> Element {
     // 30s intervals — too slow to keep the first page load waiting on.
     use_future(move || async move {
         for _ in 0..15 {
-            if state.read().account_settled {
+            if let Some((source, _)) = state.read().legacy_account.clone() {
+                sync.send(app::Cmd::LoadLegacyNickname(source));
+            } else if state.read().account_settled {
                 return;
+            } else {
+                sync.send(app::Cmd::LoadAccount);
             }
-            sync.send(app::Cmd::LoadAccount);
             gloo_sleep(2000).await;
         }
     });
@@ -96,8 +178,14 @@ fn App() -> Element {
     // retired delegates the empty answer settles immediately, so a first-ever
     // load is not delayed at all.
     use_future(move || async move {
-        if chess_core::delegate_api::LEGACY_DELEGATE_CODE_HASHES.is_empty() {
+        if chess_delegate_protocol::LEGACY_DELEGATE_CODE_HASHES.is_empty() {
             return;
+        }
+        while !state.read().legacy_probed {
+            if state.read().account_settled {
+                return;
+            }
+            gloo_sleep(200).await;
         }
         gloo_sleep(8000).await;
         if !state.read().account_settled {
@@ -111,7 +199,7 @@ fn App() -> Element {
     use_future(move || async move {
         loop {
             let watching = match state.read().route.clone() {
-                Route::Game(id) | Route::Replay(id) => Some(id),
+                Route::Game(id) => Some(id),
                 _ => None,
             };
             sync.send(app::Cmd::Heartbeat { watching });
@@ -290,21 +378,27 @@ fn App() -> Element {
 
     rsx! {
         document::Stylesheet { href: MAIN_CSS }
+        div {
+            class: "app-shell",
+            style: theme::style(&theme.read()),
+            onpointerdown: move |_| sound::unlock(),
+            onpointerup: move |_| sound::unlock(),
+            onkeydown: move |_| sound::unlock(),
         views::TopBar { state, sync }
-        views::StatusBanner { state }
-        views::NoticeBanners { state }
+            if state.read().route != Route::Practice {
+                views::StatusBanner { state }
+                views::NoticeBanners { state }
+            }
         views::ChooseNicknamePrompt { state, sync }
         match state.read().route.clone() {
             Route::Home => rsx! { views::HomeView { state, sync } },
+            Route::Practice => rsx! { practice::PracticeView {} },
             Route::Game(id) => rsx! {
-                views::GameView { state, sync, game_id: id, replay_mode: false }
+                views::GameView { key: "{id}", state, sync, game_id: id }
             },
-            Route::Replay(id) => rsx! {
-                views::GameView { state, sync, game_id: id, replay_mode: true }
-            },
-            Route::Profile(_) => rsx! { views::HomeView { state, sync } },
         }
         views::Footer {}
+        }
     }
 }
 

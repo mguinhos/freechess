@@ -5,13 +5,14 @@
 //! never leaves the device, and it is what lets a player close the browser and
 //! come back as the same person.
 //!
-//! See [`chess_core::delegate_api`] for the protocol and for why the seed is
+//! See [`chess_delegate_protocol`] for the protocol and for why the seed is
 //! handed back to the UI rather than the delegate signing on its behalf.
 
 #![allow(unexpected_cfgs)]
 
-use chess_core::delegate_api::{
-    ChessDelegateRequest, ChessDelegateResponse, ACCOUNT_SEED_KEY, NICKNAME_KEY,
+use chess_delegate_protocol::{
+    ChessDelegateRequest, ChessDelegateResponse, Theme, ACCOUNT_SEED_KEY, NICKNAME_KEY,
+    THEME_KEY_PREFIX,
 };
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateCtx, DelegateError, DelegateInterface,
@@ -90,7 +91,7 @@ fn handle(ctx: &mut DelegateCtx, request: ChessDelegateRequest) -> ChessDelegate
 
         ChessDelegateRequest::StoreAccount { seed } => {
             if ctx.set_secret(ACCOUNT_SEED_KEY, &seed) {
-                ChessDelegateResponse::Stored
+                ChessDelegateResponse::AccountStored { seed }
             } else {
                 ChessDelegateResponse::Error {
                     message: "the secret store rejected the account seed".to_string(),
@@ -120,5 +121,147 @@ fn handle(ctx: &mut DelegateCtx, request: ChessDelegateRequest) -> ChessDelegate
                 .and_then(|bytes| String::from_utf8(bytes).ok());
             ChessDelegateResponse::Nickname { nickname }
         }
+
+        ChessDelegateRequest::GetTheme { player } => {
+            let key = theme_key(&player);
+            let theme = match ctx.get_secret(&key) {
+                Some(bytes) => match decode_theme(&bytes) {
+                    Ok(theme) => Some(theme),
+                    Err(message) => return ChessDelegateResponse::Error { message },
+                },
+                None if ctx.has_secret(&key) => {
+                    return ChessDelegateResponse::Error {
+                        message: "could not read the stored theme".to_string(),
+                    };
+                }
+                None => None,
+            };
+            ChessDelegateResponse::Theme { player, theme }
+        }
+
+        ChessDelegateRequest::SetTheme { player, theme } => {
+            let bytes = match encode_theme(&theme) {
+                Ok(bytes) => bytes,
+                Err(message) => return ChessDelegateResponse::Error { message },
+            };
+            if ctx.set_secret(&theme_key(&player), &bytes) {
+                ChessDelegateResponse::ThemeSaved { player, theme }
+            } else {
+                ChessDelegateResponse::Error {
+                    message: "the secret store rejected the theme".to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn theme_key(player: &[u8; 32]) -> Vec<u8> {
+    [THEME_KEY_PREFIX, player.as_slice()].concat()
+}
+
+fn encode_theme(theme: &Theme) -> Result<Vec<u8>, String> {
+    if !theme.valid() {
+        return Err("theme colors must be #RRGGBB hex values".to_string());
+    }
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(theme, &mut bytes)
+        .map_err(|error| format!("could not encode theme: {error}"))?;
+    Ok(bytes)
+}
+
+fn decode_theme(bytes: &[u8]) -> Result<Theme, String> {
+    let mut remaining = bytes;
+    let theme: Theme = ciborium::de::from_reader(&mut remaining)
+        .map_err(|error| format!("could not decode stored theme: {error}"))?;
+    if !remaining.is_empty() || !theme.valid() {
+        return Err("the stored theme is invalid".to_string());
+    }
+    Ok(theme)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chess_delegate_protocol::PieceSet;
+
+    #[test]
+    fn themes_have_independent_keys_for_full_player_identities() {
+        let first = [1; 32];
+        let mut second = first;
+        second[31] = 2;
+        let first_key = theme_key(&first);
+        assert_eq!(first_key.len(), THEME_KEY_PREFIX.len() + 32);
+        assert!(first_key.starts_with(THEME_KEY_PREFIX));
+        assert_eq!(&first_key[THEME_KEY_PREFIX.len()..], &first);
+        assert_ne!(first_key, theme_key(&second));
+        assert_ne!(first_key, ACCOUNT_SEED_KEY);
+        assert_ne!(first_key, NICKNAME_KEY);
+    }
+
+    #[test]
+    fn stored_themes_round_trip_and_reject_corruption() {
+        let theme = Theme {
+            piece_set: PieceSet::Classic,
+            white_piece: "#aAbBcC".into(),
+            ..Theme::default()
+        };
+        let encoded = encode_theme(&theme).unwrap();
+        assert_eq!(decode_theme(&encoded).unwrap(), theme);
+        assert!(decode_theme(&[]).is_err());
+        assert!(decode_theme(&encoded[..encoded.len() - 1]).is_err());
+        let mut with_trailing_data = encoded;
+        with_trailing_data.push(0);
+        assert!(decode_theme(&with_trailing_data).is_err());
+
+        let invalid = Theme {
+            black_piece: "red".into(),
+            ..theme
+        };
+        assert!(encode_theme(&invalid).is_err());
+        let mut invalid_bytes = Vec::new();
+        ciborium::ser::into_writer(&invalid, &mut invalid_bytes).unwrap();
+        assert!(decode_theme(&invalid_bytes).is_err());
+    }
+
+    #[test]
+    fn missing_themes_and_failed_writes_are_distinct() {
+        // Native DelegateCtx intentionally has no host store: reads miss and writes fail.
+        let mut ctx = DelegateCtx::default();
+        let player = [3; 32];
+        assert_eq!(
+            handle(&mut ctx, ChessDelegateRequest::GetTheme { player }),
+            ChessDelegateResponse::Theme {
+                player,
+                theme: None
+            }
+        );
+        assert_eq!(
+            handle(
+                &mut ctx,
+                ChessDelegateRequest::SetTheme {
+                    player,
+                    theme: Theme::default()
+                }
+            ),
+            ChessDelegateResponse::Error {
+                message: "the secret store rejected the theme".into()
+            }
+        );
+        let invalid = Theme {
+            light_square: "red".into(),
+            ..Theme::default()
+        };
+        assert_eq!(
+            handle(
+                &mut ctx,
+                ChessDelegateRequest::SetTheme {
+                    player,
+                    theme: invalid
+                }
+            ),
+            ChessDelegateResponse::Error {
+                message: "theme colors must be #RRGGBB hex values".into()
+            }
+        );
     }
 }
